@@ -59,12 +59,20 @@ fn ext(name: impl AsRef<Path>) -> String {
     name.as_ref().extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
 }
 
+pub use cadcraft_dwg::Limits as DwgLimits;
+
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
 /// (SVG and gzip-compressed SVGZ).
 pub fn read(bytes: &[u8], name: impl AsRef<Path>) -> Result<Drawing> {
+    read_limited(bytes, name, cadcraft_dwg::Limits::DEFAULT)
+}
+
+/// [`read`] with the DWG bridge's size limits chosen by the caller (a host that sizes them from
+/// its memory budget instead of the fixed defaults).
+pub fn read_limited(bytes: &[u8], name: impl AsRef<Path>, limits: DwgLimits) -> Result<Drawing> {
     let name = name.as_ref();
     if cadcraft_dwg::is_dwg(bytes) {
-        let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
+        let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, limits).map_err(IoError::Format)?;
         let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
         d.read_notes = notes;
         return Ok(d);

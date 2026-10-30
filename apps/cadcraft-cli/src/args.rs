@@ -276,7 +276,76 @@ pub(crate) struct McpArgs {
     #[arg(long, requires = "connect")]
     pub(crate) launch: bool,
     #[command(flatten)]
+    pub(crate) whiq: WhiqArgs,
+    #[command(flatten)]
     pub(crate) settings: Settings,
+}
+
+/// The headless engine's flags, in the shape every WHIQ craft engine takes (`<app>-cli mcp`).
+#[derive(Args, Debug, Default)]
+#[command(next_help_heading = "Headless engine")]
+pub(crate) struct WhiqArgs {
+    /// Reads are confined to this folder (and the write root); relative names are looked up there
+    #[arg(long, value_name = "DIR", conflicts_with = "connect")]
+    pub(crate) automation_read_root: Option<PathBuf>,
+    /// Writes are confined to this folder; relative names are written there
+    #[arg(long, value_name = "DIR", conflicts_with = "connect")]
+    pub(crate) automation_write_root: Option<PathBuf>,
+    /// Saves and exports replace files instead of keeping the old one as OLD_<name>
+    #[arg(long, conflicts_with = "connect")]
+    pub(crate) automation_no_old_copies: bool,
+    /// The name saves are stamped with (a call's `caller` overrides it)
+    #[arg(long, value_name = "NAME", conflicts_with = "connect")]
+    pub(crate) author: Option<String>,
+    /// A call arriving while another runs waits this long, then answers `busy`
+    #[arg(long, value_name = "MS", default_value_t = 300)]
+    pub(crate) busy_after_ms: u64,
+    /// A call still running after this long answers with a job id and carries on
+    #[arg(long, value_name = "MS", default_value_t = 15_000)]
+    pub(crate) job_after_ms: u64,
+    /// Opening a file of this many megabytes or more is a job from the start
+    #[arg(long, value_name = "MB", default_value_t = 20.0)]
+    pub(crate) open_job_mb: f64,
+    /// Auto-save and close the drawings after this many seconds without calls
+    #[arg(long, value_name = "SECS")]
+    pub(crate) idle_evict_secs: Option<u64>,
+    /// Auto-save and close the drawings when the process uses more memory than this
+    #[arg(long, value_name = "MB")]
+    pub(crate) max_memory_mb: Option<u64>,
+    /// Answers above this many bytes of JSON are trimmed (`continue_from` for the rest)
+    #[arg(long, value_name = "BYTES", default_value_t = 262_144)]
+    pub(crate) max_result_bytes: usize,
+    /// Checkpoint unsaved work to the recovered file after this many changing calls (0: off)
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub(crate) checkpoint_edits: u64,
+    /// … and when unsaved changes are this many seconds old (0: off)
+    #[arg(long, value_name = "SECS", default_value_t = 60)]
+    pub(crate) checkpoint_secs: u64,
+}
+
+impl WhiqArgs {
+    /// The engine's configuration from the flags.
+    pub(crate) fn config(&self) -> cadcraft_mcp::whiq::Config {
+        use std::time::Duration;
+        let settings = cadcraft_mcp::whiq::docs::Settings {
+            roots: cadcraft_mcp::whiq::files::Roots { read: self.automation_read_root.clone(), write: self.automation_write_root.clone() },
+            old_copies: !self.automation_no_old_copies,
+            author: self.author.clone().filter(|a| !a.trim().is_empty()),
+            max_result_bytes: self.max_result_bytes.max(1024),
+            max_memory_bytes: self.max_memory_mb.filter(|m| *m > 0).map(|m| m.saturating_mul(1024 * 1024)),
+        };
+        let mb = if self.open_job_mb.is_finite() && self.open_job_mb > 0.0 { self.open_job_mb } else { 20.0 };
+        cadcraft_mcp::whiq::Config {
+            settings,
+            busy_after: Duration::from_millis(self.busy_after_ms),
+            job_after: Duration::from_millis(self.job_after_ms.max(1)),
+            open_job_bytes: (mb * 1024.0 * 1024.0) as u64,
+            idle_evict: self.idle_evict_secs.filter(|s| *s > 0).map(Duration::from_secs),
+            checkpoint_edits: self.checkpoint_edits,
+            checkpoint_interval: (self.checkpoint_secs > 0).then(|| Duration::from_secs(self.checkpoint_secs)),
+            handle_signals: true,
+        }
+    }
 }
 
 /// Time the engine on a synthetic N-entity drawing (default 200000), or the canvas display-list

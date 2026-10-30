@@ -354,17 +354,25 @@ impl<'a> Cur<'a> {
     }
 }
 
-/// Binary DXF (R13+: 2-byte group codes).
+/// Binary DXF (R13+: 2-byte group codes; R12 and earlier: 1-byte codes).
 pub fn parse_binary(b: &[u8]) -> Result<Vec<Tag>> {
     parse_binary_with_limit(b, MAX_TAGS)
 }
 
+/// Whether a binary DXF body (after the sentinel) uses the R12 layout: 1-byte group codes, 255
+/// escaping a 2-byte one (DXF Reference, "Binary DXF Files"). Both start with group code 0 and
+/// the text `SECTION`; the R13+ layout writes that code as two zero bytes.
+fn short_codes(b: &[u8]) -> bool {
+    b.first() == Some(&0) && b.get(1).is_some_and(|c| *c != 0)
+}
+
 fn parse_binary_with_limit(b: &[u8], max_tags: usize) -> Result<Vec<Tag>> {
+    let short = short_codes(b);
     let mut c = Cur { b, p: 0 };
     let mut text = codepage::BinaryText::default();
     let mut tags = Vec::new();
     while c.p < b.len() {
-        let mut code = i32::from(c.i16()?);
+        let mut code = if short { i32::from(c.u8()?) } else { i32::from(c.i16()?) };
         if code == 255 {
             code = i32::from(c.i16()?);
         }

@@ -8,7 +8,8 @@ pub(crate) fn mcp(a: &McpArgs) -> Result {
             Ok(r) => Box::new(r),
             Err(source) => return Err(CliError::McpConnect { addr, source }),
         },
-        McpTarget::Headless => Box::new(cadcraft_mcp::Headless::default()),
+        // The headless engine the platform drives: jobs, busy, cancel, roots, recovered files.
+        McpTarget::Headless => return Ok(cadcraft_mcp::whiq::serve(a.whiq.config(), std::io::BufReader::new(std::io::stdin()), std::io::stdout())?),
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

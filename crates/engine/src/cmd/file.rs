@@ -271,6 +271,15 @@ pub struct ReadFile {
     path: Option<String>,
 }
 
+impl ReadFile {
+    /// A drawing a host read itself (the MCP server reads with limits sized from its memory
+    /// budget), to hand to [`finish_open`] like a [`read_file`] result.
+    pub fn from_drawing(drawing: Drawing, binary_dxf: bool, name: &str, path: Option<String>) -> ReadFile {
+        let path = path.filter(|p| is_drawing_file(p));
+        ReadFile { drawing, binary_dxf, name: name.to_string(), path }
+    }
+}
+
 /// Read and decode `path` (the slow half of `OPEN {path}`). Needs no session; runs anywhere.
 pub fn read_file(path: &std::path::Path) -> std::result::Result<ReadFile, String> {
     #[cfg(not(target_arch = "wasm32"))]

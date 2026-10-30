@@ -47,13 +47,21 @@ fn connect_without_address_fails_before_serving() {
 
 #[test]
 fn no_connect_still_serves_headless() {
-    let out = mcp(&[], &format!("{INIT}\n{CIRCLE}\n"));
+    // WHIQ: the headless engine starts with no drawing; new_drawing (id 3) opens one first.
+    let new = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"new_drawing","arguments":{}}}"#;
+    // The unsaved drawing is auto-saved on hang-up: into a scratch write root, not the source tree.
+    let root = std::env::temp_dir().join(format!("cadcraft-mcp-headless-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+    let root_arg = root.to_string_lossy().into_owned();
+    let out = mcp(&["--automation-write-root", &root_arg], &format!("{INIT}\n{new}\n{CIRCLE}\n"));
+    let _ = std::fs::remove_dir_all(&root);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let r = replies(&out);
     let instructions = r.iter().find(|v| v["id"] == 1).and_then(|v| v["result"]["instructions"].as_str()).unwrap_or_default();
     assert!(instructions.contains("Backend: headless"), "{instructions}");
     let circle = r.iter().find(|v| v["id"] == 2).map(|v| &v["result"]);
-    assert!(circle.is_some_and(|c| c.is_object() && c.get("isError").is_none()), "{r:?}");
+    // WHIQ: the headless engine answers every tool result with an explicit `isError`.
+    assert!(circle.is_some_and(|c| c.is_object() && c.get("isError").is_none_or(|e| e == false)), "{r:?}");
 }
 
 #[test]

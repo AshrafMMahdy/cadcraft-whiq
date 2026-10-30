@@ -13,6 +13,7 @@ mod backend;
 pub mod control_token;
 mod server;
 mod tools;
+pub mod whiq;
 
 pub use backend::{Backend, Headless, Remote};
 pub use server::{PROTOCOL_VERSION, Server};
