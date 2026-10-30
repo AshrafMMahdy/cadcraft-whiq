@@ -607,7 +607,8 @@ fn jobs_busy_cancel_and_evict() {
     let e = m.error("read_drawing", json!({}));
     assert_eq!(e["code"], "evicted");
     assert_eq!(e["recovered_path"], rec.as_str());
-    copy(m.dir.join("out").join(&rec), m.dir.join("in").join(&rec));
+    // The recovered file opens where it was written (relative names are looked up in the write
+    // root too).
     let o = m.call("open_drawing", json!({"path": rec}));
     let t = m.call("read_drawing", json!({"document": o["document"], "section": "text", "contains": "GROUND"}));
     assert_eq!(t["total"], 1, "the recovered file holds the work: {t}");
