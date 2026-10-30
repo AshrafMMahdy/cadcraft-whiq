@@ -182,3 +182,23 @@ peaks at 292 MB through every tool.
   contents); server-side `layers_off` / `only_layers` are exact for nested objects.
 - A PDF holds at most 256 sheets (CADCraft's plotter limit).
 - Memory: about 1 KB per entity resident and 2.5–5 KB per entity at the peak of opening a DWG.
+
+## Wiring it into the platform (for the owner; the platform repository was not touched)
+
+- `engines.lock`: an entry like the craft forks', `kind: "craft"`, `repo: "AshrafMMahdy/cadcraft-whiq"`,
+  `bin` `cadcraft-cli` / `cadcraft-cli.exe`, assets `cadcraft-cli-{tag}-linux-x86_64.tar.gz` and
+  `cadcraft-cli-{tag}-windows-x86_64.zip` (pin with `scripts/engines-pin.mjs cadcraft@whiq-v0.1.0`
+  once `cadcraft` is in its `DEFAULTS` and in `ENGINE_NAMES`).
+- The supervisor's flags work as for the forks: `mcp --automation-read-root … --automation-write-root …
+  --author … --busy-after-ms 300 [--automation-no-old-copies]`; `server_status.limits.old_copies`
+  says which; tools carry `_meta["whiq/files"]` (`open_drawing.path`, `read_drawing.path`,
+  `search_drawing.path`, `render_preview.path`, `roundtrip_check.path`, `export.source`).
+- Build smoke (`engines-fetch.mjs renderPlan`, extension `dwg`): `new_drawing {}` → `edit {ops:
+  [{op: "command", command: "style", params: {name: "ARABIC", font: <fonts.arabic>}}, {op: "command",
+  command: "style.current", params: {name: "ARABIC"}}, {op: "add", type: "text", at: [0, 0], text:
+  SMOKE_ARABIC, height: 5}]}` → `save_drawing {path: "smoke.dwg"}` → `export {path: "smoke.pdf"}`.
+  The document starts `AC10` (not `PK`). The PDF check must not require the Arabic face embedded
+  (see Known gaps); `whiq_smoke.py` shows the check that holds (filled glyph paths in
+  `render_preview`, the text read back from the DWG).
+- The Preview tab: `render_preview` answers SVG tiles (`tiles[].svg`, `window`, y running down);
+  `max_bytes` sets how many fit in one answer; each primitive group is `<g data-layer="…">`.
