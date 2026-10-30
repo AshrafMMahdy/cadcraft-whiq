@@ -161,6 +161,19 @@ impl Drop for Mcp {
     }
 }
 
+/// Copy a file the server just wrote; on Windows a fresh file can be held for a moment (a virus
+/// scanner), so a sharing violation is retried.
+fn copy(from: PathBuf, to: PathBuf) {
+    for _ in 0..100 {
+        match std::fs::copy(&from, &to) {
+            Ok(_) => return,
+            Err(e) if e.raw_os_error() == Some(32) || e.raw_os_error() == Some(33) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("copy {} → {}: {e}", from.display(), to.display()),
+        }
+    }
+    panic!("{} stayed locked", from.display());
+}
+
 /// The handle an edit operation made (`handle`, or the first of `handles`).
 fn made(op: &Value) -> String {
     let r = &op["result"];
@@ -413,7 +426,7 @@ fn save_as_dwg_and_dxf_versions_and_open_them_back() {
         assert!(m.dir.join("out").join(name).exists());
     }
     for name in ["sheet.dwg", "sheet2013.dwg", "sheet2000.dwg", "sheet.dxf", "sheet2007.dxf"] {
-        std::fs::copy(m.dir.join("out").join(name), m.dir.join("in").join(name)).unwrap();
+        copy(m.dir.join("out").join(name), m.dir.join("in").join(name));
         let o = m.call("open_drawing", json!({"path": name}));
         let t = m.call("read_drawing", json!({"document": o["document"], "section": "text"}));
         let texts: Vec<&str> = t["texts"].as_array().unwrap().iter().filter_map(|x| x["text"].as_str()).collect();
@@ -484,7 +497,7 @@ fn preview_and_export() {
     let e = m.call("export", json!({"path": "plan.pdf", "overwrite": true}));
     assert!(e["saved"][0]["previous_renamed_to"].is_null());
     // DWG → DXF / PDF / SVG of a file opened from disk.
-    std::fs::copy(m.dir.join("out/plan.dwg"), m.dir.join("in/from.dwg")).unwrap();
+    copy(m.dir.join("out/plan.dwg"), m.dir.join("in/from.dwg"));
     for (out, magic) in [("from.dxf", &b"  0"[..]), ("from.pdf", &b"%PDF"[..]), ("from.svg", &b"<svg"[..])] {
         m.call("export", json!({"source": "from.dwg", "path": out, "space": if out.ends_with("pdf") { json!("all") } else { json!("model") }}));
         let b = std::fs::read(m.dir.join("out").join(out)).unwrap();
@@ -594,7 +607,7 @@ fn jobs_busy_cancel_and_evict() {
     let e = m.error("read_drawing", json!({}));
     assert_eq!(e["code"], "evicted");
     assert_eq!(e["recovered_path"], rec.as_str());
-    std::fs::copy(m.dir.join("out").join(&rec), m.dir.join("in").join(&rec)).unwrap();
+    copy(m.dir.join("out").join(&rec), m.dir.join("in").join(&rec));
     let o = m.call("open_drawing", json!({"path": rec}));
     let t = m.call("read_drawing", json!({"document": o["document"], "section": "text", "contains": "GROUND"}));
     assert_eq!(t["total"], 1, "the recovered file holds the work: {t}");
@@ -637,7 +650,7 @@ fn xrefs_attach_list_and_read_through() {
     m.call("new_drawing", json!({}));
     m.call("edit", json!({"ops": [{"op": "add", "type": "text", "at": [0, 0], "text": "XREF NOTE", "height": 2.5}, {"op": "add", "type": "line", "points": [[0, 0], [10, 0]]}]}));
     m.call("save_drawing", json!({"path": "part.dxf"}));
-    std::fs::copy(m.dir.join("out/part.dxf"), m.dir.join("in/part.dxf")).unwrap();
+    copy(m.dir.join("out/part.dxf"), m.dir.join("in/part.dxf"));
     m.call("new_drawing", json!({}));
     let r = m.call("edit", json!({"ops": [{"op": "command", "command": "xattach", "params": {"path": "part.dxf", "at": [100, 0]}}]}));
     assert_eq!(r["failed"], 0, "{r}");
