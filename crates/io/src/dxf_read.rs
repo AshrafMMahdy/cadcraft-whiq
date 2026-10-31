@@ -9,7 +9,7 @@ use cadcraft_doc::{
     Linetype, Lineweight, LwPolyline, MAX_FRAME_CHARS, MLeaderStyle, MText, MultilineAttrib, NamedView, PageSetup, Point, Polyline3d, RawTag,
     RayLine, Solid, Table, TableCell, Text, TextStyle, Tolerance, Transparency, Ucs, Unknown, VAlign, Viewport, VportConfig, VportTile, Wipeout,
 };
-use cadcraft_dxf::{Tag, records, sections};
+use cadcraft_dxf::{Tag, record_refs, records, section_refs};
 use cadcraft_geom::{PolyVertex, Spline, Vec2, Vec3};
 
 use crate::{IoError, Result};
@@ -70,7 +70,13 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
 
 /// A block definition read from BLOCKS: name, base point, description, entities (owner, paper
 /// flag, entity) and block flags.
-type BlockDef = (String, Vec3, String, Vec<(Option<String>, bool, Entity)>, i64);
+type BlockDef = (String, Vec3, String, Vec<Placed>, i64);
+
+/// An entity read, waiting for its space or block: the owner's handle, the paper-space flag and
+/// the entity, already shared as its space keeps it: an entity is several hundred bytes, and a
+/// list of them inline was a second copy of every entity of a large drawing while they were
+/// moved into their spaces.
+type Placed = (Option<String>, bool, std::sync::Arc<Entity>);
 
 /// A layout read from OBJECTS: name, tab order, paper block handle and page setup.
 type LayoutDef = (String, u32, String, PageSetup);
@@ -78,7 +84,9 @@ type LayoutDef = (String, u32, String, PageSetup);
 /// Import DXF sections while sharing one materialized-table-cell budget across blocks and entity sections.
 fn read_budgeted(bytes: &[u8], mut table_cells_left: usize) -> Result<Drawing> {
     let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
-    let secs = sections(&tags);
+    // Sections and entity records borrow the one copy of the groups (C3: copying them held the
+    // file's groups three times over while a large drawing was read).
+    let secs = section_refs(&tags);
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }
@@ -105,17 +113,17 @@ fn read_budgeted(bytes: &[u8], mut table_cells_left: usize) -> Result<Drawing> {
     let mut skipped = std::collections::BTreeMap::new();
     count_skipped(&mut skipped, "(no section)", outside_sections(&tags));
     for s in &secs {
-        match s.name.as_str() {
-            "HEADER" => header(&s.tags, &mut d),
-            "TABLES" => tables(&s.tags, &mut d, &mut rx),
-            "BLOCKS" => blocks.extend(read_blocks(&s.tags, &mut d, &mut rx, &mut table_cells_left, &mut skipped)),
+        match s.name {
+            "HEADER" => header(s.tags, &mut d),
+            "TABLES" => tables(s.tags, &mut d, &mut rx),
+            "BLOCKS" => blocks.extend(read_blocks(s.tags, &mut d, &mut rx, &mut table_cells_left, &mut skipped)),
             // A damaged file may split its entities over several ENTITIES sections (#865).
             "ENTITIES" => {
                 let mut n = 0;
-                entities.extend(parse_entities(&records(&s.tags), &mut d, &mut rx, &mut n, &mut table_cells_left));
+                entities.extend(parse_entities(&record_refs(s.tags), &mut d, &mut rx, &mut n, &mut table_cells_left));
                 count_skipped(&mut skipped, "ENTITIES", n);
             }
-            "OBJECTS" => read_objects(&s.tags, &mut objs, &mut layout_objs),
+            "OBJECTS" => read_objects(s.tags, &mut objs, &mut layout_objs),
             _ => {}
         }
     }

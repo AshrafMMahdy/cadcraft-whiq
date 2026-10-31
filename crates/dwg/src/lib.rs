@@ -40,6 +40,15 @@ pub fn version(bytes: &[u8]) -> Option<String> {
     is_dwg(bytes).then(|| String::from_utf8_lossy(bytes.get(0..6).unwrap_or_default()).to_string())
 }
 
+/// A DWG read as DXF: the DXF bytes, notes on what the read left out, and the contents of the
+/// multiline texts (by handle) the DXF does not carry exactly, for the reader to put back.
+#[derive(Clone, Debug, Default)]
+pub struct Converted {
+    pub dxf: Vec<u8>,
+    pub notes: Vec<String>,
+    pub mtext: Vec<(u64, String)>,
+}
+
 /// Size limits for reading a DWG file. DWG is compressed and the DXF text it converts to is
 /// several times larger (about 6x in our tests: a 10 MB DWG becomes about 60 MB of DXF), so
 /// the limits are generous for real drawings. They exist because a damaged file, or one the reader
@@ -88,6 +97,11 @@ mod native {
     /// file, and the notes say how many were skipped and of which types, so a partial read never
     /// passes for a complete one.
     pub fn dwg_to_dxf_noted(bytes: &[u8], limits: Limits) -> Result<(Vec<u8>, Vec<String>), String> {
+        dwg_to_dxf_read(bytes, limits).map(|c| (c.dxf, c.notes))
+    }
+
+    /// [`dwg_to_dxf_noted`], also returning the multiline texts the DXF does not carry exactly.
+    pub fn dwg_to_dxf_read(bytes: &[u8], limits: Limits) -> Result<super::Converted, String> {
         if bytes.len() > limits.max_dwg_bytes {
             return Err(format!("DWG: the file is {}, larger than the {} CADCraft opens", mb(bytes.len() as u64), mb(limits.max_dwg_bytes as u64)));
         }
@@ -121,7 +135,23 @@ mod native {
             ));
         }
         written.map_err(|e| format!("DWG→DXF: {e}"))?;
-        Ok((add_header_vars(out.buf, &doc.header), notes))
+        let mtext = mtext_the_dxf_changes(&doc);
+        Ok(super::Converted { dxf: add_header_vars(out.buf, &doc.header), notes, mtext })
+    }
+
+    /// The MTEXT contents the DXF writer cannot carry, by handle: it writes a line feed as the
+    /// paragraph code `\P`, and a caret followed by a space as is, which reads back as a caret
+    /// alone (`^ ` is the DXF escape of a caret). A value with a carriage return is left to the
+    /// writer's `\P` (CADCraft's contents hold no carriage returns).
+    fn mtext_the_dxf_changes(doc: &acadrust::CadDocument) -> Vec<(u64, String)> {
+        doc.entities()
+            .filter_map(|e| match e {
+                acadrust::entities::EntityType::MText(t) if (t.value.contains("^ ") || t.value.contains('\n')) && !t.value.contains('\r') => {
+                    Some((t.common.handle.value(), t.value.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Most record types named in the skipped-records note.
@@ -742,7 +772,7 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{dwg_to_dxf, dwg_to_dxf_noted, dwg_to_dxf_with, dxf_to_dwg, dxf_to_dwg_as};
+pub use native::{dwg_to_dxf, dwg_to_dxf_noted, dwg_to_dxf_read, dwg_to_dxf_with, dxf_to_dwg, dxf_to_dwg_as};
 
 // Test-only: the stage ("post_process" or "convert") whose guard the current test checks. The
 // stage then panics on entry, so a test through the public API shows whether it is guarded.
@@ -774,6 +804,10 @@ pub fn dwg_to_dxf(_bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 #[cfg(target_arch = "wasm32")]
 pub fn dwg_to_dxf_noted(_bytes: &[u8], _limits: Limits) -> Result<(Vec<u8>, Vec<String>), String> {
+    Err("DWG files can't be opened in the web build yet; save as DXF".into())
+}
+#[cfg(target_arch = "wasm32")]
+pub fn dwg_to_dxf_read(_bytes: &[u8], _limits: Limits) -> Result<Converted, String> {
     Err("DWG files can't be opened in the web build yet; save as DXF".into())
 }
 #[cfg(target_arch = "wasm32")]

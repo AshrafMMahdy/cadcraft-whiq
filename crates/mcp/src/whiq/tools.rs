@@ -3,6 +3,7 @@
 //! the round-trip check. The contract's own tools (server_status, job_status, list_jobs, cancel,
 //! evict) are the runtime's (`runtime.rs`).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use cadcraft_engine::Session;
@@ -731,61 +732,152 @@ impl Engine {
             .get("version")
             .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
             .and_then(|t| cadcraft_io::Version::parse(&t));
+        // What is compared is taken from each drawing in turn, and the copy read back is dropped
+        // before the comparison: at no point are the open drawing, the written file, the copy
+        // read back and their texts all held at once (C3: a 1.5-million-entity DXF went past
+        // 6.9 GB this way).
+        ctx.stage("comparing", 0);
+        let before = Modelled::of(d, ctx)?;
         ctx.stage("writing", 0);
         let bytes = cadcraft_io::write_with(d, &name, &cadcraft_io::SaveOptions { version, binary: false })
             .map_err(|e| ToolError::new(code::FAILED, e.to_string(), "try the other format"))?;
+        let written = bytes.len();
         ctx.check()?;
         ctx.stage("reading back", 0);
-        let back = cadcraft_io::read_limited(&bytes, &name, limits_for(bytes.len(), ctx.settings.max_memory_bytes)).map_err(|e| {
+        let back = cadcraft_io::read_limited(&bytes, &name, limits_for(written, ctx.settings.max_memory_bytes)).map_err(|e| {
             ToolError::new(
                 code::FAILED,
                 format!("the written {fmt} does not read back: {e}"),
                 "report this drawing; save as the other format meanwhile",
             )
         })?;
-        let (a1, l1) = read::counts(d);
-        let (a2, l2) = read::counts(&back);
+        drop(bytes);
+        ctx.check()?;
+        ctx.stage("comparing", 0);
+        let after = Modelled::of(&back, ctx)?;
+        drop(back);
+        let problems = before.problems(&after);
+        Ok(Reply::json(json!({"document": doc.handle, "format": fmt, "bytes": written, "lossless": problems.is_empty(), "problems": problems,
+            "note": "compares what CADCraft models (entities per space and type, layers, blocks, layouts, texts, multiline texts with their formatting codes, width, attachment and rotation); data CADCraft keeps raw is written back as read"})))
+    }
+}
+
+/// What `roundtrip_check` compares of a drawing: entities per space and type, layer, block and
+/// layout counts, every text (plain), and the multiline texts of each space and named block as
+/// written (contents with formatting codes, width, attachment, rotation; anonymous blocks are
+/// dimension and table pictures, rebuilt on save). Texts are sorted, so a comparison is a merge.
+struct Modelled {
+    entities: BTreeMap<String, BTreeMap<String, usize>>,
+    layers: usize,
+    blocks: usize,
+    layouts: usize,
+    texts: Vec<String>,
+    mtexts: Vec<String>,
+}
+
+impl Modelled {
+    fn of(d: &Drawing, ctx: &Ctx) -> Result<Self, ToolError> {
+        let (entities, _) = read::counts(d);
+        let flt = read::Filter { layers: None, window: None, contains: None, exact: false, types: None, expand_blocks: false };
+        let mut texts = read::text_values(d, &read::spaces(d), &flt, ctx)?;
+        texts.sort_unstable();
+        let mut mtexts = Vec::new();
+        let stores =
+            read::spaces(d).into_iter().filter_map(|(_, sp)| d.space(&sp)).chain(d.blocks.values().filter(|b| !b.anonymous).map(|b| &b.entities));
+        for store in stores {
+            for e in store.iter() {
+                if let EntityKind::MText(t) = &e.kind {
+                    mtexts.push(mtext_key(t));
+                }
+            }
+        }
+        mtexts.sort_unstable();
+        Ok(Modelled {
+            entities,
+            layers: d.layers.len(),
+            blocks: d.blocks.values().filter(|b| !b.anonymous).count(),
+            layouts: d.layouts.len(),
+            texts,
+            mtexts,
+        })
+    }
+
+    fn problems(&self, after: &Modelled) -> Vec<Value> {
         let mut problems = Vec::new();
-        for (space, c) in &a1 {
+        for (space, c) in &self.entities {
             for (ty, n) in c {
-                let m = a2.get(space).and_then(|x| x.get(ty)).copied().unwrap_or(0);
+                let m = after.entities.get(space).and_then(|x| x.get(ty)).copied().unwrap_or(0);
                 if m != *n {
                     problems.push(json!({"what": "entities", "space": space, "type": ty, "before": n, "after": m}));
                 }
             }
         }
-        for (space, c) in &a2 {
+        for (space, c) in &after.entities {
             for (ty, m) in c {
-                if a1.get(space).and_then(|x| x.get(ty)).is_none() {
+                if self.entities.get(space).and_then(|x| x.get(ty)).is_none() {
                     problems.push(json!({"what": "entities", "space": space, "type": ty, "before": 0, "after": m}));
                 }
             }
         }
-        let _ = (l1, l2);
-        let cmp = |what: &str, x: usize, y: usize, p: &mut Vec<Value>| {
+        for (what, x, y) in [("layers", self.layers, after.layers), ("blocks", self.blocks, after.blocks), ("layouts", self.layouts, after.layouts)] {
             if x != y {
-                p.push(json!({"what": what, "before": x, "after": y}));
+                problems.push(json!({"what": what, "before": x, "after": y}));
             }
-        };
-        cmp("layers", d.layers.len(), back.layers.len(), &mut problems);
-        cmp("blocks", d.blocks.values().filter(|b| !b.anonymous).count(), back.blocks.values().filter(|b| !b.anonymous).count(), &mut problems);
-        cmp("layouts", d.layouts.len(), back.layouts.len(), &mut problems);
-        let all = read::spaces(d);
-        let flt = read::Filter { layers: None, window: None, contains: None, exact: false, types: None, expand_blocks: false };
-        let t1: Vec<String> = read::texts(d, &all, &flt, ctx)?.iter().filter_map(|t| t["text"].as_str().map(str::to_string)).collect();
-        let t2: Vec<String> =
-            read::texts(&back, &read::spaces(&back), &flt, ctx)?.iter().filter_map(|t| t["text"].as_str().map(str::to_string)).collect();
-        let mut s1 = t1.clone();
-        let mut s2 = t2.clone();
-        s1.sort();
-        s2.sort();
-        if s1 != s2 {
-            let lost: Vec<&String> = s1.iter().filter(|x| !s2.contains(x)).take(20).collect();
-            problems.push(json!({"what": "texts", "before": t1.len(), "after": t2.len(), "lost_examples": lost}));
         }
-        Ok(Reply::json(json!({"document": doc.handle, "format": fmt, "bytes": bytes.len(), "lossless": problems.is_empty(), "problems": problems,
-            "note": "compares what CADCraft models (entities per space and type, layers, blocks, layouts, texts); data CADCraft keeps raw is written back as read"})))
+        if self.texts != after.texts {
+            let lost = only_in(&self.texts, &after.texts, 20);
+            problems.push(json!({"what": "texts", "before": self.texts.len(), "after": after.texts.len(), "lost_examples": lost}));
+        }
+        if self.mtexts != after.mtexts {
+            let lost = only_in(&self.mtexts, &after.mtexts, usize::MAX);
+            let changed: Vec<Value> = lost.iter().take(5).map(|k| mtext_example(k)).collect();
+            problems.push(json!({"what": "mtext", "before": self.mtexts.len(), "after": after.mtexts.len(), "changed": lost.len(),
+                "examples": changed, "note": "multiline texts whose contents (formatting codes included), width, attachment or rotation changed"}));
+        }
+        problems
     }
+}
+
+/// The items of sorted `a` that sorted `b` does not hold (counting repeats), at most `limit`.
+/// A merge, so a drawing with a million texts compares in one pass.
+fn only_in<'a>(a: &'a [String], b: &[String], limit: usize) -> Vec<&'a String> {
+    let mut out = Vec::new();
+    let mut j = 0;
+    for x in a {
+        while b.get(j).is_some_and(|y| y < x) {
+            j += 1;
+        }
+        if b.get(j) == Some(x) {
+            j += 1;
+        } else {
+            out.push(x);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Separates the fields of an MTEXT key (a character no contents hold: control characters other
+/// than tab and line feed are dropped on write).
+const KEY_SEP: char = '\u{1f}';
+
+/// A multiline text as written: contents with its formatting codes, width, attachment and
+/// rotation (in [0, 2π) and rounded to 1e-9: DWG stores the direction, not the angle).
+fn mtext_key(t: &cadcraft_engine::doc::MText) -> String {
+    let r = |v: f64| if v.is_finite() { (v * 1e9).round() / 1e9 } else { 0.0 };
+    let turn = std::f64::consts::TAU;
+    let a = if t.rotation.is_finite() { t.rotation.rem_euclid(turn) } else { 0.0 };
+    let a = if turn - a < 1e-9 { 0.0 } else { a };
+    format!("{}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}", t.contents, r(t.width), t.attach, r(a))
+}
+
+fn mtext_example(key: &str) -> Value {
+    let mut it = key.split(KEY_SEP);
+    let contents: String = it.next().unwrap_or_default().chars().take(300).collect();
+    let (width, attach, rotation) = (it.next().unwrap_or_default(), it.next().unwrap_or_default(), it.next().unwrap_or_default());
+    json!({"contents": contents, "width": width.parse::<f64>().ok(), "attach": attach.parse::<u8>().ok(), "rotation": rotation.parse::<f64>().ok()})
 }
 
 /// Commands `edit` refuses: they open, close or save documents, which the server's own tools do

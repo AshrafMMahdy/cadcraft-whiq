@@ -258,14 +258,10 @@ fn write_text_entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: boo
             w.i(71, i64::from(t.attach));
             w.i(72, 1);
             // Long contents go in 250-char 3-chunks, the remainder in 1.
-            let chars: Vec<char> = crate::dxf_read::mtext_dxf::encode_contents(&t.contents).chars().collect();
-            let chunks: Vec<String> = chars.chunks(250).map(|c| c.iter().collect()).collect();
+            let chunks = crate::dxf_read::mtext_dxf::content_chunks(&t.contents);
             let n = chunks.len();
-            for (i, c) in chunks.iter().enumerate() {
-                w.s(if i + 1 == n { 1 } else { 3 }, c.clone());
-            }
-            if n == 0 {
-                w.s(1, "");
+            for (i, c) in chunks.into_iter().enumerate() {
+                w.s(if i + 1 == n { 1 } else { 3 }, c);
             }
             w.s(7, &t.style);
             if t.rotation != 0.0 {

@@ -159,3 +159,46 @@ fn a_paper_viewport_behind_a_model_viewport_stays_id_1_through_dwg() {
         assert_eq!((id(model), id(sheet)), (Some(2), Some(1)), "layout {name}");
     }
 }
+
+/// MTEXT contents, formatting codes, width, attachment and rotation survive a DWG round trip,
+/// also when a tab (`^I`) or a literal caret (`^ `) falls where the writer splits the contents
+/// into 250-character groups. The DWG bridge decodes each group on its own: a `^` ending one group
+/// and the `I` starting the next came back as the two characters `^I` instead of a tab (the 12th
+/// MTEXT of an AutoCAD sample drawing, a font table with a tab on every line).
+#[test]
+fn dwg_keeps_mtext_contents_formatting_width_attachment_and_rotation() {
+    let mut d = Drawing::new_metric();
+    let line = "\\fArial|b1|i0|c0|p34;\\C5;abcdefghij\t{\\H0.7x;ABC}\\P";
+    let mut texts = Vec::new();
+    // The escape at every position around the first and second group boundaries.
+    for (k, (pad, esc)) in (240..=252).flat_map(|n| [(n, '\t'), (n, '^'), (n + 250, '\t'), (n + 250, '^')]).enumerate() {
+        let contents = format!("{}{esc}I after{}\\Ptail ^ {}", "x".repeat(pad), line.repeat(k % 3), "\t".repeat(k % 2));
+        texts.push(MText {
+            insert: Vec3::new(k as f64, 2.0 * k as f64, 0.0),
+            height: 0.3,
+            width: 19.930391160798923 + k as f64,
+            attach: u8::try_from(k % 9 + 1).unwrap(),
+            rotation: (k as f64 * 7.5).to_radians(),
+            style: "Standard".into(),
+            contents,
+            line_spacing: 1.0,
+            line_spacing_exact: false,
+            columns: None,
+        });
+    }
+    let handles: Vec<Handle> = texts.iter().map(|t| d.add(&Space::Model, Common::default(), EntityKind::MText(t.clone())).unwrap()).collect();
+    for version in [None, Some(cadcraft_io::Version::R2007), Some(cadcraft_io::Version::R2018)] {
+        let dwg = cadcraft_io::write_with(&d, "x.dwg", &cadcraft_io::SaveOptions { version, binary: false }).unwrap();
+        let back = cadcraft_io::read(&dwg, "x.dwg").unwrap();
+        for (h, before) in handles.iter().zip(&texts) {
+            let Some(EntityKind::MText(after)) = back.entity(*h).map(|e| &e.kind) else { panic!("{version:?}: MTEXT {h:?} is gone") };
+            assert_eq!(after.contents, before.contents, "{version:?}: contents of {h:?}");
+            assert_eq!(after.width, before.width, "{version:?}: width of {h:?}");
+            assert_eq!(after.attach, before.attach, "{version:?}: attachment of {h:?}");
+            // DWG stores the direction: 360° reads back as 0°.
+            let turn = (after.rotation - before.rotation).rem_euclid(std::f64::consts::TAU);
+            assert!(turn.min(std::f64::consts::TAU - turn) < 1e-9, "{version:?}: rotation of {h:?}: {} -> {}", before.rotation, after.rotation);
+            assert_eq!((after.insert, after.height, &after.style), (before.insert, before.height, &before.style), "{version:?}: {h:?}");
+        }
+    }
+}

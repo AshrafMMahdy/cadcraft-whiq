@@ -282,6 +282,37 @@ pub fn page(key: &str, items: Vec<Value>, from: usize, limit: usize) -> Map<Stri
 /// multileaders, table cells and (with `dims`) dimension texts.
 pub fn texts(d: &Drawing, sp: &[(String, Space)], flt: &Filter, ctx: &Ctx) -> Result<Vec<Value>, ToolError> {
     let mut out = Vec::new();
+    each_text(d, sp, flt, ctx, &mut |v, ty, text, at, h, rot, style, tag| {
+        let mut o = json!({
+            "handle": v.e.handle.hex(), "type": ty, "text": text, "layer": v.layer, "space": v.space,
+            "at": pt(at), "height": round(h * v.xf.scale, 6), "rotation": round((rot + v.xf.rot).to_degrees(), 4), "style": style,
+        });
+        if let Some(t) = tag {
+            o["tag"] = json!(t);
+        }
+        if !v.via.is_empty() {
+            o["block"] = json!(v.via.join(" > "));
+            o["insert"] = json!(v.top_insert.map(|h| h.hex()));
+        }
+        out.push(o);
+    })?;
+    Ok(out)
+}
+
+/// The text of each item [`texts`] lists, and nothing else (a round trip compares these: a
+/// JSON object per text would hold several times the drawing's own memory on a large one).
+pub fn text_values(d: &Drawing, sp: &[(String, Space)], flt: &Filter, ctx: &Ctx) -> Result<Vec<String>, ToolError> {
+    let mut out = Vec::new();
+    each_text(d, sp, flt, ctx, &mut |_, _, text, _, _, _, _, _| out.push(text.to_string()))?;
+    Ok(out)
+}
+
+/// What [`each_text`] hands on for one text: the visit, type, trimmed text, position in the
+/// space, height and rotation (before the visit's transform), style and tag.
+type TextSink<'s> = dyn FnMut(&Visit<'_>, &str, &str, Vec2, f64, f64, &str, Option<&str>) + 's;
+
+/// Every text in `sp` that passes `flt`, in reading order.
+fn each_text(d: &Drawing, sp: &[(String, Space)], flt: &Filter, ctx: &Ctx, f: &mut TextSink<'_>) -> Result<(), ToolError> {
     for (name, space) in sp {
         let Some(store) = d.space(space) else { continue };
         walk(d, store, name, flt.expand_blocks, ctx, &mut |v| {
@@ -297,23 +328,12 @@ pub fn texts(d: &Drawing, sp: &[(String, Space)], flt: &Filter, ctx: &Ctx) -> Re
                 if ty == "AttDef" && !v.via.is_empty() {
                     continue;
                 }
-                let mut o = json!({
-                    "handle": v.e.handle.hex(), "type": ty, "text": text.trim(), "layer": v.layer, "space": v.space,
-                    "at": pt(at), "height": round(h * v.xf.scale, 6), "rotation": round((rot + v.xf.rot).to_degrees(), 4), "style": style,
-                });
-                if let Some(t) = tag {
-                    o["tag"] = json!(t);
-                }
-                if !v.via.is_empty() {
-                    o["block"] = json!(v.via.join(" > "));
-                    o["insert"] = json!(v.top_insert.map(|h| h.hex()));
-                }
-                out.push(o);
+                f(v, ty, text.trim(), at, h, rot, &style, tag.as_deref());
             }
             true
         })?;
     }
-    Ok(out)
+    Ok(())
 }
 
 pub type TextItem = (&'static str, String, Vec2, f64, f64, String, Option<String>);

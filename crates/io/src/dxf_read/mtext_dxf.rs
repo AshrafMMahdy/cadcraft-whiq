@@ -55,6 +55,37 @@ pub(crate) fn encode_contents(s: &str) -> String {
     out
 }
 
+/// The most characters in one contents group (DXF Reference, MTEXT: groups 3 of 250 characters,
+/// the rest in group 1).
+const CHUNK: usize = 250;
+
+/// The contents encoded ([`encode_contents`]) and cut into groups of at most 250 characters,
+/// never between a caret and the letter after it: readers that decode each group on its own
+/// (the DWG bridge does) would read a `^` ending one group and the `I` starting the next as the
+/// two characters `^I` instead of a tab. The last group is written as group 1, the others as 3;
+/// there is always one (empty contents give one empty group).
+pub(crate) fn content_chunks(s: &str) -> Vec<String> {
+    let enc = encode_contents(s);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut n = 0;
+    let mut it = enc.chars();
+    while let Some(c) = it.next() {
+        // Every caret of the encoded contents starts a pair (`^ `, `^I`, `^J`).
+        let pair = if c == '^' { it.next() } else { None };
+        let w = 1 + usize::from(pair.is_some());
+        if n + w > CHUNK {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
+        }
+        cur.push(c);
+        cur.extend(pair);
+        n += w;
+    }
+    out.push(cur);
+    out
+}
+
 /// The MTEXT's own tags: up to an embedded object (group 101), whose groups reuse MTEXT's codes.
 fn own(tags: &[Tag]) -> &[Tag] {
     let end = tags.iter().position(|t| t.code == 101).unwrap_or(tags.len());
@@ -117,4 +148,30 @@ pub(crate) fn column_tags(t: &MText) -> Vec<Tag> {
     ];
     v.extend(heights.into_iter().map(|h| Tag::f(50, h)));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Groups are at most 250 characters, join back to the encoded contents, and no group ends
+    /// inside a caret pair, wherever the pair falls.
+    #[test]
+    fn content_groups_never_split_a_caret_pair() {
+        assert_eq!(content_chunks(""), [""]);
+        assert_eq!(content_chunks(&"a".repeat(250)), ["a".repeat(250)]);
+        for pad in 240..520 {
+            for esc in ['\t', '^', '\n'] {
+                let s = format!("{}{esc}I{}", "x".repeat(pad), "y".repeat(pad % 7));
+                let chunks = content_chunks(&s);
+                assert_eq!(chunks.concat(), encode_contents(&s), "{pad} {esc:?}");
+                for c in &chunks {
+                    assert!(c.chars().count() <= CHUNK, "{pad} {esc:?}");
+                    assert_eq!(decode_contents(c).chars().filter(|&x| x == '^').count(), c.matches("^ ").count(), "{pad} {esc:?}: {c:?}");
+                }
+                let decoded: String = chunks.iter().map(|c| decode_contents(c)).collect();
+                assert_eq!(decoded, s, "{pad} {esc:?}: each group decoded on its own");
+            }
+        }
+    }
 }

@@ -162,14 +162,10 @@ pub(super) fn multiline_tags(w: &mut W, a: &Attrib, attdef: bool) {
     w.f(46, 0.0);
     w.i(71, i64::from(m.attach));
     w.i(72, 5);
-    let chars: Vec<char> = crate::dxf_read::mtext_dxf::encode_contents(&m.contents).chars().collect();
-    let chunks: Vec<String> = chars.chunks(250).map(|c| c.iter().collect()).collect();
+    let chunks = crate::dxf_read::mtext_dxf::content_chunks(&m.contents);
     let n = chunks.len();
-    for (i, c) in chunks.iter().enumerate() {
-        w.s(if i + 1 == n { 1 } else { 3 }, c.clone());
-    }
-    if n == 0 {
-        w.s(1, "");
+    for (i, c) in chunks.into_iter().enumerate() {
+        w.s(if i + 1 == n { 1 } else { 3 }, c);
     }
     w.s(7, &m.style);
     if m.rotation != 0.0 {

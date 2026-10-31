@@ -1,15 +1,15 @@
 use super::common::T;
 use super::entities::{entity_extras, entity_plot_style, entity_with_table_budget, insert_attribs, polyline_entity};
 use super::objects::{MAX_OBJECTS, Objects, page_setup};
-use super::{Block, BlockDef, Drawing, Entity, EntityKind, Handle, HashMap, Layout, LayoutDef, Rx, Tag, records};
+use super::{Block, BlockDef, Drawing, Entity, EntityKind, Handle, HashMap, Layout, LayoutDef, Placed, Rx, Tag, record_refs, records};
 
 pub(super) fn parse_entities(
-    recs: &[(String, Vec<Tag>)],
+    recs: &[(String, &[Tag])],
     d: &mut Drawing,
     rx: &mut Rx,
     skipped: &mut usize,
     table_cells_left: &mut usize,
-) -> Vec<(Option<String>, bool, Entity)> {
+) -> Vec<Placed> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some((kind, tags)) = recs.get(i) {
@@ -59,9 +59,11 @@ pub(super) fn parse_entities(
                 None => d.new_handle(),
             };
             entity_extras(kind, tags, h, &mut k, rx);
-            let more: Vec<_> =
-                extra.into_iter().map(|f| (owner.clone(), paper, Entity { handle: d.new_handle(), common: c.clone(), kind: f })).collect();
-            out.push((owner, paper, Entity { handle: h, common: c, kind: k }));
+            let more: Vec<_> = extra
+                .into_iter()
+                .map(|f| (owner.clone(), paper, std::sync::Arc::new(Entity { handle: d.new_handle(), common: c.clone(), kind: f })))
+                .collect();
+            out.push((owner, paper, std::sync::Arc::new(Entity { handle: h, common: c, kind: k })));
             out.extend(more);
         } else if kind == "HATCH" {
             // Without boundary data. The other records `entity` returns nothing for are read
@@ -73,8 +75,9 @@ pub(super) fn parse_entities(
     let mut seen = std::collections::HashSet::new();
     for (_, _, e) in &mut out {
         if !seen.insert(e.handle) {
-            e.handle = d.new_handle();
-            seen.insert(e.handle);
+            let h = d.new_handle();
+            std::sync::Arc::make_mut(e).handle = h;
+            seen.insert(h);
         }
     }
     out
@@ -88,7 +91,7 @@ pub(super) fn read_blocks(
     table_cells_left: &mut usize,
     skipped: &mut std::collections::BTreeMap<String, usize>,
 ) -> Vec<BlockDef> {
-    let recs = records(tags);
+    let recs = record_refs(tags);
     for (k, tg) in &recs {
         let t = T(tg);
         if k == "BLOCK" && t.i(70).unwrap_or(0) & 4 != 0 {
@@ -178,7 +181,7 @@ pub(super) fn place_blocks(d: &mut Drawing, blocks: Vec<BlockDef>, rx: &mut Rx, 
         if up == "*MODEL_SPACE" {
             for (_, _, e) in ents {
                 d.ensure_layer(&e.common.layer);
-                d.model.push(e);
+                d.model.push_shared(e);
             }
             continue;
         }
@@ -186,7 +189,7 @@ pub(super) fn place_blocks(d: &mut Drawing, blocks: Vec<BlockDef>, rx: &mut Rx, 
             let lname = paper_block_for.get(&up).cloned().unwrap_or_else(|| first_layout.to_string());
             if let Some(l) = d.layouts.iter_mut().find(|l| l.name == lname) {
                 for (_, _, e) in ents {
-                    l.entities.push(e);
+                    l.entities.push_shared(e);
                 }
             }
             continue;
@@ -195,7 +198,7 @@ pub(super) fn place_blocks(d: &mut Drawing, blocks: Vec<BlockDef>, rx: &mut Rx, 
         // nothing inserts whose content is the one CADCraft writes. An arrowhead block with other
         // content (AutoCAD's `_Dot`, a user's redefinition) is kept, so dimensions keep it.
         let generated_arrow = || {
-            let own: Vec<&Entity> = ents.iter().map(|(_, _, e)| e).collect();
+            let own: Vec<&Entity> = ents.iter().map(|(_, _, e)| e.as_ref()).collect();
             crate::dxf_ext::is_standard_arrow(&name) && !rx.inserted.contains(&up) && crate::dxf_write::is_generated_arrow(&name, &own)
         };
         if rx.table_blocks.contains(&up) || generated_arrow() {
@@ -212,7 +215,7 @@ pub(super) fn place_blocks(d: &mut Drawing, blocks: Vec<BlockDef>, rx: &mut Rx, 
             b.xref_overlay = xref & 8 != 0;
         } else {
             for (_, _, e) in ents {
-                b.entities.push(e);
+                b.entities.push_shared(e);
             }
         }
         // Array parameters, with the block names the items use (other programs may rename
@@ -226,13 +229,7 @@ pub(super) fn place_blocks(d: &mut Drawing, blocks: Vec<BlockDef>, rx: &mut Rx, 
 }
 
 /// Place the ENTITIES section: model space, or paper space when flagged (67=1).
-pub(super) fn place_entities(
-    d: &mut Drawing,
-    entities: Vec<(Option<String>, bool, Entity)>,
-    rx: &Rx,
-    paper_block_for: &HashMap<String, String>,
-    first_layout: &str,
-) {
+pub(super) fn place_entities(d: &mut Drawing, entities: Vec<Placed>, rx: &Rx, paper_block_for: &HashMap<String, String>, first_layout: &str) {
     for (owner, paper, e) in entities {
         d.ensure_layer(&e.common.layer);
         let owner_name = owner.and_then(|o| rx.brs.get(&o.trim().to_ascii_uppercase()).cloned()).map(|n| n.to_ascii_uppercase());
@@ -240,10 +237,10 @@ pub(super) fn place_entities(
         if to_paper {
             let lname = owner_name.and_then(|n| paper_block_for.get(&n).cloned()).unwrap_or_else(|| first_layout.to_string());
             if let Some(l) = d.layouts.iter_mut().find(|l| l.name == lname) {
-                l.entities.push(e);
+                l.entities.push_shared(e);
             }
         } else {
-            d.model.push(e);
+            d.model.push_shared(e);
         }
     }
 }

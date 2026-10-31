@@ -19,6 +19,7 @@ recorded here for review.
 | `crates/io` | `read_limited`: a read with the DWG bridge's limits chosen by the caller (the engine sizes them from its memory budget) |
 | `crates/engine` | `ReadFile::from_drawing`: hand a drawing the host read itself to `finish_open` |
 | `crates/dxf` | Binary DXF of R12 and earlier (1-byte group codes) reads; it failed with "no sections found" |
+| `crates/dxf`, `crates/io`, `crates/doc`, `crates/dwg` | C2 and C3 of the engines corpus (below): MTEXT contents cut only between caret pairs, MTEXT contents the DWG bridge's DXF cannot carry put back by handle; the reader borrows sections and records and hands entities over without copying them |
 | `.github/workflows/whiq-release.yml` | Builds `cadcraft-cli` for Linux x86_64 (musl, static) and Windows x86_64 (static CRT) with craft-fonts at the shared pin, runs the contract tests and the smoke against the built binary, publishes `cadcraft-cli-<tag>-linux-x86_64.tar.gz`, `cadcraft-cli-<tag>-windows-x86_64.zip`, `SHA256SUMS`, `engines.lock` |
 | `apps/cadcraft-cli/tests/mcp_contract.rs`, `whiq_smoke.py` | The contract suite (every tool, on drawings it builds; `CADCRAFT_CLI=path` runs it against another binary) and the platform's build smoke |
 
@@ -253,6 +254,55 @@ Aggregate over the 97: areas identical (32,174,588.838); block references 176 = 
 texts, dimensions, closed shapes identical. Scale hints: `$DIMSCALE`, `$LTSCALE` and the text
 matches agree on all 97; read_dxf's `cannoscale` is always null (2018 files store `$CANNOSCALE` as a
 handle), CADCraft names the scale (`1:1`; files without one show that default).
+
+## Engines corpus gate: C2 (MTEXT through DWG) and C3 (round-trip memory)
+
+The platform's engines corpus run (2026-10-31, `docs/engines-corpus/README.md` in White Hat IQ)
+found three cadcraft defects; these two are fixed here (C1, multileaders written as LEADER + MTEXT
+for R14–2004, is left for later).
+
+- **C2: an MTEXT changed on a DWG round trip** (`truetype.dwg`, an AutoCAD sample: the corpus row
+  read "12 → 12", the count of MTEXTs; one of the 12, the font table, changed, the other 11 were
+  already exact). CADCraft's DXF writer cut MTEXT contents into 250-character groups anywhere, here
+  between the `^` and the `I` of an encoded tab; the DWG bridge decodes each group on its own and
+  stored the two characters `^I`. The contents are now cut only between whole caret pairs
+  (`dxf_read/mtext_dxf.rs` `content_chunks`, used for MTEXT and multiline attributes). Two more
+  changes the bridge's own DXF writer makes on the way back (a caret followed by a space read back
+  as a caret alone, a line feed written as `\P`) are put back from the DWG by handle
+  (`cadcraft-dwg` `dwg_to_dxf_read` → `Converted.mtext`, applied in `cadcraft-io` `read_limited`).
+  `roundtrip_check` now also compares each multiline text of the spaces and named blocks as
+  written (contents with formatting codes, width, attachment, rotation), problem `what: "mtext"`
+  with up to 5 examples, not only the plain text. Tests:
+  `crates/io/tests/it/dwg_roundtrip_losses.rs` `dwg_keeps_mtext_contents_formatting_width_attachment_and_rotation`
+  (52 MTEXTs with a tab or caret at every position around the first two group boundaries, DWG
+  the default version, 2007 and 2018), `mtext_dxf` unit test `content_groups_never_split_a_caret_pair`, contract test
+  `roundtrip_keeps_multiline_texts_as_written`. All three failed before the fix (the contract test
+  also against the whiq-v0.1.1 binary).
+- **C3: `roundtrip_check` of a 90 MB, 1.5-million-entity DXF went past 6.9 GB and was killed.**
+  Intermediate copies dropped, no caps added: the DXF reader's sections and entity records now
+  borrow the one parsed copy of the file's groups (`cadcraft_dxf::section_refs`, `record_refs`;
+  they were copied twice over); entities waiting for their space are held as the `Arc` the space
+  keeps (`EntityStore::push_shared`; a 672-byte entity was held inline and then copied); strings
+  without `\U+` / `\M+` escapes are not copied a second time while parsing. `roundtrip_check`
+  takes what it compares from each drawing in turn and drops the written file and the copy read
+  back before comparing, texts as strings rather than JSON objects, and finds lost texts by a merge
+  of sorted lists (it was quadratic: a large drawing with a lost text would not have finished).
+  Test: contract test `roundtrip_check_memory_stays_in_proportion_to_the_file` (Linux: the
+  server's `VmHWM` over its resident size with the drawing open, for a generated 135,000-entity
+  floor plate; at most 48 times the file: 34.5× now, 68.2× with whiq-v0.1.1).
+
+Peak resident memory, release musl binary, `floorplate_500.dxf` (94.5 MB, 1,500,000 entities),
+over MCP stdio, the box shared with other builds:
+
+| Call | whiq-v0.1.1 | this change |
+|---|---|---|
+| `open_drawing` | 3,641 MB (1,331 MB after) | 1,991 MB (1,327 MB after); 16.3 s → 7.8 s |
+| `roundtrip_check {format: dxf}` | 6,593 MB (+5,262 MB over the open drawing) | 3,931 MB (+2,604 MB); 48 s → 38 s; lossless |
+| `roundtrip_check {format: dwg}` | 6,662 MB | 3,990 MB; lossless |
+
+Corpus regression (`roundtrip_check` of the 144 other CAD corpus files, DWG for .dwg, DXF for
+.dxf, whiq-v0.1.1 against this change): the same verdict on 143; `truetype.dwg` lossy → lossless.
+The 7 C1 files stay lossy and now also list their MTEXT count change.
 
 ## Release
 

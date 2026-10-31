@@ -287,7 +287,7 @@ fn parse_ascii_with_limit(text: &str, max_tags: usize) -> Result<Vec<Tag>> {
         let Some((_, val)) = lines.next() else { return Err(DxfError::Eof) };
         let v = typed(code, val);
         let v = match v {
-            Value::Str(s) => Value::Str(unescape_unicode(&s)),
+            Value::Str(s) if s.contains("\\U+") || s.contains("\\M+") => Value::Str(unescape_unicode(&s)),
             o => o,
         };
         tags.push(Tag { code, value: v });
@@ -549,20 +549,35 @@ pub struct Section {
     pub tags: Vec<Tag>,
 }
 
-/// Split a tag stream into sections.
-pub fn sections(tags: &[Tag]) -> Vec<Section> {
+/// A section borrowed from the tag stream it was found in ([`section_refs`]): its tags are not
+/// copied, so a reader holds one copy of a file's groups however large the file is.
+#[derive(Clone, Copy, Debug)]
+pub struct SectionRef<'a> {
+    pub name: &'a str,
+    pub tags: &'a [Tag],
+}
+
+/// True when `t` is a code-0 group whose text is `name` (no allocation).
+fn is_marker(t: &Tag, name: &str) -> bool {
+    t.code == 0 && matches!(&t.value, Value::Str(s) if s == name)
+}
+
+/// The sections of a tag stream, borrowed from it.
+pub fn section_refs(tags: &[Tag]) -> Vec<SectionRef<'_>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < tags.len() {
-        let is_sec = tags.get(i).is_some_and(|t| t.code == 0 && t.str() == "SECTION");
-        if is_sec {
-            let name = tags.get(i + 1).filter(|t| t.code == 2).map(Tag::str).unwrap_or_default();
+        if tags.get(i).is_some_and(|t| is_marker(t, "SECTION")) {
+            let name = match tags.get(i + 1) {
+                Some(Tag { code: 2, value: Value::Str(s) }) => s.as_str(),
+                _ => "",
+            };
             let start = i + 2;
             let mut j = start;
-            while j < tags.len() && !(tags.get(j).is_some_and(|t| t.code == 0 && t.str() == "ENDSEC")) {
+            while j < tags.len() && !tags.get(j).is_some_and(|t| is_marker(t, "ENDSEC")) {
                 j += 1;
             }
-            out.push(Section { name, tags: tags.get(start..j).unwrap_or(&[]).to_vec() });
+            out.push(SectionRef { name, tags: tags.get(start..j).unwrap_or(&[]) });
             i = j + 1;
         } else {
             i += 1;
@@ -571,17 +586,33 @@ pub fn sections(tags: &[Tag]) -> Vec<Section> {
     out
 }
 
-/// Split a run of tags into records starting at each code-0 tag: (type, tags after the 0).
-pub fn records(tags: &[Tag]) -> Vec<(String, Vec<Tag>)> {
-    let mut out: Vec<(String, Vec<Tag>)> = Vec::new();
-    for t in tags {
+/// Split a tag stream into sections (copies of their tags; [`section_refs`] borrows them).
+pub fn sections(tags: &[Tag]) -> Vec<Section> {
+    section_refs(tags).into_iter().map(|s| Section { name: s.name.to_string(), tags: s.tags.to_vec() }).collect()
+}
+
+/// Split a run of tags into records starting at each code-0 tag: (type, tags after the 0),
+/// borrowed from `tags`.
+pub fn record_refs(tags: &[Tag]) -> Vec<(String, &[Tag])> {
+    let mut out = Vec::new();
+    let mut open: Option<(String, usize)> = None;
+    for (i, t) in tags.iter().enumerate() {
         if t.code == 0 {
-            out.push((t.str(), Vec::new()));
-        } else if let Some(last) = out.last_mut() {
-            last.1.push(t.clone());
+            if let Some((k, s)) = open.take() {
+                out.push((k, tags.get(s..i).unwrap_or(&[])));
+            }
+            open = Some((t.str(), i + 1));
         }
     }
+    if let Some((k, s)) = open {
+        out.push((k, tags.get(s..).unwrap_or(&[])));
+    }
     out
+}
+
+/// Split a run of tags into records starting at each code-0 tag: (type, tags after the 0).
+pub fn records(tags: &[Tag]) -> Vec<(String, Vec<Tag>)> {
+    record_refs(tags).into_iter().map(|(k, t)| (k, t.to_vec())).collect()
 }
 
 #[cfg(test)]

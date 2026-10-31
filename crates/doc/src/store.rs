@@ -93,8 +93,13 @@ impl EntityStore {
     }
     /// Append on top of the draw order. Replaces an entity with the same handle in place.
     pub fn push(&mut self, e: Entity) {
+        self.push_shared(Arc::new(e));
+    }
+    /// [`push`](Self::push) for an entity already behind an `Arc` (a reader that builds many
+    /// entities hands them over without copying each one).
+    pub fn push_shared(&mut self, e: Arc<Entity>) {
         if self.contains(e.handle) {
-            self.replace(e);
+            self.replace(Arc::unwrap_or_clone(e));
             return;
         }
         let needs_new = self.chunks.last().is_none_or(|c| c.items.len() >= CHUNK_MAX);
@@ -105,7 +110,7 @@ impl EntityStore {
         let h = e.handle;
         let Some(last) = self.chunks.last_mut() else { return };
         let chunk = Arc::make_mut(last);
-        chunk.items.push(Arc::new(e));
+        chunk.items.push(e);
         let id = chunk.id;
         self.set_index(h, Some(id));
         self.len += 1;

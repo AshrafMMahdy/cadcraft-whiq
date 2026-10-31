@@ -72,9 +72,11 @@ pub fn read(bytes: &[u8], name: impl AsRef<Path>) -> Result<Drawing> {
 pub fn read_limited(bytes: &[u8], name: impl AsRef<Path>, limits: DwgLimits) -> Result<Drawing> {
     let name = name.as_ref();
     if cadcraft_dwg::is_dwg(bytes) {
-        let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, limits).map_err(IoError::Format)?;
-        let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
-        d.read_notes = notes;
+        let c = cadcraft_dwg::dwg_to_dxf_read(bytes, limits).map_err(IoError::Format)?;
+        let mut d = dxf_read::read(&c.dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
+        drop(c.dxf);
+        d.read_notes = c.notes;
+        mtext_contents(&mut d, c.mtext);
         return Ok(d);
     }
     match (Format::from_path(name), ext(name).as_str()) {
@@ -82,6 +84,34 @@ pub fn read_limited(bytes: &[u8], name: impl AsRef<Path>, limits: DwgLimits) -> 
         (Some(Format::Dxf), _) => dxf_read::read(bytes),
         (_, e) if bytes.len() > 4 => dxf_read::read(bytes).map_err(|_| IoError::Unsupported(e.to_string())),
         (_, e) => Err(IoError::Unsupported(e.to_string())),
+    }
+}
+
+/// The contents of multiline texts the DWG bridge's DXF does not carry exactly (a line feed, a
+/// caret followed by a space), put back from the DWG by handle.
+fn mtext_contents(d: &mut Drawing, fixes: Vec<(u64, String)>) {
+    if fixes.is_empty() {
+        return;
+    }
+    let fixes: std::collections::HashMap<cadcraft_doc::Handle, String> = fixes.into_iter().map(|(h, v)| (cadcraft_doc::Handle(h), v)).collect();
+    let set = |e: &mut cadcraft_doc::Entity| {
+        if let (cadcraft_doc::EntityKind::MText(t), Some(v)) = (&mut e.kind, fixes.get(&e.handle)) {
+            t.contents.clone_from(v);
+        }
+    };
+    let spaces = std::iter::once(&mut d.model).chain(d.layouts.iter_mut().map(|l| &mut l.entities));
+    for store in spaces {
+        for h in fixes.keys() {
+            store.modify(*h, set);
+        }
+    }
+    for b in d.blocks.values_mut() {
+        if fixes.keys().any(|h| b.entities.contains(*h)) {
+            let b = std::sync::Arc::make_mut(b);
+            for h in fixes.keys() {
+                b.entities.modify(*h, set);
+            }
+        }
     }
 }
 

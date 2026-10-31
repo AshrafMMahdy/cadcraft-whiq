@@ -777,3 +777,100 @@ fn markdown_rides_in_the_structured_result() {
     }
     assert!(m.call("read_drawing", json!({"section": "text"})).get("markdown").is_none());
 }
+
+/// C2 (engines corpus, an AutoCAD sample's font table): multiline texts keep their contents,
+/// formatting codes, width, attachment and rotation through a DWG round trip, also with a tab
+/// or a caret where the contents are cut into 250-character groups, and `roundtrip_check`
+/// compares them as written (not only their plain text).
+#[test]
+fn roundtrip_keeps_multiline_texts_as_written() {
+    let mut m = Mcp::start("mtext", &[]);
+    m.call("new_drawing", json!({}));
+    let mut ops = Vec::new();
+    for (k, pad) in (244..=252).enumerate() {
+        let text = format!("{}\tSwiss Light{{\\fArial|b1|i0|c0|p34;\\C5;abc}}\\P\\pl0,tz;next\t^ caret ^I", "x".repeat(pad));
+        let k = k as u64;
+        ops.push(json!({"op": "add", "type": "mtext", "at": [0, k * 10], "text": text, "height": 0.3, "width": 19.930391160798923 + k as f64,
+            "attach": k % 9 + 1, "rotation": 15 * k}));
+    }
+    let r = m.call("edit", json!({"ops": ops}));
+    assert_eq!(r["failed"], 0, "{r}");
+    for (fmt, version) in [("dwg", json!(null)), ("dwg", json!(2007)), ("dwg", json!(2018)), ("dxf", json!(null))] {
+        let rt = m.call("roundtrip_check", json!({"format": fmt, "version": version}));
+        assert_eq!(rt["lossless"], true, "{fmt} {version}: {rt}");
+    }
+    // A formatting code changed in the copy read back is a loss: the check reads the codes.
+    let s = m.call("save_drawing", json!({"path": "mtext.dwg"}));
+    assert!(s["saved"][0]["bytes"].as_u64().unwrap() > 1000, "{s}");
+    copy(m.dir.join("out").join("mtext.dwg"), m.dir.join("in").join("mtext.dwg"));
+    let o = m.call("open_drawing", json!({"path": "mtext.dwg"}));
+    let t = m.call("read_drawing", json!({"document": o["document"], "section": "text"}));
+    let texts: Vec<&str> = t["texts"].as_array().unwrap().iter().filter_map(|x| x["text"].as_str()).collect();
+    assert_eq!(texts.len(), 9, "{t}");
+    assert!(texts.iter().all(|x| x.contains("\tSwiss Light") && x.ends_with("^ caret ^I") && !x.contains("\\f")), "{texts:?}");
+}
+
+/// The value of a `/proc/<pid>/status` field in kB.
+#[cfg(target_os = "linux")]
+fn proc_kb(pid: u32, field: &str) -> u64 {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    s.lines().find_map(|l| l.strip_prefix(field)?.trim_start_matches(':').trim().strip_suffix("kB")?.trim().parse().ok()).unwrap()
+}
+
+/// A generated floor plate as an R12 DXF: `n` × `n` rooms, each 4 walls, a room tag and a light
+/// (the engines corpus' 90 MB file is the same with `n` = 500).
+fn floor_plate(n: usize) -> String {
+    let mut w = String::from("0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n");
+    w.push_str("0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLAYER\n70\n3\n");
+    for (name, c) in [("A-WALL", 1), ("A-ANNO", 3), ("E-LITE", 5)] {
+        w.push_str(&format!("0\nLAYER\n2\n{name}\n70\n0\n62\n{c}\n6\nCONTINUOUS\n"));
+    }
+    w.push_str("0\nENDTAB\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n");
+    let s = 5000.0;
+    for i in 0..n {
+        for j in 0..n {
+            let (x, y) = (i as f64 * s, j as f64 * s);
+            for (a, b, c, d) in [(x, y, x + s, y), (x + s, y, x + s, y + s), (x + s, y + s, x, y + s), (x, y + s, x, y)] {
+                w.push_str(&format!("0\nLINE\n8\nA-WALL\n10\n{a}\n20\n{b}\n11\n{c}\n21\n{d}\n"));
+            }
+            w.push_str(&format!("0\nTEXT\n8\nA-ANNO\n10\n{}\n20\n{}\n40\n250\n1\nROOM {i:03}-{j:03}\n", x + 500.0, y + 2500.0));
+            w.push_str(&format!("0\nCIRCLE\n8\nE-LITE\n10\n{}\n20\n{}\n40\n300\n", x + 2500.0, y + 2500.0));
+        }
+    }
+    w.push_str("0\nENDSEC\n0\nEOF\n");
+    w
+}
+
+/// C3 (engines corpus: a 90 MB, 1.5-million-entity DXF went past 6.9 GB and was killed): the
+/// memory `roundtrip_check` adds to the open drawing stays in proportion to the file. Measured as
+/// the server's peak resident memory during the check (Linux: `VmHWM`, reset before it) over its
+/// resident memory with the drawing open.
+#[cfg(target_os = "linux")]
+#[test]
+fn roundtrip_check_memory_stays_in_proportion_to_the_file() {
+    let mut m = Mcp::start("bigrt", &[]);
+    let dxf = floor_plate(150);
+    std::fs::write(m.dir.join("in").join("floor.dxf"), &dxf).unwrap();
+    let o = m.call("open_drawing", json!({"path": "floor.dxf"}));
+    assert_eq!(o["entities"], 150 * 150 * 6, "{o}");
+    let pid = m.child.id();
+    let open = proc_kb(pid, "VmRSS");
+    // Writing 5 to clear_refs resets the peak to the current resident size.
+    if std::fs::write(format!("/proc/{pid}/clear_refs"), "5").is_err() {
+        eprintln!("clear_refs is not writable here; memory not measured");
+        return;
+    }
+    let rt = m.call("roundtrip_check", json!({"format": "dxf"}));
+    assert_eq!(rt["lossless"], true, "{rt}");
+    let peak = proc_kb(pid, "VmHWM");
+    let file_kb = dxf.len() as u64 / 1024;
+    let added = peak.saturating_sub(open);
+    eprintln!("file {file_kb} kB, open {open} kB, peak in roundtrip_check {peak} kB (+{added} kB, {:.1}x the file)", added as f64 / file_kb as f64);
+    assert!(added <= RT_MEMORY_PER_FILE_BYTE * file_kb, "roundtrip_check added {added} kB to the {open} kB of the open drawing ({file_kb} kB file)");
+}
+
+/// The most memory `roundtrip_check` may add, per byte of the DXF file the drawing came from: it
+/// holds the file it wrote (about 2.6 times the source here), its groups and the copy read back
+/// (about 34 times the file in all, 2026-10-31); whiq-v0.1.1 added 68 times the file.
+#[cfg(target_os = "linux")]
+const RT_MEMORY_PER_FILE_BYTE: u64 = 48;
