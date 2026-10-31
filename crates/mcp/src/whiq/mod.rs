@@ -10,6 +10,7 @@ pub mod files;
 pub mod preview;
 pub mod read;
 pub mod runtime;
+pub mod takeoff;
 pub mod tools;
 
 pub use runtime::{Config, all_definitions, serve};

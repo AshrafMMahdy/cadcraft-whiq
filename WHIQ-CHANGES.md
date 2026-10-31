@@ -46,7 +46,7 @@ forks' 18. Answers over `--max-result-bytes` are trimmed (`truncated`, `continue
 |---|---|---|
 | `open_drawing` | `path` (read root) | `{document, name, path, format: dwg\|dxf, version, release, entities, layouts, layers, blocks, warnings}` |
 | `new_drawing` | `metric?` | `{document, …}` |
-| `read_drawing` | `document?` \| `path?`; `section`: summary \| text \| dimensions \| title_block \| entities \| layers \| blocks \| layouts \| xrefs; `space?` (all \| model \| paper \| layout \| list), `layer?`, `window?` [[x0,y0],[x1,y1]], `contains?`, `match?`, `type?`, `expand_blocks?` (true), `geometry?`, `anonymous?`, `limit?` (500), `continue_from?`, `format?` json \| markdown | summary: `{file {format, version, release, bytes}, units {insunits(_name), measurement, lunits(_name), luprec, aunits, dimscale, ltscale}, entities, counts {space: {type: n}}, texts, dimensions, layouts [{name, entities, extents, paper, viewports, active}], layers {count, off, frozen, names}, blocks, xrefs, title_blocks, styles, read_notes, skipped_records}`; lists: `{total, returned, offset, <section>: […], continue_from?}` — text `{handle, type, text, layer, space, at, height, rotation, style, tag?, block?, insert?}`; dimensions `{handle, kind, text, measurement, unit, overridden, layer, space, at, style, points}`; title_block `{candidates [{handle, block, space, layer, at, scale, rotation, score, likely, attributes {TAG: value}, block_texts}], sheet_texts}`; entities `{handle, type, dxf, layer, space, color, bounds, block?, in_block?, geometry?}`; layers `{name, on, frozen, locked, plot, color, linetype, lineweight, transparency, description, entities}`; blocks `{name, entities, base, references, attributes [{tag, prompt, default}], xref_path}`; layouts `{name, extents, entities, tab_order, page, viewports [{handle, center, width, height, view_center, view_height, scale, frozen_layers}], active}` |
+| `read_drawing` | `document?` \| `path?`; `section`: summary \| takeoff \| text \| dimensions \| title_block \| entities \| layers \| blocks \| layouts \| xrefs; `space?` (all \| model \| paper \| layout \| list), `layer?`, `window?` [[x0,y0],[x1,y1]], `contains?`, `match?`, `type?`, `expand_blocks?` (true), `geometry?`, `anonymous?`, `limit?` (500), `continue_from?`, `format?` json \| markdown | summary: `{file {format, version, release, bytes}, units {insunits(_name), measurement, lunits(_name), luprec, aunits, dimscale, ltscale}, entities, counts {space: {type: n}}, texts, dimensions, layouts [{name, entities, extents, paper, viewports, active}], layers {count, off, frozen, names}, blocks, xrefs, title_blocks, styles, read_notes, skipped_records}`; lists: `{total, returned, offset, <section>: […], continue_from?}` — text `{handle, type, text, layer, space, at, height, rotation, style, tag?, block?, insert?}`; dimensions `{handle, kind, text, measurement, unit, overridden, layer, space, at, style, points}`; title_block `{candidates [{handle, block, space, layer, at, scale, rotation, score, likely, attributes {TAG: value}, block_texts}], sheet_texts}`; entities `{handle, type, dxf, layer, space, color, bounds, block?, in_block?, geometry?}`; layers `{name, on, frozen, locked, plot, color, linetype, lineweight, transparency, description, entities}`; blocks `{name, entities, base, references, attributes [{tag, prompt, default}], xref_path}`; layouts `{name, extents, entities, tab_order, page, viewports [{handle, center, width, height, view_center, view_height, scale, frozen_layers}], active}` |
 | `search_drawing` | `query`, `match?`, `kinds?` (text, attribute, tag, dimension, block_reference, block, layer, layout), `space?`, `layer?`, `window?`, `limit?` | `{total, hits [{match, kind, text, tag?, handle, layer, space, at, block?, insert?}]}` |
 | `render_preview` | `document?` \| `path?`; `space?` (model) \| `viewport?` (handle); `window?`; `tiles?` {cols, rows}; `tile?` [col, row]; `layers_off?`, `layers_on?`, `only_layers?`; `format?` svg \| png; `width?`, `height?`; `background?` light \| dark; `output?` (write files) | `{space, format, window, extents, total_tiles, returned, tiles [{tile, window, bytes, primitives \| width/height, svg? \| saved?}], primitives, layers [{name, on}], continue_from?}`; PNG tiles come as image blocks |
 | `export` | `path` (its extension or `format`: dxf \| dwg \| pdf \| svg \| png), `document?` \| `source?`, `version?` (2000–2018), `binary?`, `space?` (model \| layout \| list \| all), `window?`, layer switches, `paper?`, `landscape?`, `scale?`, `fit?`, `lineweights?`, `width?`, `overwrite?` | `{document, format, saved [{path, bytes, format, space?, previous_renamed_to?}]}` |
@@ -206,6 +206,53 @@ dev build, file for file).
   `render_preview`, the text read back from the DWG).
 - The Preview tab: `render_preview` answers SVG tiles (`tiles[].svg`, `window`, y running down);
   `max_bytes` sets how many fit in one answer; each primitive group is `<g data-layer="…">`.
+
+## whiq-v0.1.1: take-off, scale hints, markdown in the structured result
+
+So the platform's `read_dxf` (and its LibreDWG converter) can be retired, `read_drawing` now answers
+everything `read_dxf` did, for DWG and DXF (ASCII and binary):
+
+- **`section: "takeoff"`** — per layer (`by_layer`, paged with `limit` / `continue_from`) and in
+  `totals`, in drawing units, never converted:
+  `{lengths {LINE, ARC, LWPOLYLINE, POLYLINE, SPLINE, ELLIPSE…, total}, perimeters {…, HATCH, total},
+  areas {…, HATCH, total}, counts {blocks {NAME: n}, CIRCLE, text, dimensions, closed_shapes,
+  open_shapes}}`, plus `unit`, `area_unit`, `units {insunits, source}`, `space`, `expand_blocks`,
+  `references_read`, `crossing`, `block_names`, `scale_hint`, `note`. Arguments: `space` (default
+  model: paper space holds title blocks and viewports), `layer`, `window` (objects inside it, or
+  crossing it with `crossing: true`), `block_names`, `expand_blocks` (default true: the geometry
+  inside each reference is measured with its scale, MINSERT rows × columns; false counts references
+  only, as `read_dxf` did), `unit_override` (relabels only), `format: markdown`.
+  Closed = closed flag, or first vertex == last vertex; polyline bulges exact; HATCH areas by island
+  nesting and hatch style, listed but out of each `total`; straight lengths 3D, areas XY.
+- **Summary** adds `scale_hint {dimscale, ltscale, cannoscale, text_matches [{match, text, layer,
+  space}] (first 20 "1:100" / `1/4"=1'-0"` texts, every space, inside blocks too), note}` and
+  `text_samples` (first 30).
+- **Entities** carry `summary` (one line: `LWPOLYLINE closed, perimeter 14, area 12`, `CIRCLE r=1
+  area 3.142`, `INSERT DOOR rot 0° scale 2×2`, `HATCH ANSI31, 2 path(s), area 37.699`…) and
+  `length` / `perimeter` / `area` / `closed`; **layers** carry `by_type` (top-level counts by DXF
+  type, every space).
+- **`format: "markdown"`** (read_drawing, search_drawing) also puts the markdown in the structured
+  result as `markdown` (the platform hands callers the structured result only).
+- Reader fixes found by the comparison: hatch boundary **ellipse edges** store angles, not ellipse
+  parameters (CADCraft drew and measured them wrong: `hatches_2.dxf` 11.8 units too long); an
+  **ELLIPSE with ratio > 1** is the same curve with the axes swapped (it was clamped into a circle).
+  A read whose only match escapes the roots through a link now answers `outside_root`.
+
+### Comparison with `read_dxf` (97 DXFs it can read; it refuses binary DXF and fails one R10 file)
+
+CADCraft with `expand_blocks: false` (read_dxf's semantics), model space:
+
+| Result | Files | Detail |
+|---|---:|---|
+| Identical totals and per-layer figures, block counts, circle/text/dimension/shape counts | **85** | |
+| Spline lengths differ by ≤ 0.005 | 7 | read_dxf samples 48 points a span with weights ignored; CADCraft matches an exact evaluation (15.186 vs exact 15.1859; 37.123 vs 37.1226) |
+| HATCH area differs | 2 | `hatch_issues.dxf`: read_dxf misses islands bounded by bulged two-vertex loops (gives 16π + 4π; correct, CADCraft: 16π − 4π). `hatches_2.dxf`: read_dxf reads ellipse-edge angles as parameters (perimeter 179.44; exact 179.91, CADCraft 179.91 for that hatch) |
+| read_dxf wrong | 3 | `circle_radius_le_0.dxf`: negative perimeter (−6.283) for a negative radius; `ASCII_R12.dxf`: layer name left as `\U+` escapes; `recover01.dxf`: read_dxf reads no entities (CADCraft: 1,441 open shapes, 29,569.559 long) |
+
+Aggregate over the 97: areas identical (32,174,588.838); block references 176 = 176; circles,
+texts, dimensions, closed shapes identical. Scale hints: `$DIMSCALE`, `$LTSCALE` and the text
+matches agree on all 97; read_dxf's `cannoscale` is always null (2018 files store `$CANNOSCALE` as a
+handle), CADCraft names the scale (`1:1`; files without one show that default).
 
 ## Release
 

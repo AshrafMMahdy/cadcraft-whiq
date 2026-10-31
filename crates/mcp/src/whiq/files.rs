@@ -94,6 +94,7 @@ impl Roots {
             return Err(self.outside(trimmed));
         }
         let mut first_ok = None;
+        let mut escaped = false;
         for c in &candidates {
             let r = real(c);
             if unrestricted || allowed.iter().any(|a| r.starts_with(a)) {
@@ -101,9 +102,14 @@ impl Roots {
                     return Ok(r);
                 }
                 first_ok.get_or_insert(r);
+            } else {
+                escaped = true;
             }
         }
         match first_ok {
+            // Nothing inside the roots exists there, and the name reaches outside (a link out of a
+            // root): that is the answer, not "not found".
+            Some(_) if escaped && access == Access::Read => Err(self.outside(trimmed)),
             Some(r) => Ok(r),
             None => Err(self.outside(trimmed)),
         }

@@ -668,3 +668,112 @@ fn xrefs_attach_list_and_read_through() {
     );
     assert_eq!(e["code"], "outside_root");
 }
+
+fn near(v: &Value, want: f64) -> bool {
+    v.as_f64().is_some_and(|x| (x - want).abs() < 1e-3)
+}
+
+/// The take-off read_dxf gave (lengths, perimeters, areas by type, HATCH apart; block counts;
+/// circle, text and dimension counts), on a drawing whose figures are known by hand.
+#[test]
+fn takeoff_measures_per_layer_and_in_total() {
+    let mut m = Mcp::start("takeoff", &[]);
+    m.call("new_drawing", json!({"metric": true}));
+    let r = m.call(
+        "edit",
+        json!({"ops": [
+            {"op": "layer", "action": "new", "name": "WALL"},
+            {"op": "layer", "action": "new", "name": "ROOM"},
+            {"op": "layer", "action": "current", "name": "WALL"},
+            {"op": "add", "type": "line", "points": [[0, 0], [10, 0]]},
+            {"op": "add", "type": "arc", "center": [0, 0], "radius": 2, "start": 0, "end": 90},
+            {"op": "layer", "action": "current", "name": "ROOM"},
+            {"op": "add", "type": "pline", "vertices": [[20, 0], [24, 0], [24, 3], [20, 3]], "closed": true},
+            {"op": "add", "type": "circle", "center": [30, 0], "radius": 1},
+            {"op": "add", "type": "text", "at": [20, 5], "text": "SCALE 1:50", "height": 0.5},
+            {"op": "add", "type": "dimlinear", "p1": [20, 0], "p2": [24, 0], "at": [22, -2]},
+            {"op": "command", "command": "hatch", "params": {"points": [[22, 1.5]]}},
+            {"op": "layer", "action": "current", "name": "0"},
+            {"op": "add", "type": "line", "points": [[0, 0], [1, 0]]}
+        ]}),
+    );
+    assert_eq!(r["failed"], 0, "{r}");
+    let door = made(&r["results"][12]);
+    let r = m.call(
+        "edit",
+        json!({"ops": [
+            {"op": "block", "action": "define", "name": "DOOR", "base": [0, 0], "handles": [door], "keep": "delete"},
+            {"op": "layer", "action": "current", "name": "WALL"},
+            {"op": "block", "action": "insert", "name": "DOOR", "at": [50, 0], "scale": 2},
+            {"op": "block", "action": "insert", "name": "DOOR", "at": [60, 0], "scale": 2},
+            {"op": "space", "name": "Layout1"},
+            {"op": "add", "type": "line", "points": [[0, 0], [100, 0]]},
+            {"op": "space", "name": "Model"}
+        ]}),
+    );
+    assert_eq!(r["failed"], 0, "{r}");
+    let t = m.call("read_drawing", json!({"section": "takeoff"}));
+    let tot = &t["totals"];
+    // Lines: 10 on WALL + two doors of 1 at scale 2 (read into); the arc a quarter of r = 2.
+    assert!(near(&tot["lengths"]["LINE"], 14.0), "{t}");
+    assert!(near(&tot["lengths"]["ARC"], std::f64::consts::PI), "{t}");
+    assert!(near(&tot["lengths"]["total"], 14.0 + std::f64::consts::PI), "{t}");
+    // Closed: the 4 × 3 room and the circle; the hatch listed apart, out of the total.
+    assert!(near(&tot["areas"]["LWPOLYLINE"], 12.0) && near(&tot["perimeters"]["LWPOLYLINE"], 14.0), "{t}");
+    assert!(near(&tot["areas"]["CIRCLE"], std::f64::consts::PI), "{t}");
+    assert!(near(&tot["areas"]["HATCH"], 12.0), "{t}");
+    assert!(near(&tot["areas"]["total"], 12.0 + std::f64::consts::PI), "{t}");
+    assert_eq!(tot["counts"]["blocks"]["DOOR"], 2);
+    assert_eq!(tot["counts"]["CIRCLE"], 1);
+    assert_eq!(tot["counts"]["text"], 1);
+    assert_eq!(tot["counts"]["dimensions"], 1);
+    assert_eq!(t["unit"], "mm");
+    // Per layer.
+    let wall = t["by_layer"].as_array().unwrap().iter().find(|l| l["layer"] == "WALL").unwrap();
+    assert!(near(&wall["lengths"]["LINE"], 14.0), "the doors' contents on layer 0 take the reference's layer: {wall}");
+    let room = t["by_layer"].as_array().unwrap().iter().find(|l| l["layer"] == "ROOM").unwrap();
+    assert!(near(&room["areas"]["total"], 12.0 + std::f64::consts::PI));
+    // References only (read_dxf's way), a window, a layer, paper space.
+    let t = m.call("read_drawing", json!({"section": "takeoff", "expand_blocks": false}));
+    assert!(near(&t["totals"]["lengths"]["LINE"], 10.0), "{t}");
+    assert_eq!(t["totals"]["counts"]["blocks"]["DOOR"], 2);
+    let t = m.call("read_drawing", json!({"section": "takeoff", "window": [[19, -3], [32, 6]]}));
+    assert!(t["totals"]["lengths"].get("LINE").is_none(), "{t}");
+    assert!(near(&t["totals"]["areas"]["LWPOLYLINE"], 12.0));
+    let t = m.call("read_drawing", json!({"section": "takeoff", "window": [[5, -1], [21, 4]], "crossing": true}));
+    assert!(near(&t["totals"]["lengths"]["LINE"], 10.0) && near(&t["totals"]["areas"]["LWPOLYLINE"], 12.0), "{t}");
+    let t = m.call("read_drawing", json!({"section": "takeoff", "layer": "ROOM"}));
+    assert!(t["totals"]["lengths"].as_object().unwrap().is_empty());
+    let t = m.call("read_drawing", json!({"section": "takeoff", "space": "Layout1"}));
+    assert!(near(&t["totals"]["lengths"]["LINE"], 100.0), "{t}");
+    // Scale hints: the header and the "1:50" text.
+    let s = m.call("read_drawing", json!({"section": "summary"}));
+    assert_eq!(s["scale_hint"]["text_matches"][0]["match"], "1:50", "{}", s["scale_hint"]);
+    assert!(s["scale_hint"]["dimscale"].is_number());
+    assert!(s["text_samples"].as_array().unwrap().iter().any(|x| x["text"] == "SCALE 1:50"));
+    // Entities carry a one-line summary with their measures; layers their types.
+    let e = m.call("read_drawing", json!({"section": "entities", "type": "Polyline", "space": "model"}));
+    assert!(near(&e["entities"][0]["area"], 12.0) && e["entities"][0]["summary"].as_str().unwrap().contains("area 12"), "{e}");
+    let l = m.call("read_drawing", json!({"section": "layers"}));
+    let room = l["layers"].as_array().unwrap().iter().find(|x| x["name"] == "ROOM").unwrap();
+    assert_eq!(room["by_type"]["CIRCLE"], 1, "{room}");
+}
+
+/// Markdown answers carry the markdown in the structured result too (the platform reads only that).
+#[test]
+fn markdown_rides_in_the_structured_result() {
+    let mut m = Mcp::start("markdown", &[]);
+    build_sheet(&mut m);
+    for (tool, args) in [
+        ("read_drawing", json!({"section": "text", "format": "markdown"})),
+        ("read_drawing", json!({"section": "summary", "format": "markdown"})),
+        ("read_drawing", json!({"section": "takeoff", "format": "markdown"})),
+        ("search_drawing", json!({"query": "OFFICE", "format": "markdown"})),
+    ] {
+        let raw = m.call_raw(tool, args.clone());
+        let md = raw["structuredContent"]["markdown"].as_str().unwrap_or_else(|| panic!("{tool} {args}: no markdown in {raw}"));
+        assert_eq!(raw["content"][0]["text"].as_str(), Some(md), "{tool} {args}");
+        assert!(md.contains('|') || md.starts_with('#'), "{md}");
+    }
+    assert!(m.call("read_drawing", json!({"section": "text"})).get("markdown").is_none());
+}

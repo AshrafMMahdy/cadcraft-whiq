@@ -26,13 +26,21 @@ fn arc(c: &Common, t: &T) -> Arc {
 }
 
 fn ellipse(c: &Common, t: &T) -> Ellipse {
-    let mut e = Ellipse {
-        center: t.p(10),
-        major: t.p(11),
-        ratio: t.fd(40, 1.0).clamp(1e-9, 1.0),
-        start: t.fd(41, 0.0),
-        end: t.fd(42, std::f64::consts::TAU),
-    };
+    let mut e = Ellipse { center: t.p(10), major: t.p(11), ratio: t.fd(40, 1.0), start: t.fd(41, 0.0), end: t.fd(42, std::f64::consts::TAU) };
+    // A ratio above 1 (outside the DXF Reference, but written by some programs) is the same curve
+    // with the axes swapped: the minor axis becomes the major, the ratio its inverse, and the
+    // parameters move back a quarter turn. Clamping it to 1 would turn the ellipse into a circle.
+    if e.ratio.is_finite() && e.ratio > 1.0 && e.ratio < 1e9 {
+        let m = e.major;
+        e.major = cadcraft_geom::Vec3::new(-m.y * e.ratio, m.x * e.ratio, m.z);
+        e.ratio = 1.0 / e.ratio;
+        let full = (cadcraft_geom::ccw_sweep(e.start, e.end) - std::f64::consts::TAU).abs() <= 1e-9;
+        if !full {
+            e.start = cadcraft_geom::norm_angle(e.start - std::f64::consts::FRAC_PI_2);
+            e.end = cadcraft_geom::norm_angle(e.end - std::f64::consts::FRAC_PI_2);
+        }
+    }
+    e.ratio = if e.ratio.is_finite() { e.ratio.clamp(1e-9, 1.0) } else { 1.0 };
     if c.extrusion.z < 0.0 && (cadcraft_geom::ccw_sweep(e.start, e.end) - std::f64::consts::TAU).abs() > 1e-9 {
         // Centre and major axis are WCS, but the minor axis is extrusion × major: with (0,0,-1)
         // it points the other way, so parameter t lands where -t does in the XY plane. A full

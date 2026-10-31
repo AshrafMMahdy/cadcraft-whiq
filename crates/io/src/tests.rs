@@ -2827,3 +2827,49 @@ fn non_unicode_names_pick_the_format_by_extension() {
     assert!(write(&d, name("png")).unwrap().starts_with(b"\x89PNG"));
     assert!(write(&d, name("dwt")).is_ok(), "a template is written as DWG");
 }
+
+/// Hatch boundary ellipse edges store angles from the major axis (groups 50/51), not ellipse
+/// parameters: the arc must end where the next edge starts (ezdxf `hatches_2.dxf` was 11.8 units
+/// too long when they were read as parameters).
+#[test]
+fn hatch_ellipse_edge_angles_are_angles() {
+    // A quarter sector: ellipse (major 10, ratio 0.5) from 0° to 45°, then back to the centre.
+    let text = "0\nSECTION\n2\nENTITIES\n0\nHATCH\n2\nSOLID\n70\n1\n91\n1\n92\n1\n93\n3\n\
+        72\n3\n10\n0\n20\n0\n11\n10\n21\n0\n40\n0.5\n50\n0\n51\n45\n73\n1\n\
+        72\n1\n10\n4.47213595499958\n20\n4.47213595499958\n11\n0\n21\n0\n\
+        72\n1\n10\n0\n20\n0\n11\n10\n21\n0\n\
+        97\n0\n75\n0\n76\n1\n0\nENDSEC\n0\nEOF\n";
+    let d = read_dxf(text.as_bytes()).unwrap();
+    let h = d.model.iter().find_map(|e| match &e.kind {
+        EntityKind::Hatch(h) => Some(h.clone()),
+        _ => None,
+    });
+    let h = h.unwrap();
+    let pts: Vec<Vec2> = h.loops[0].vertices.iter().map(|v| v.p).collect();
+    // The arc's last point is the point at 45° on the ellipse: (√20, √20).
+    let r = 20f64.sqrt();
+    assert!(pts.iter().any(|p| (p.x - r).abs() < 1e-6 && (p.y - r).abs() < 1e-6), "{pts:?}");
+    // And nothing of the arc lies beyond the 45° ray.
+    assert!(pts.iter().all(|p| p.y <= p.x + 1e-6), "{pts:?}");
+}
+
+/// An ELLIPSE with a ratio above 1 is the same curve with its axes swapped, not a circle
+/// (ezdxf `duplicate_handles.dxf`: quarter arcs 0.5% short when the ratio was clamped).
+#[test]
+fn ellipse_ratio_above_one_swaps_the_axes() {
+    let text =
+        "0\nSECTION\n2\nENTITIES\n0\nELLIPSE\n10\n0\n20\n0\n30\n0\n11\n10\n21\n0\n31\n0\n40\n2\n41\n0\n42\n1.5707963267948966\n0\nENDSEC\n0\nEOF\n";
+    let d = read_dxf(text.as_bytes()).unwrap();
+    let el = d.model.iter().find_map(|e| match &e.kind {
+        EntityKind::Ellipse(el) => Some(el.clone()),
+        _ => None,
+    });
+    let el = el.unwrap();
+    assert!((el.ratio - 0.5).abs() < 1e-12, "{el:?}");
+    assert!((el.major.x.hypot(el.major.y) - 20.0).abs() < 1e-9, "{el:?}");
+    let g = cadcraft_geom::Ellipse { center: el.center.xy(), major: el.major.xy(), ratio: el.ratio, start: el.start, end: el.end };
+    // The written arc ran from (10, 0) (t = 0) to (0, 20) (t = π/2): the same points now.
+    let (a, b) = (g.at_param(g.start), g.at_param(g.start + g.sweep()));
+    assert!((a.x - 10.0).abs() < 1e-9 && a.y.abs() < 1e-9, "{a:?}");
+    assert!(b.x.abs() < 1e-9 && (b.y - 20.0).abs() < 1e-9, "{b:?}");
+}

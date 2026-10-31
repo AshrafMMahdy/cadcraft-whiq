@@ -57,10 +57,13 @@ pub fn definitions() -> Vec<Value> {
             "annotations": rw, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
         json!({"name": "new_drawing", "description": "Start a new empty drawing (imperial, or metric: true). Answers its `document` handle.",
             "inputSchema": {"type": "object", "properties": {"metric": {"type": "boolean"}}}, "annotations": rw, "_meta": {"whiq/files": {"read": [], "opens": true}}}),
-        json!({"name": "read_drawing", "description": "Read a drawing for an agent. section: summary (default: units, version, extents, layouts, layer/block counts, entity counts, title blocks), text (every TEXT/MTEXT/attribute/multileader/table cell with layer, space, position, height; texts inside blocks too), dimensions (shown text and measured value, kind, layer, position), title_block (attributed block references ranked as title blocks, with every attribute and the block's fixed texts; plus texts on each layout sheet), entities (handles, types, layers, bounds; geometry: true adds the full geometry), layers, blocks, layouts (paper, viewports with scale), xrefs. Lists are windowed: limit (default 500) and continue_from; filters: space, layer, window, contains, type. format: json (default) or markdown (a table in the text block; the structured result stays JSON). Pass path instead of document to open and read in one call.",
+        json!({"name": "read_drawing", "description": "Read a drawing for an agent. section: summary (default: units, version, extents, layouts, layer/block counts, entity counts, title blocks, scale hints, text samples), takeoff (quantities in drawing units, per layer and totals: open lengths, closed perimeters and areas by type — HATCH listed but out of each total —, block reference counts by name, circle/text/dimension counts; model space by default; blocks read into by default; window: inside only unless crossing: true), text (every TEXT/MTEXT/attribute/multileader/table cell with layer, space, position, height; texts inside blocks too), dimensions (shown text and measured value, kind, layer, position), title_block (attributed block references ranked as title blocks, with every attribute and the block's fixed texts; plus texts on each layout sheet), entities (handles, types, layers, bounds; geometry: true adds the full geometry), layers, blocks, layouts (paper, viewports with scale), xrefs. Lists are windowed: limit (default 500) and continue_from; filters: space, layer, window, contains, type. format: json (default) or markdown (a table in the text block; the structured result stays JSON). Pass path instead of document to open and read in one call.",
             "inputSchema": {"type": "object", "properties": {
                 "document": doc, "path": {"type": "string", "description": "Open this file first (if not open already)"},
-                "section": {"type": "string", "enum": ["summary", "text", "dimensions", "title_block", "entities", "layers", "blocks", "layouts", "xrefs"]},
+                "section": {"type": "string", "enum": ["summary", "takeoff", "text", "dimensions", "title_block", "entities", "layers", "blocks", "layouts", "xrefs"]},
+                "crossing": {"type": "boolean", "description": "takeoff: with a window, count objects that cross it too (default false: only those inside)"},
+                "block_names": {"type": ["string", "array"], "description": "takeoff: only references of these blocks are counted and read into"},
+                "unit_override": {"type": "string", "description": "takeoff: the unit label when $INSUNITS is missing or wrong (relabels only; nothing is converted)"},
                 "space": space, "layer": {"type": ["string", "array"]}, "window": window, "contains": {"type": "string"},
                 "match": {"type": "string", "enum": ["contains", "exact"]}, "type": {"type": ["string", "array"], "description": "Entity or text types (Line, Polyline, Text, MText, Attribute, Block Reference, Dimension…)"},
                 "expand_blocks": {"type": "boolean", "description": "Read inside block references (default true)"}, "geometry": {"type": "boolean"},
@@ -107,6 +110,10 @@ pub fn definitions() -> Vec<Value> {
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": false}}}),
     ]
 }
+
+/// $INSUNITS as short unit names (the take-off's `unit`).
+const UNIT_SHORT: &[&str] =
+    &["unitless", "in", "ft", "mi", "mm", "cm", "m", "km", "µin", "mil", "yd", "Å", "nm", "µm", "dm", "dam", "hm", "Gm", "AU", "ly", "pc"];
 
 /// The worker's side: the drawings and the tools that use them.
 #[derive(Default)]
@@ -273,7 +280,75 @@ impl Engine {
         let sp = read::spaces_named(d, a.get("space"))?;
         let flt = read::Filter::from_args(a)?;
         let mut v = match section.as_str() {
-            "summary" => read::summary(doc, ctx)?,
+            "summary" => {
+                let mut v = read::summary(doc, ctx)?;
+                v["scale_hint"] = super::takeoff::scale_hint(d, ctx)?;
+                let mut samples = Vec::new();
+                for t in read::texts(
+                    d,
+                    &read::spaces(d),
+                    &read::Filter { layers: None, window: None, contains: None, exact: false, types: None, expand_blocks: false },
+                    ctx,
+                )? {
+                    if samples.len() >= 30 {
+                        break;
+                    }
+                    samples.push(json!({"text": t["text"].as_str().map(|x| x.chars().take(200).collect::<String>()), "type": t["type"], "layer": t["layer"], "at": t["at"], "space": t["space"]}));
+                }
+                v["text_samples"] = json!(samples);
+                v
+            }
+            "takeoff" | "quantities" | "take_off" => {
+                // Model space unless asked: paper space holds title blocks and viewports, not quantities.
+                let sp = if a.get("space").is_none_or(Value::is_null) { read::spaces_named(d, Some(&json!("model")))? } else { sp.clone() };
+                let blocks = match a.get("block_names") {
+                    Some(Value::String(x)) => Some(x.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect()),
+                    Some(Value::Array(x)) => Some(x.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()),
+                    _ => None,
+                };
+                let crossing = flag(a, "crossing").unwrap_or(false);
+                let t = super::takeoff::takeoff(d, &sp, &flt, crossing, blocks.clone(), ctx)?;
+                let code = usize::try_from(d.header.i64("INSUNITS", 0)).unwrap_or(0);
+                let short = UNIT_SHORT.get(code).copied().filter(|_| code > 0);
+                let unit = s(a, "unit_override").map(str::to_string).or(short.map(str::to_string)).unwrap_or_else(|| "unitless".into());
+                let paper_skipped: usize =
+                    if a.get("space").is_none_or(Value::is_null) { d.layouts.iter().map(|l| l.entities.len()).sum() } else { 0 };
+                let mut notes = vec![
+                    format!("All values in drawing units ({unit}; areas in {unit}²) — nothing is converted."),
+                    "lengths = open LINE/ARC/LWPOLYLINE/POLYLINE/SPLINE/partial ELLIPSE; closed shapes (closed flag, or first vertex == last vertex) go to perimeters + areas; polyline bulge arcs are exact.".to_string(),
+                    "HATCH area/perimeter is listed under HATCH but EXCLUDED from each `total` (a hatch usually fills an outline already counted); islands are subtracted by nesting and the hatch style.".to_string(),
+                    if flt.expand_blocks {
+                        "Blocks are counted (references by block name, MINSERT rows×columns) AND read into: the geometry inside each reference is measured with its scale (expand_blocks: false counts references only).".to_string()
+                    } else {
+                        "Blocks are counted (references by block name, MINSERT rows×columns), not read into: geometry inside block definitions is not in the lengths/areas.".to_string()
+                    },
+                    "Straight-segment lengths are 3D; areas are the XY projection.".to_string(),
+                ];
+                if paper_skipped > 0 {
+                    notes.push(format!(
+                        "{paper_skipped} paper-space objects left out (title blocks and viewports; space: \"all\" or a layout name takes them in)."
+                    ));
+                }
+                if t.unparsed_hatches > 0 {
+                    notes.push(format!("{} HATCH objects have no boundary and are not counted.", t.unparsed_hatches));
+                }
+                notes.extend(t.notes.iter().cloned());
+                let mut o = read::page("by_layer", t.layer_values(), from, limit);
+                o.insert("totals".into(), t.totals_value());
+                o.insert("unit".into(), json!(unit));
+                o.insert("area_unit".into(), json!(format!("{unit}²")));
+                o.insert("units".into(), json!({"insunits": code, "source": if s(a, "unit_override").is_some() { "unit_override" } else if short.is_some() { "$INSUNITS" } else { "not set" }}));
+                o.insert("space".into(), json!(sp.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()));
+                o.insert("expand_blocks".into(), json!(flt.expand_blocks));
+                o.insert("references_read".into(), json!(t.references_read));
+                o.insert("crossing".into(), json!(crossing));
+                if let Some(b) = blocks {
+                    o.insert("block_names".into(), json!(b));
+                }
+                o.insert("scale_hint".into(), super::takeoff::scale_hint(d, ctx)?);
+                o.insert("note".into(), json!(notes.join(" ")));
+                Value::Object(o)
+            }
             "text" | "texts" => Value::Object(read::page("texts", read::texts(d, &sp, &flt, ctx)?, from, limit)),
             "dimensions" | "dims" | "dimension" => Value::Object(read::page("dimensions", read::dimensions(d, &sp, &flt, ctx)?, from, limit)),
             "title_block" | "titleblock" | "title_blocks" | "title" => {
@@ -325,6 +400,10 @@ impl Engine {
             v["section"] = json!(section);
         }
         let text = markdown.then(|| read::markdown(&section, &v));
+        if let Some(m) = &text {
+            // The supervisor hands callers the structured result only: the markdown rides in it too.
+            v["markdown"] = json!(m);
+        }
         Ok(Reply { value: v, extra: Vec::new(), text, trim: true })
     }
 
@@ -347,8 +426,11 @@ impl Engine {
         let mut o = read::page("hits", hits, usize_arg(a, "continue_from", 0), usize_arg(a, "limit", 500).max(1));
         o.insert("document".into(), json!(doc.handle));
         o.insert("query".into(), json!(query));
-        let v = Value::Object(o);
+        let mut v = Value::Object(o);
         let text = s(a, "format").is_some_and(|f| f.eq_ignore_ascii_case("markdown")).then(|| read::markdown("search", &v));
+        if let Some(m) = &text {
+            v["markdown"] = json!(m);
+        }
         Ok(Reply { value: v, extra: Vec::new(), text, trim: true })
     }
 

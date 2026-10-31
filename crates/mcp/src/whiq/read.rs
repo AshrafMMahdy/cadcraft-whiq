@@ -34,8 +34,17 @@ impl Xf {
     pub fn apply(&self, p: Vec2) -> Vec2 {
         Vec2::new(self.a * p.x + self.b * p.y + self.t.x, self.c * p.x + self.d * p.y + self.t.y)
     }
+    /// The determinant: areas scale by its magnitude, lengths by its square root.
+    pub fn det(&self) -> f64 {
+        self.a * self.d - self.b * self.c
+    }
+    /// Whether lengths scale alike in every direction (no non-uniform block scaling).
+    pub fn uniform(&self) -> bool {
+        let (sx, sy) = ((self.a * self.a + self.c * self.c).sqrt(), (self.b * self.b + self.d * self.d).sqrt());
+        (sx - sy).abs() <= 1e-9 * sx.max(sy).max(1e-300)
+    }
     /// The transform of a block reference (insert, scale, rotation, block base) inside `self`.
-    fn then_insert(&self, at: Vec3, scale: Vec3, rotation: f64, base: Vec3) -> Xf {
+    pub fn then_insert(&self, at: Vec3, scale: Vec3, rotation: f64, base: Vec3) -> Xf {
         let (s, c) = rotation.sin_cos();
         let (sx, sy) = (scale.x, scale.y);
         // inner(p) = at + R * S * (p - base)
@@ -307,9 +316,9 @@ pub fn texts(d: &Drawing, sp: &[(String, Space)], flt: &Filter, ctx: &Ctx) -> Re
     Ok(out)
 }
 
-type TextItem = (&'static str, String, Vec2, f64, f64, String, Option<String>);
+pub type TextItem = (&'static str, String, Vec2, f64, f64, String, Option<String>);
 
-fn text_items(e: &Entity) -> Vec<TextItem> {
+pub fn text_items(e: &Entity) -> Vec<TextItem> {
     match &e.kind {
         EntityKind::Text(t) => vec![("Text", t.value.clone(), t.justify_point(), t.height, t.rotation, t.style.clone(), None)],
         EntityKind::MText(t) => {
@@ -526,6 +535,11 @@ pub fn entities(d: &Drawing, sp: &[(String, Space)], flt: &Filter, geometry: boo
             if !v.via.is_empty() {
                 o["in_block"] = json!(v.via.join(" > "));
             }
+            let (line, measures) = super::takeoff::entity_line(v.e, &v.xf);
+            o["summary"] = json!(line);
+            for (k, m) in measures {
+                o[k] = m;
+            }
             if geometry {
                 o["geometry"] = serde_json::to_value(&v.e.kind).unwrap_or(Value::Null);
             }
@@ -708,12 +722,19 @@ pub fn summary(doc: &Doc, ctx: &Ctx) -> Result<Value, ToolError> {
 
 pub fn layers(d: &Drawing) -> Vec<Value> {
     let (_, per_layer) = counts(d);
+    let mut by_type: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for (_, space) in spaces(d) {
+        for e in d.space(&space).into_iter().flat_map(|st| st.iter()) {
+            *by_type.entry(e.common.layer.to_ascii_lowercase()).or_default().entry(e.kind.dxf_name().to_string()).or_default() += 1;
+        }
+    }
     d.layers
         .iter()
         .map(|l| {
             json!({"name": l.name, "on": l.on, "frozen": l.frozen, "locked": l.locked, "plot": l.plot, "color": l.color.name(), "linetype": l.linetype,
                 "lineweight": serde_json::to_value(l.lineweight).unwrap_or(Value::Null), "transparency": l.transparency, "description": l.description,
-                "entities": per_layer.get(&l.name.to_ascii_lowercase()).copied().unwrap_or(0)})
+                "entities": per_layer.get(&l.name.to_ascii_lowercase()).copied().unwrap_or(0),
+                "by_type": by_type.get(&l.name.to_ascii_lowercase()).cloned().unwrap_or_default()})
         })
         .collect()
 }
@@ -884,6 +905,37 @@ pub fn markdown(section: &str, v: &Value) -> String {
                 l["paper"]["name"].as_str().unwrap_or(""),
                 l["extents"]
             ));
+        }
+        return s;
+    }
+    if section == "takeoff" || section == "quantities" || section == "take_off" {
+        let unit = v["unit"].as_str().unwrap_or("units");
+        s.push_str(&format!("## Take-off (drawing units: {unit}; areas {unit}²; HATCH out of the totals)\n\n| layer | length | perimeter | area | HATCH area | blocks | circles | texts | dims |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"));
+        let row = |name: &str, b: &Value| {
+            let blocks: u64 = b["counts"]["blocks"].as_object().map_or(0, |m| m.values().filter_map(Value::as_u64).sum());
+            format!(
+                "| {name} | {} | {} | {} | {} | {blocks} | {} | {} | {} |\n",
+                b["lengths"]["total"].as_f64().unwrap_or(0.0),
+                b["perimeters"]["total"].as_f64().unwrap_or(0.0),
+                b["areas"]["total"].as_f64().unwrap_or(0.0),
+                b["areas"]["HATCH"].as_f64().unwrap_or(0.0),
+                b["counts"]["CIRCLE"],
+                b["counts"]["text"],
+                b["counts"]["dimensions"]
+            )
+        };
+        for l in v["by_layer"].as_array().into_iter().flatten() {
+            s.push_str(&row(l["layer"].as_str().unwrap_or(""), l));
+        }
+        s.push_str(&row("**total**", &v["totals"]));
+        if let Some(b) = v["totals"]["counts"]["blocks"].as_object().filter(|b| !b.is_empty()) {
+            s.push_str("\n| block | references |\n|---|---:|\n");
+            for (k, n) in b {
+                s.push_str(&format!("| {} | {n} |\n", k.replace('|', "\\|")));
+            }
+        }
+        if let Some(n) = v.get("continue_from") {
+            s.push_str(&format!("\nMore layers: call again with continue_from: {n}\n"));
         }
         return s;
     }

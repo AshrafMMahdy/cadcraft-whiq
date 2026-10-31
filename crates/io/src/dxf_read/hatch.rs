@@ -141,8 +141,21 @@ fn elliptic_edge(tags: &[Tag], index: &mut usize, vertices: &mut Vec<PolyVertex>
     let center = Vec2::new(edge_value(tags, *index), edge_value(tags, *index + 1));
     let major = Vec2::new(edge_value(tags, *index + 2), edge_value(tags, *index + 3));
     let ratio = edge_value(tags, *index + 4);
-    let start_angle = edge_value(tags, *index + 5).to_radians();
-    let end_angle = edge_value(tags, *index + 6).to_radians();
+    // Groups 50 and 51 are ANGLES from the major axis (DXF Reference, hatch boundary edge data),
+    // not ellipse parameters: the parameter of the point at angle `a` is atan2(sin a / ratio,
+    // cos a). Read as parameters, the arc would miss the edges it joins.
+    let param = |a: f64| if ratio.abs() > 1e-12 { (a.sin() / ratio).atan2(a.cos()) } else { a };
+    let unwrap = |t0: f64, a0: f64, a1: f64| {
+        // Keep the angular sweep (a full turn stays a full turn).
+        let mut t1 = param(a1);
+        while t1 <= t0 {
+            t1 += std::f64::consts::TAU;
+        }
+        if (a1 - a0).abs() >= std::f64::consts::TAU - 1e-9 { t0 + std::f64::consts::TAU } else { t1 }
+    };
+    let (a0, a1) = (edge_value(tags, *index + 5).to_radians(), edge_value(tags, *index + 6).to_radians());
+    let start_angle = param(a0);
+    let end_angle = unwrap(start_angle, a0, a1);
     let ccw = tags.get(*index + 7).filter(|tag| tag.code == 73).map(Tag::i64).unwrap_or(1) != 0;
     *index += 8;
     let (start, end) = if ccw { (start_angle, end_angle) } else { (-end_angle, -start_angle) };
