@@ -154,18 +154,21 @@ Tests: `apps/cadcraft-cli/tests/mcp_contract.rs` (C:) and the corpus run (K: eve
 | Jobs, busy, progress, cancel, evict, recovered files | contract tools | C: `jobs_busy_cancel_and_evict`, `hang_up_with_unsaved_work_leaves_a_recovered_file` |
 | Build smoke (Arabic line → DWG, DXF, PDF; read back) | all | `apps/cadcraft-cli/tests/whiq_smoke.py` (release workflow) |
 
-### Size and memory (dev build, Linux; generated floor plate)
+### Size and memory (release musl binary, Linux; generated floor plate; a loaded shared box)
 
 | Step | 94 MB DXF, 1.5 M entities | 30.6 MB DWG, same drawing |
 |---|---|---|
-| open | 13–21 s; 1.5 GB resident after, 3.7 GB peak | 29 s; 3.6 GB after, **7.35 GB peak** (inside the DWG bridge) |
-| summary / text page / search | 0.7 s / 1.0 s / 0.3–0.4 s | 0.8 s / — / 0.4 s |
-| preview of a window or one tile | 2.2–2.8 s (only the objects in it are built) | 2.8 s |
-| PNG of the whole extents | 29 s, 2.5 GB peak | — |
-| export DWG / PDF | 28 s / 35 s (4.3 GB peak) | save 27 s, 4.6 GB peak |
+| open | 13 s; 1.33 GB resident after, 3.6 GB peak | 39 s; 1.39 GB after, **5.35 GB peak** (inside the DWG bridge) |
+| summary / text page / search | 0.7–1.1 s / 1.0 s / 0.3–0.5 s | 1.1 s / — / 0.5 s |
+| preview of a window or one tile | 2.2 s (only the objects in it are built) | 2.2 s |
+| PNG of the whole extents (dev build) | 29 s, 2.5 GB peak | — |
+| export / save DWG | 34 s, 2.9 GB peak | save 48 s, 2.9 GB peak |
+| export PDF (dev build) | 35 s, 4.3 GB peak | — |
+| close | memory back to the OS (185 MB) | |
 
 Everyday drawings are small by comparison: the largest real sample (36,437 entities, 1.7 MB DWG)
-peaks at 292 MB through every tool.
+peaks at 228 MB through every tool (release binary; the corpus run gave the same results as the
+dev build, file for file).
 
 ## Known gaps
 
@@ -181,7 +184,8 @@ peaks at 292 MB through every tool.
 - In the SVG, `data-layer` is the layer of the top-level object (a block reference's layer for its
   contents); server-side `layers_off` / `only_layers` are exact for nested objects.
 - A PDF holds at most 256 sheets (CADCraft's plotter limit).
-- Memory: about 1 KB per entity resident and 2.5–5 KB per entity at the peak of opening a DWG.
+- Memory: about 1 KB per entity resident and 2.5–3.5 KB per entity at the peak of opening a DWG
+  (the third-party DWG decoder holds its own model while CADCraft's is built).
 
 ## Wiring it into the platform (for the owner; the platform repository was not touched)
 
@@ -202,3 +206,10 @@ peaks at 292 MB through every tool.
   `render_preview`, the text read back from the DWG).
 - The Preview tab: `render_preview` answers SVG tiles (`tiles[].svg`, `window`, y running down);
   `max_bytes` sets how many fit in one answer; each primitive group is `<g data-layer="…">`.
+
+## Release
+
+`whiq-v0.1.0` (commit 2d7bf3a, workflow dispatch; tag pushes are refused from agent sessions):
+`cadcraft-cli-whiq-v0.1.0-linux-x86_64.tar.gz` (sha256 33e6d418…38bb4), `cadcraft-cli-whiq-v0.1.0-windows-x86_64.zip`
+(sha256 c494134d…bff1), `SHA256SUMS`, `engines.lock`. Both builds ran the contract suite and the
+Linux build the smoke against the built binary.
