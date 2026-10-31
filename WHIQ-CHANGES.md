@@ -260,3 +260,7 @@ handle), CADCraft names the scale (`1:1`; files without one show that default).
 `cadcraft-cli-whiq-v0.1.0-linux-x86_64.tar.gz` (sha256 33e6d418…38bb4), `cadcraft-cli-whiq-v0.1.0-windows-x86_64.zip`
 (sha256 c494134d…bff1), `SHA256SUMS`, `engines.lock`. Both builds ran the contract suite and the
 Linux build the smoke against the built binary.
+
+`whiq-v0.1.1` (commit fc2bf39, workflow dispatch): take-off, scale hints, entity one-liners, layer
+types, markdown in the structured result, the hatch-ellipse and ellipse-ratio reader fixes. Same
+assets and checks as `whiq-v0.1.0`.
