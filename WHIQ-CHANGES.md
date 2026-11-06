@@ -51,7 +51,7 @@ forks' 18. Answers over `--max-result-bytes` are trimmed (`truncated`, `continue
 | `search_drawing` | `query`, `match?`, `kinds?` (text, attribute, tag, dimension, block_reference, block, layer, layout), `space?`, `layer?`, `window?`, `limit?` | `{total, hits [{match, kind, text, tag?, handle, layer, space, at, block?, insert?}]}` |
 | `render_preview` | `document?` \| `path?`; `space?` (model) \| `viewport?` (handle); `window?`; `tiles?` {cols, rows}; `tile?` [col, row]; `layers_off?`, `layers_on?`, `only_layers?`; `format?` svg \| png; `width?`, `height?`; `background?` light \| dark; `output?` (write files) | `{space, format, window, extents, total_tiles, returned, tiles [{tile, window, bytes, primitives \| width/height, svg? \| saved?}], primitives, layers [{name, on}], continue_from?}`; PNG tiles come as image blocks |
 | `export` | `path` (its extension or `format`: dxf \| dwg \| pdf \| svg \| png), `document?` \| `source?`, `version?` (2000–2018), `binary?`, `space?` (model \| layout \| list \| all), `window?`, layer switches, `paper?`, `landscape?`, `scale?`, `fit?`, `lineweights?`, `width?`, `overwrite?` | `{document, format, saved [{path, bytes, format, space?, previous_renamed_to?}]}` |
-| `edit` | `document?`, `space?`, `atomic?` (true), `ops` [ `{op: command, command, params}` \| `{op: cmdline, text}` \| `add {type, …}` \| `delete {handles}` \| `set_text {handle, text}` \| `set_attributes {handle \| block, values}` \| `set_properties {handles, …}` \| `layer {action: new\|set\|delete\|current\|rename, …}` \| `block {action: define\|insert\|delete\|rename, …}` \| `space {name}` \| `undo` ] | `{document, applied, failed, results [{index, op, ok, result \| error}], entities, dirty}`; atomic failure: error with `failed_at`, `rolled_back`, `results` |
+| `edit` | `document?`, `space?`, `atomic?` (true), `ops` [ `{op: command, command, params}` \| `{op: cmdline, text}` \| `add {type, …}` \| `delete {handles}` \| `set_text {handle, text}` \| `set_attributes {handle \| block, values}` \| `set_properties {handles, …}` \| `layer {action: new\|set\|delete\|current\|rename, …}` \| `block {action: define\|insert\|delete\|rename, …}` \| `space {name}` \| `undo` ] | `{document, applied, failed, results [{index, op, ok, result \| error}], entities, dirty}`; atomic failure: error with `failed_at`, `rolled_back`, `results`; with `atomic: false` a failed op that had changed something is undone (`rolled_back` on its result) |
 | `save_drawing` | `document?`, `path?` (default: its name in the write root), `version?`, `binary?`, `overwrite?` | `{document, …, saved [{path, bytes, format, previous_renamed_to?}], version}` |
 | `close_drawing` | `document?`, `discard?` | `{closed, open_documents}`; unsaved changes refused (`invalid_request`) without `discard` |
 | `list_commands` | `filter?`, `limit?` | `{commands [{id, label, aliases, params}]}` |
@@ -303,6 +303,31 @@ over MCP stdio, the box shared with other builds:
 Corpus regression (`roundtrip_check` of the 144 other CAD corpus files, DWG for .dwg, DXF for
 .dxf, whiq-v0.1.1 against this change): the same verdict on 143; `truetype.dwg` lossy → lossless.
 The 7 C1 files stay lossy and now also list their MTEXT count change.
+
+## Undo the call (owner's decision 2026-11-05)
+
+When one call fails half way, the drawing goes back to exactly how it was before that call and the
+error says nothing of it was applied. `edit`'s batch rule is unchanged (all or nothing by default,
+`atomic: false` keeps the operations that worked).
+
+| Before | Now |
+|---|---|
+| `Session::execute`: a command that returned an error after changing something kept the change and recorded an undo step (only a panic was put back) | An error puts the drawing and selection back (the layout shown follows if the command had made or renamed it) and records no undo step |
+| `edit` panicking outside its per-command catch: the runtime published and auto-saved the half-done drawing ("the work so far was auto-saved") | The runtime undoes the interrupted `edit` first: the live drawing and the recovered file are the pre-call state; `rolled_back` says so |
+| `edit` rollback kept the undo stack's first N steps and cleared redo and the selection: a batch with an `undo` op lost a step, a full stack lost its oldest | The document's session is restored as it was (undo, redo, selection, space, views, Block Editor) |
+| `atomic: false`: an operation that made several changes and failed part way (`set_attributes` by block, `block delete`, a multi-line `cmdline` script) kept the part that ran | That operation is undone whole (`rolled_back: true`, "nothing of this operation was applied"); the others stay |
+| `export` of several layouts (SVG/PNG) or `render_preview` with `output` and tiles failing part way: an error without the files already on disk | The error carries `files_written` (as `saved` lists them) and says how many were written |
+
+Not changed: an operation typed into a command an earlier operation left waiting is that command's
+input, so it is not undone on its own (the command keeps its own undo and is ended at the end of
+the call). A command that runs other commands (SCRIPT) and fails still leaves their undo steps in
+the engine's history (the drawing is put back; undoing such a step changes nothing); through
+`edit` the whole history is restored. No limit, cap or fallback was added.
+
+Tests: engine `failed_command_changes_nothing`; `cadcraft-mcp` unit tests in `whiq/tools.rs`
+(history after a failed atomic call, an operation failing part way, a shorthand failing on its
+second command, an interrupted edit, files written by a failed export and preview); contract test
+`a_call_that_fails_part_way_keeps_nothing_of_itself`.
 
 ## Release
 

@@ -1085,13 +1085,17 @@ fn worker_loop(shared: &Shared, rx: mpsc::Receiver<Work>) {
                 let r = match r {
                     Ok(r) => r,
                     Err(_) => {
+                        // An edit the panic stopped part way is undone first: the live drawing and
+                        // the recovered file are the drawing as it was before the call.
+                        let undone = engine.undo_interrupted_call();
                         publish(shared, &engine);
                         let saved = shared.autosave_all("panic");
                         let mut e = ToolError::new(
                             code::INTERNAL,
                             format!("{tool} failed inside the engine"),
-                            "the work so far was auto-saved; open the recovered file, or retry with other arguments",
-                        );
+                            "nothing of this call was applied: the drawing is as it was before it (also auto-saved as the recovered file) — send it again (fixed), or with other arguments",
+                        )
+                        .with("rolled_back", json!(undone));
                         if let Some(p) = saved.first() {
                             e = e.with("recovered_path", json!(shared.config.settings.roots.show(p)));
                         }

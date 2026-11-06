@@ -42,6 +42,7 @@ mod draworder;
 mod dyn_input;
 mod dynamic_block_data;
 mod dynamic_grips;
+mod failed_command_changes_nothing;
 mod fillet_chamfer;
 mod fix_holds_grips;
 mod followups_626;

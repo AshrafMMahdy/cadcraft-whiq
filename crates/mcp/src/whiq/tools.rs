@@ -95,7 +95,7 @@ pub fn definitions() -> Vec<Value> {
                 "width": {"type": "integer"}, "height": {"type": "integer"}, "overwrite": {"type": "boolean"}},
                 "required": ["path"]},
             "annotations": writes, "_meta": {"whiq/files": {"read": ["source"], "opens": true}}}),
-        json!({"name": "edit", "description": "Change a drawing with many operations in one call (all or nothing by default: atomic: false keeps the ones that worked). Each op: {op: \"command\", command, params} runs any CADCraft command (list_commands names them; e.g. line {points}, circle {center, radius}, text {at, text, height}, mtext, pline, hatch, dimlinear, insert {name, at}, move, copy, rotate, scale, mirror, erase {handles}, properties.set {handles, layer, color, …}, layer.new / layer.set / layer.delete, block {name, base, handles}, rename {table, from, to}, purge, layout.set {name}); {op: \"cmdline\", text} types at the command line; shorthands: add {type, …params}, delete {handles}, set_text {handle, text}, set_attributes {handle | block, values: {TAG: value}}, set_properties {handles, …}, layer {action: new|set|delete|current|rename, name, …}, block {action: define|insert|delete|rename, …}, space {name}, undo. Paths in params stay inside the roots; open/save/close are the server's own tools.",
+        json!({"name": "edit", "description": "Change a drawing with many operations in one call (all or nothing by default: atomic: false keeps the ones that worked; a failed one is never kept in part). Each op: {op: \"command\", command, params} runs any CADCraft command (list_commands names them; e.g. line {points}, circle {center, radius}, text {at, text, height}, mtext, pline, hatch, dimlinear, insert {name, at}, move, copy, rotate, scale, mirror, erase {handles}, properties.set {handles, layer, color, …}, layer.new / layer.set / layer.delete, block {name, base, handles}, rename {table, from, to}, purge, layout.set {name}); {op: \"cmdline\", text} types at the command line; shorthands: add {type, …params}, delete {handles}, set_text {handle, text}, set_attributes {handle | block, values: {TAG: value}}, set_properties {handles, …}, layer {action: new|set|delete|current|rename, name, …}, block {action: define|insert|delete|rename, …}, space {name}, undo. Paths in params stay inside the roots; open/save/close are the server's own tools.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "ops": {"type": "array"}, "atomic": {"type": "boolean"}, "space": {"type": "string", "description": "Make this space current first (Model or a layout)"},
                 "command": {"type": "string", "description": "One command without ops (with params)"}, "params": {"type": "object"}, "text": {"type": "string", "description": "One command line without ops"}}},
             "annotations": rw}),
@@ -120,6 +120,9 @@ const UNIT_SHORT: &[&str] =
 #[derive(Default)]
 pub struct Engine {
     pub docs: Docs,
+    /// The `edit` call under way and its document as it was before the call: a call that stops
+    /// part way (an error, a cancel, a panic) is undone whole ([`Engine::undo_interrupted_call`]).
+    call: Option<Before>,
 }
 
 fn dwg_version(bytes: &[u8]) -> Option<String> {
@@ -454,50 +457,60 @@ impl Engine {
         let mut extra = Vec::new();
         let mut used = 0usize;
         let mut next = None;
-        for (k, (cr, win)) in tiles.iter().enumerate().skip(from) {
-            ctx.check()?;
-            let mut t = json!({"tile": cr, "window": preview::win_value(win)});
-            let (bytes, mime, ext, info): (Vec<u8>, &str, &str, Value) = if png {
-                let (b, w, h) = preview::png(&prep, win, width, height, dark, ctx)?;
-                (b, "image/png", "png", json!({"width": w, "height": h}))
-            } else {
-                let list = prep.list_for(win, f64::from(width), ctx)?;
-                let (svg, n) = preview::svg_tile(&list, &prep.layers, win, f64::from(width), dark, ctx)?;
-                (svg.into_bytes(), "image/svg+xml", "svg", json!({"primitives": n}))
-            };
-            if let Value::Object(o) = info {
-                for (kk, vv) in o {
-                    t[kk] = vv;
-                }
-            }
-            t["bytes"] = json!(bytes.len());
-            if let Some(o) = output {
-                let base = Path::new(o);
-                let name = if total == 1 {
-                    base.with_extension(ext)
+        let mut each = || -> Result<(), ToolError> {
+            for (k, (cr, win)) in tiles.iter().enumerate().skip(from) {
+                ctx.check()?;
+                let mut t = json!({"tile": cr, "window": preview::win_value(win)});
+                let (bytes, mime, ext, info): (Vec<u8>, &str, &str, Value) = if png {
+                    let (b, w, h) = preview::png(&prep, win, width, height, dark, ctx)?;
+                    (b, "image/png", "png", json!({"width": w, "height": h}))
                 } else {
-                    let stem = base.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| "preview".into());
-                    base.with_file_name(format!("{stem}-c{}r{}.{ext}", cr[0], cr[1]))
+                    let list = prep.list_for(win, f64::from(width), ctx)?;
+                    let (svg, n) = preview::svg_tile(&list, &prep.layers, win, f64::from(width), dark, ctx)?;
+                    (svg.into_bytes(), "image/svg+xml", "svg", json!({"primitives": n}))
                 };
-                let p = ctx.resolve(&name.to_string_lossy(), Access::Write)?;
-                let kept =
-                    write_file(&p, &bytes, WritePolicy { old_copies: ctx.settings.old_copies, overwrite: flag(a, "overwrite").unwrap_or(false) })?;
-                t["saved"] = saved_entry(ctx.roots(), &p, bytes.len(), ext, kept.as_ref());
-            } else {
-                // Tiles go into the answer while they fit; the first always does (never cut inside one).
-                if !out.is_empty() && used + bytes.len() > budget {
-                    next = Some(k);
-                    break;
+                if let Value::Object(o) = info {
+                    for (kk, vv) in o {
+                        t[kk] = vv;
+                    }
                 }
-                used += bytes.len();
-                if png {
-                    extra.push(json!({"type": "image", "mimeType": mime, "data": cadcraft_engine::cmd::file::base64_encode(&bytes)}));
+                t["bytes"] = json!(bytes.len());
+                if let Some(o) = output {
+                    let base = Path::new(o);
+                    let name = if total == 1 {
+                        base.with_extension(ext)
+                    } else {
+                        let stem = base.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| "preview".into());
+                        base.with_file_name(format!("{stem}-c{}r{}.{ext}", cr[0], cr[1]))
+                    };
+                    let p = ctx.resolve(&name.to_string_lossy(), Access::Write)?;
+                    let kept = write_file(
+                        &p,
+                        &bytes,
+                        WritePolicy { old_copies: ctx.settings.old_copies, overwrite: flag(a, "overwrite").unwrap_or(false) },
+                    )?;
+                    t["saved"] = saved_entry(ctx.roots(), &p, bytes.len(), ext, kept.as_ref());
                 } else {
-                    t["svg"] = json!(String::from_utf8_lossy(&bytes));
+                    // Tiles go into the answer while they fit; the first always does (never cut inside one).
+                    if !out.is_empty() && used + bytes.len() > budget {
+                        next = Some(k);
+                        break;
+                    }
+                    used += bytes.len();
+                    if png {
+                        extra.push(json!({"type": "image", "mimeType": mime, "data": cadcraft_engine::cmd::file::base64_encode(&bytes)}));
+                    } else {
+                        t["svg"] = json!(String::from_utf8_lossy(&bytes));
+                    }
                 }
+                out.push(t);
+                ctx.step(1);
             }
-            out.push(t);
-            ctx.step(1);
+            Ok(())
+        };
+        if let Err(e) = each() {
+            let written: Vec<Value> = out.iter().filter_map(|t| t.get("saved").cloned()).collect();
+            return Err(with_written(e, &written));
         }
         let mut layers_state: Vec<Value> = prep.layer_states.iter().map(|(n, on)| json!({"name": n, "on": on})).collect();
         layers_state.sort_by(|x, y| x["name"].as_str().cmp(&y["name"].as_str()));
@@ -609,38 +622,49 @@ impl Engine {
                     other => read::spaces_named(d, other)?,
                 };
                 let many = sp.len() > 1;
-                for (name, _) in &sp {
-                    ctx.check()?;
-                    let mut args = a.clone();
-                    args["space"] = json!(name);
-                    if let Some(o) = args.as_object_mut() {
-                        for k in ["layers_off", "layers_on", "only_layers"] {
-                            o.remove(k);
+                let mut each = || -> Result<(), ToolError> {
+                    for (name, _) in &sp {
+                        ctx.check()?;
+                        let mut args = a.clone();
+                        args["space"] = json!(name);
+                        if let Some(o) = args.as_object_mut() {
+                            for k in ["layers_off", "layers_on", "only_layers"] {
+                                o.remove(k);
+                            }
                         }
-                    }
-                    let prep = preview::prepare(d, &args, ctx)?;
-                    let bytes = if fmt == "svg" {
-                        let wpx = f64::from(a.get("width").and_then(Value::as_u64).map_or(1600, |w| u32::try_from(w).unwrap_or(1600)));
-                        let list = prep.list_for(&prep.window, wpx, ctx)?;
-                        preview::svg_tile(&list, &prep.layers, &prep.window, wpx, false, ctx)?.0.into_bytes()
-                    } else {
-                        let w = a.get("width").and_then(Value::as_u64).map_or(2400, |w| u32::try_from(w).unwrap_or(2400));
-                        preview::png(&prep, &prep.window, w, a.get("height").and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok()), false, ctx)?
+                        let prep = preview::prepare(d, &args, ctx)?;
+                        let bytes = if fmt == "svg" {
+                            let wpx = f64::from(a.get("width").and_then(Value::as_u64).map_or(1600, |w| u32::try_from(w).unwrap_or(1600)));
+                            let list = prep.list_for(&prep.window, wpx, ctx)?;
+                            preview::svg_tile(&list, &prep.layers, &prep.window, wpx, false, ctx)?.0.into_bytes()
+                        } else {
+                            let w = a.get("width").and_then(Value::as_u64).map_or(2400, |w| u32::try_from(w).unwrap_or(2400));
+                            preview::png(
+                                &prep,
+                                &prep.window,
+                                w,
+                                a.get("height").and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok()),
+                                false,
+                                ctx,
+                            )?
                             .0
-                    };
-                    let f = if many {
-                        let stem = file.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| "drawing".into());
-                        let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "-_ ".contains(c) { c } else { '_' }).collect();
-                        file.with_file_name(format!("{stem}-{safe}.{fmt}"))
-                    } else {
-                        file.clone()
-                    };
-                    let p = ctx.resolve(&f.to_string_lossy(), Access::Write)?;
-                    let kept = write_file(&p, &bytes, policy)?;
-                    let mut e = saved_entry(ctx.roots(), &p, bytes.len(), &fmt, kept.as_ref());
-                    e["space"] = json!(name);
-                    saved.push(e);
-                }
+                        };
+                        let f = if many {
+                            let stem = file.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| "drawing".into());
+                            let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "-_ ".contains(c) { c } else { '_' }).collect();
+                            file.with_file_name(format!("{stem}-{safe}.{fmt}"))
+                        } else {
+                            file.clone()
+                        };
+                        let p = ctx.resolve(&f.to_string_lossy(), Access::Write)?;
+                        let kept = write_file(&p, &bytes, policy)?;
+                        let mut e = saved_entry(ctx.roots(), &p, bytes.len(), &fmt, kept.as_ref());
+                        e["space"] = json!(name);
+                        saved.push(e);
+                    }
+                    Ok(())
+                };
+                each().map_err(|e| with_written(e, &saved))?;
             }
             other => {
                 return Err(ToolError::new(
@@ -880,6 +904,17 @@ fn mtext_example(key: &str) -> Value {
     json!({"contents": contents, "width": width.parse::<f64>().ok(), "attach": attach.parse::<u8>().ok(), "rotation": rotation.parse::<f64>().ok()})
 }
 
+/// A call that writes several files and fails part way: the error lists the files already
+/// written (`files_written`, as `saved` lists them) and says so, as they stay on disk.
+fn with_written(e: ToolError, written: &[Value]) -> ToolError {
+    if written.is_empty() {
+        return e;
+    }
+    let n = written.len();
+    let reason = format!("{} ({n} file{} written before it, listed in files_written)", e.reason, if n == 1 { " was" } else { "s were" });
+    ToolError { reason, ..e }.with("files_written", json!(written))
+}
+
 /// Commands `edit` refuses: they open, close or save documents, which the server's own tools do
 /// inside the roots.
 const REFUSED: &[&str] =
@@ -1117,11 +1152,7 @@ impl Engine {
         })?;
         let atomic = flag(a, "atomic").unwrap_or(true);
         let i = self.docs.index(a)?;
-        let doc: &mut Doc = &mut self.docs.list[i];
-        let st = doc.session.state().map_err(engine_error)?;
-        let (before, undo_len, space_before) = (st.doc.clone(), st.undo.len(), st.space.clone());
-        let mut results = Vec::new();
-        let mut failed_at = None;
+        self.docs.list[i].session.state().map_err(engine_error)?;
         let total = ops.len() + usize::from(a.get("space").is_some());
         ctx.stage("editing", u64::try_from(total).unwrap_or(0));
         let mut all: Vec<Value> = Vec::new();
@@ -1129,117 +1160,340 @@ impl Engine {
             all.push(json!({"op": "space", "name": sp}));
         }
         all.extend(ops);
-        for (k, op) in all.iter().enumerate() {
-            if ctx.cancelled() {
-                rollback(doc, &before, undo_len, &space_before);
-                return Err(ToolError::new(
-                    code::CANCELLED,
-                    format!("stopped as asked before operation {k}"),
-                    "the drawing is as it was before the call",
-                )
-                .with("rolled_back", json!(true)));
-            }
-            let outcome = (|| -> Result<Value, ToolError> {
-                let step = step_of(op, doc.session.doc().map_err(engine_error)?)?;
-                let run = |s: &mut Session, id: &str, mut p: Value| -> Result<Value, ToolError> {
-                    if REFUSED.contains(&id.to_ascii_lowercase().as_str()) {
-                        return Err(ToolError::new(
-                            code::UNSUPPORTED,
-                            format!("`{id}` is not run inside edit"),
-                            "use open_drawing, new_drawing, save_drawing or close_drawing",
-                        ));
-                    }
-                    if cadcraft_engine::find_command(id).is_none() {
-                        let ids: Vec<&str> = cadcraft_engine::command_specs().iter().map(|c| c.id).collect();
-                        return Err(ToolError::new(
-                            code::NOT_FOUND,
-                            format!("unknown command `{id}`"),
-                            "list_commands names every command and its parameters",
-                        )
-                        .with("closest", json!(super::contract::closest(id, ids, 5))));
-                    }
-                    confine_paths(id, &mut p, ctx)?;
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.execute(id, &p)))
-                        .map_err(|_| {
-                            ToolError::new(
-                                code::INTERNAL,
-                                format!("`{id}` failed inside the engine"),
-                                "the drawing was restored; check the parameters",
-                            )
-                        })?
-                        .map_err(engine_error)
-                };
-                match step {
-                    Step::Cmd(id, p) => run(&mut doc.session, &id, p),
-                    Step::Many(list) => {
-                        let mut out = Vec::new();
-                        for (id, p) in list {
-                            out.push(run(&mut doc.session, &id, p)?);
-                        }
-                        Ok(json!(out))
-                    }
-                    Step::Line(text) => {
-                        let s = &mut doc.session;
-                        let n = s.log.len();
-                        let r = if text.contains('\n') { s.script(&text) } else { s.cmdline(&text) };
-                        let output: Vec<String> = s.log.iter().skip(n).cloned().collect();
-                        r.map_err(engine_error)?;
-                        Ok(json!({"output": output, "prompt": s.prompt_text(), "running": s.running.as_ref().map(|r| r.id.clone())}))
-                    }
-                    Step::Undo => doc.session.undo().map(|l| json!({"undone": l})).map_err(engine_error),
-                }
-            })();
-            ctx.step(1);
-            match outcome {
-                Ok(v) => results
-                    .push(json!({"index": k, "op": op.get("op").or(op.get("command")).cloned().unwrap_or(Value::Null), "ok": true, "result": v})),
-                Err(e) => {
-                    results.push(json!({"index": k, "op": op.get("op").or(op.get("command")).cloned().unwrap_or(Value::Null), "ok": false, "error": e.to_value()}));
-                    if atomic {
-                        failed_at = Some((k, e));
-                        break;
-                    }
-                }
-            }
-        }
-        // A command left waiting for input (a cmdline op that did not finish it) is ended.
-        if doc.session.running.is_some() {
-            doc.session.cancel();
-        }
-        if let Some((k, e)) = failed_at {
-            rollback(doc, &before, undo_len, &space_before);
-            return Err(ToolError::new(
-                e.code.as_str(),
-                format!("operation {k} failed: {}", e.reason),
-                format!(
-                    "{} — nothing was changed (atomic); fix that operation and send the batch again, or atomic: false to keep the others",
-                    e.next_step
-                ),
-            )
-            .with("failed_at", json!(k))
-            .with("rolled_back", json!(true))
-            .with("results", json!(results)));
-        }
-        let ok = results.iter().filter(|r| r["ok"] == true).count();
-        let mut v = doc.info(ctx.roots());
-        v["applied"] = json!(ok);
-        v["failed"] = json!(results.len() - ok);
-        v["results"] = json!(results);
-        v["entities"] = json!(doc.drawing()?.entity_count());
-        v["next_step"] = json!("save_drawing to keep the changes; render_preview to look at them");
-        Ok(Reply::json(v))
+        let before = self.call.insert(Before::of(&self.docs.list[i]));
+        let r = edit_ops(&mut self.docs.list[i], before, &all, atomic, ctx);
+        self.call = None;
+        r
+    }
+
+    /// After a call panicked: the `edit` it interrupted is undone whole, so the drawing (and what
+    /// is published and auto-saved after the panic) is as it was before the call. Returns whether
+    /// there was one.
+    pub fn undo_interrupted_call(&mut self) -> bool {
+        let Some(before) = self.call.take() else { return false };
+        let Some(doc) = self.docs.list.iter_mut().find(|d| d.uid == before.uid) else { return false };
+        rollback(doc, &before);
+        true
     }
 }
 
-fn rollback(doc: &mut Doc, before: &std::sync::Arc<Drawing>, undo_len: usize, space: &Space) {
+/// `edit`'s operations on `doc`; `before` is the document as it was before the call.
+fn edit_ops(doc: &mut Doc, before: &Before, all: &[Value], atomic: bool, ctx: &Ctx) -> Result<Reply, ToolError> {
+    let mut results = Vec::new();
+    let mut failed_at = None;
+    for (k, op) in all.iter().enumerate() {
+        if ctx.cancelled() {
+            rollback(doc, before);
+            return Err(ToolError::new(
+                code::CANCELLED,
+                format!("stopped as asked before operation {k}"),
+                "the drawing is as it was before the call",
+            )
+            .with("rolled_back", json!(true)));
+        }
+        // With atomic: false each operation is all or nothing on its own: one that fails part
+        // way (a shorthand that runs several commands, a script of several lines) is undone
+        // whole. An operation typed into a command an earlier one left waiting is that
+        // command's input: the command keeps its own undo (it ends restored on an error).
+        let op_before = (!atomic && doc.session.running.is_none()).then(|| Before::of(doc));
+        let outcome = (|| -> Result<Value, ToolError> {
+            let step = step_of(op, doc.session.doc().map_err(engine_error)?)?;
+            let run = |s: &mut Session, id: &str, mut p: Value| -> Result<Value, ToolError> {
+                if REFUSED.contains(&id.to_ascii_lowercase().as_str()) {
+                    return Err(ToolError::new(
+                        code::UNSUPPORTED,
+                        format!("`{id}` is not run inside edit"),
+                        "use open_drawing, new_drawing, save_drawing or close_drawing",
+                    ));
+                }
+                if cadcraft_engine::find_command(id).is_none() {
+                    let ids: Vec<&str> = cadcraft_engine::command_specs().iter().map(|c| c.id).collect();
+                    return Err(ToolError::new(
+                        code::NOT_FOUND,
+                        format!("unknown command `{id}`"),
+                        "list_commands names every command and its parameters",
+                    )
+                    .with("closest", json!(super::contract::closest(id, ids, 5))));
+                }
+                confine_paths(id, &mut p, ctx)?;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.execute(id, &p)))
+                    .map_err(|_| {
+                        ToolError::new(code::INTERNAL, format!("`{id}` failed inside the engine"), "the drawing was restored; check the parameters")
+                    })?
+                    .map_err(engine_error)
+            };
+            match step {
+                Step::Cmd(id, p) => run(&mut doc.session, &id, p),
+                Step::Many(list) => {
+                    let mut out = Vec::new();
+                    for (id, p) in list {
+                        out.push(run(&mut doc.session, &id, p)?);
+                    }
+                    Ok(json!(out))
+                }
+                Step::Line(text) => {
+                    let s = &mut doc.session;
+                    let n = s.log.len();
+                    let r = if text.contains('\n') { s.script(&text) } else { s.cmdline(&text) };
+                    let output: Vec<String> = s.log.iter().skip(n).cloned().collect();
+                    r.map_err(engine_error)?;
+                    Ok(json!({"output": output, "prompt": s.prompt_text(), "running": s.running.as_ref().map(|r| r.id.clone())}))
+                }
+                Step::Undo => doc.session.undo().map(|l| json!({"undone": l})).map_err(engine_error),
+            }
+        })();
+        ctx.step(1);
+        match outcome {
+            Ok(v) => {
+                results.push(json!({"index": k, "op": op.get("op").or(op.get("command")).cloned().unwrap_or(Value::Null), "ok": true, "result": v}))
+            }
+            Err(e) => {
+                let mut r =
+                    json!({"index": k, "op": op.get("op").or(op.get("command")).cloned().unwrap_or(Value::Null), "ok": false, "error": e.to_value()});
+                if atomic {
+                    results.push(r);
+                    failed_at = Some((k, e));
+                    break;
+                }
+                if let Some(b) = &op_before {
+                    rollback(doc, b);
+                    r["rolled_back"] = json!(true);
+                    r["error"]["next_step"] = json!(format!("{} — nothing of this operation was applied; send it again (fixed)", e.next_step));
+                }
+                results.push(r);
+            }
+        }
+    }
+    // A command left waiting for input (a cmdline op that did not finish it) is ended.
     if doc.session.running.is_some() {
         doc.session.cancel();
     }
-    if let Ok(st) = doc.session.state_mut() {
-        st.doc = before.clone();
-        st.undo.truncate(undo_len);
-        st.redo.clear();
-        st.selection.clear();
-        st.space = space.clone();
+    if let Some((k, e)) = failed_at {
+        rollback(doc, before);
+        return Err(ToolError::new(
+            e.code.as_str(),
+            format!("operation {k} failed: {}", e.reason),
+            format!(
+                "{} — nothing of this call was applied (atomic); send it again with that operation fixed, or atomic: false to keep the others",
+                e.next_step
+            ),
+        )
+        .with("failed_at", json!(k))
+        .with("rolled_back", json!(true))
+        .with("results", json!(results)));
+    }
+    let ok = results.iter().filter(|r| r["ok"] == true).count();
+    let mut v = doc.info(ctx.roots());
+    v["applied"] = json!(ok);
+    v["failed"] = json!(results.len() - ok);
+    v["results"] = json!(results);
+    v["entities"] = json!(doc.drawing()?.entity_count());
+    v["next_step"] = json!("save_drawing to keep the changes; render_preview to look at them");
+    Ok(Reply::json(v))
+}
+
+/// A document's session as it was at one point of an `edit` call: its drawings, each with its
+/// undo and redo history, selection, space, views and Block Editor, and which one is active.
+struct Before {
+    uid: u64,
+    docs: Vec<cadcraft_engine::DocState>,
+    active: usize,
+}
+
+impl Before {
+    fn of(doc: &Doc) -> Self {
+        Before { uid: doc.uid, docs: doc.session.docs.clone(), active: doc.session.active }
+    }
+}
+
+/// Put `doc` back as it was at `before`. A command the call left waiting for input is ended first.
+fn rollback(doc: &mut Doc, before: &Before) {
+    if doc.session.running.is_some() {
+        doc.session.cancel();
+    }
+    doc.session.docs.clone_from(&before.docs);
+    doc.session.active = before.active;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::super::docs::Settings;
+    use super::super::files::Roots;
+    use super::*;
+
+    fn ctx(write: Option<PathBuf>, old_copies: bool) -> Ctx {
+        Ctx::new(Settings { roots: Roots { read: None, write }, old_copies, ..Settings::default() })
+    }
+
+    fn engine() -> (Engine, Ctx) {
+        let mut e = Engine::default();
+        let c = ctx(None, true);
+        e.call("new_drawing", &json!({}), &c).unwrap();
+        (e, c)
+    }
+
+    fn state(e: &Engine) -> &cadcraft_engine::DocState {
+        e.docs.list[0].session.state().unwrap()
+    }
+
+    fn labels(e: &Engine) -> Vec<String> {
+        state(e).undo.iter().map(|u| u.label.clone()).collect()
+    }
+
+    fn edit(e: &mut Engine, c: &Ctx, args: Value) -> Result<Value, ToolError> {
+        e.call("edit", &args, c).map(|r| r.value)
+    }
+
+    fn made(r: &Value, k: usize) -> String {
+        let x = &r["results"][k]["result"];
+        x["handle"].as_str().or_else(|| x["handles"][0].as_str()).unwrap_or_else(|| panic!("no handle in {r}")).to_string()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("cadcraft-whiq-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A failed atomic call leaves the undo and redo history exactly as it was, even when an
+    /// `undo` op in it moved steps before another op recorded a new one.
+    #[test]
+    fn a_failed_atomic_call_keeps_the_history_as_it_was() {
+        let (mut e, c) = engine();
+        let circle = json!({"op": "add", "type": "circle", "center": [0, 0], "radius": 1});
+        edit(&mut e, &c, json!({"ops": [circle, circle]})).unwrap();
+        edit(&mut e, &c, json!({"ops": [{"op": "undo"}]})).unwrap();
+        let (doc, undo, redo) = (state(&e).doc.clone(), labels(&e), state(&e).redo.len());
+        let err = edit(
+            &mut e,
+            &c,
+            json!({"ops": [{"op": "undo"}, {"op": "add", "type": "line", "points": [[0, 0], [5, 5]]}, {"op": "command", "command": "no-such-command"}]}),
+        )
+        .unwrap_err();
+        assert!(err.next_step.contains("nothing of this call was applied"), "{}", err.next_step);
+        assert!(Arc::ptr_eq(&state(&e).doc, &doc));
+        assert_eq!(labels(&e), undo);
+        assert_eq!(state(&e).redo.len(), redo);
+        assert!(e.call.is_none());
+    }
+
+    /// With atomic: false an operation that makes several changes and fails part way (a script of
+    /// several lines) keeps none of them; the operations that worked are kept.
+    #[test]
+    fn an_operation_that_fails_part_way_keeps_none_of_it() {
+        let (mut e, c) = engine();
+        let (count, undo) = (state(&e).doc.entity_count(), labels(&e));
+        let script = "circle {\"center\": [0, 0], \"radius\": 1}\nno-such-command";
+        let r = edit(
+            &mut e,
+            &c,
+            json!({"atomic": false, "ops": [{"op": "cmdline", "text": script}, {"op": "add", "type": "line", "points": [[0, 0], [5, 5]]}]}),
+        )
+        .unwrap();
+        assert_eq!((r["applied"].as_u64(), r["failed"].as_u64()), (Some(1), Some(1)), "{r}");
+        assert_eq!(r["results"][0]["rolled_back"], true, "{r}");
+        assert!(r["results"][0]["error"]["next_step"].as_str().unwrap().contains("nothing of this operation was applied"), "{r}");
+        assert_eq!(state(&e).doc.entity_count(), count + 1, "the script's circle is gone, the line stays");
+        assert_eq!(labels(&e), [undo, vec!["Line".to_string()]].concat());
+        assert!(e.docs.list[0].session.running.is_none());
+    }
+
+    /// A shorthand that runs one command per block reference (set_attributes by block) and fails
+    /// on the second reference keeps the first one's change neither.
+    #[test]
+    fn a_shorthand_that_fails_on_its_second_command_keeps_none_of_it() {
+        let (mut e, c) = engine();
+        let r = edit(
+            &mut e,
+            &c,
+            json!({"ops": [
+                {"op": "add", "type": "line", "points": [[0, 0], [10, 0]]},
+                {"op": "add", "type": "attdef", "tag": "NO", "prompt": "Number", "default": "1", "at": [0, 5], "height": 1}
+            ]}),
+        )
+        .unwrap();
+        let (l, t) = (made(&r, 0), made(&r, 1));
+        let r = edit(
+            &mut e,
+            &c,
+            json!({"ops": [
+                {"op": "block", "action": "define", "name": "B", "base": [0, 0], "handles": [l, t], "keep": "delete"},
+                {"op": "block", "action": "insert", "name": "B", "at": [100, 0]},
+                {"op": "block", "action": "insert", "name": "B", "at": [0, 50]}
+            ]}),
+        )
+        .unwrap();
+        let a = made(&r, 1);
+        // While reference A is edited in place, only its working set may change: the attribute
+        // edit of the other reference is refused after A's has been made.
+        edit(&mut e, &c, json!({"ops": [{"op": "command", "command": "refedit", "params": {"handle": a}}]})).unwrap();
+        let (doc, undo) = (state(&e).doc.clone(), labels(&e));
+        let r = edit(&mut e, &c, json!({"atomic": false, "ops": [{"op": "set_attributes", "block": "B", "values": {"NO": "2"}}]})).unwrap();
+        assert_eq!(r["failed"], 1, "{r}");
+        assert_eq!(r["results"][0]["rolled_back"], true, "{r}");
+        assert!(Arc::ptr_eq(&state(&e).doc, &doc), "reference A keeps its old value");
+        assert_eq!(labels(&e), undo);
+    }
+
+    /// What a panic part way through an edit leaves (a change made, a command waiting for input)
+    /// is undone by the runtime's panic arm before it publishes and auto-saves.
+    #[test]
+    fn an_interrupted_edit_is_undone_whole() {
+        let (mut e, c) = engine();
+        edit(&mut e, &c, json!({"ops": [{"op": "add", "type": "circle", "center": [0, 0], "radius": 1}]})).unwrap();
+        assert!(e.call.is_none(), "a finished call leaves nothing to undo");
+        let (doc, undo) = (state(&e).doc.clone(), labels(&e));
+        e.call = Some(Before::of(&e.docs.list[0]));
+        let s = &mut e.docs.list[0].session;
+        s.execute("line", &json!({"points": [[0, 0], [5, 5]]})).unwrap();
+        s.cmdline("line").unwrap();
+        s.cmdline("0,0").unwrap();
+        assert!(s.running.is_some());
+        assert!(e.undo_interrupted_call());
+        assert!(Arc::ptr_eq(&state(&e).doc, &doc));
+        assert_eq!(labels(&e), undo);
+        assert!(e.docs.list[0].session.running.is_none());
+        assert!(!e.undo_interrupted_call(), "once only");
+    }
+
+    /// An export of several layouts that fails part way names the files it already wrote.
+    #[test]
+    fn a_failed_multi_layout_export_lists_the_files_written() {
+        let dir = scratch("export-written");
+        let c = ctx(Some(dir.clone()), false);
+        let mut e = Engine::default();
+        e.call("new_drawing", &json!({}), &c).unwrap();
+        edit(&mut e, &c, json!({"ops": [{"op": "add", "type": "line", "points": [[0, 0], [10, 10]]}]})).unwrap();
+        let spaces = read::spaces(e.docs.list[0].drawing().unwrap());
+        assert!(spaces.len() > 1, "a new drawing has layouts");
+        // The second space's file can't be written: a folder stands in its place.
+        std::fs::create_dir_all(dir.join(format!("plan-{}.svg", spaces[1].0)).join("x")).unwrap();
+        let err = e.call("export", &json!({"path": "plan.svg", "space": "all"}), &c).map(|_| ()).unwrap_err();
+        let written = err.extra["files_written"].as_array().unwrap_or_else(|| panic!("{}", err.to_value()));
+        assert_eq!(written.len(), 1);
+        assert!(written[0]["path"].as_str().unwrap().ends_with("plan-Model.svg"), "{written:?}");
+        assert!(err.reason.contains("1 file was written before it"), "{}", err.reason);
+        assert!(dir.join("plan-Model.svg").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preview written to files tile by tile that fails part way names the tiles written.
+    #[test]
+    fn a_failed_tiled_preview_lists_the_files_written() {
+        let dir = scratch("render-written");
+        let c = ctx(Some(dir.clone()), false);
+        let mut e = Engine::default();
+        e.call("new_drawing", &json!({}), &c).unwrap();
+        edit(&mut e, &c, json!({"ops": [{"op": "add", "type": "line", "points": [[0, 0], [10, 10]]}]})).unwrap();
+        std::fs::create_dir_all(dir.join("prev-c1r0.svg").join("x")).unwrap();
+        let err = e.call("render_preview", &json!({"output": "prev.svg", "tiles": {"cols": 2, "rows": 1}}), &c).map(|_| ()).unwrap_err();
+        let written = err.extra["files_written"].as_array().unwrap_or_else(|| panic!("{}", err.to_value()));
+        assert_eq!(written.len(), 1);
+        assert!(written[0]["path"].as_str().unwrap().ends_with("prev-c0r0.svg"), "{written:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,9 +1,12 @@
-use super::{Arc, EngineError, Result, Session, Snapshot, Value, cmd, find_command};
+use super::{Arc, Drawing, EngineError, Handle, Result, Session, Snapshot, Value, cmd, find_command};
 
 impl Session {
     // ---------------- programmatic execution ----------------
 
     /// Run a command with JSON parameters (no dialogs). Records undo when the drawing changes.
+    ///
+    /// A command that fails (an error or a panic) changes nothing: the drawing and selection are
+    /// put back as they were before it and no undo step is recorded.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         (spec.enabled)(self).map_err(|m| EngineError::Disabled(spec.id.into(), m))?;
@@ -22,12 +25,8 @@ impl Session {
                     .map(ToString::to_string)
                     .or_else(|| p.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "panic".into());
-                // Restore the drawing as it was.
-                if let Some((doc, sel, uid)) = &before
-                    && let Some(st) = self.docs.iter_mut().find(|d| d.uid == *uid)
-                {
-                    st.doc = doc.clone();
-                    st.selection = sel.clone();
+                if let Some(b) = &before {
+                    self.put_back(b);
                 }
                 return Err(EngineError::Internal(id.into(), msg));
             }
@@ -39,6 +38,12 @@ impl Session {
         };
         // Opening or closing the Block Editor swaps the whole drawing: nothing in it changed.
         if self.state().is_ok_and(|s| s.block_edit.is_some()) == editing {
+            // A failed command keeps none of what it did before failing.
+            if result.is_err()
+                && let Some(b) = &before
+            {
+                self.put_back(b);
+            }
             self.after_command(before.as_ref().map(|b| &b.0), before.as_ref().map(|b| b.2), spec.undoable && result.is_ok());
         }
         let result = match (result, &before) {
@@ -47,6 +52,7 @@ impl Session {
         };
         let grouped = self.lisp_groups_undo();
         if spec.undoable
+            && result.is_ok()
             && let Some((doc, sel, uid)) = before
             && let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&doc, &st.doc)
@@ -58,6 +64,17 @@ impl Session {
             st.revision += 1;
         }
         result
+    }
+
+    /// Put the document `uid` back as it was before a failed command: its drawing and selection.
+    /// When the current layout was one the command made (or renamed), the view follows it back.
+    fn put_back(&mut self, (doc, selection, uid): &(Arc<Drawing>, Vec<Handle>, u64)) {
+        let Some(st) = self.docs.iter_mut().find(|d| d.uid == *uid) else { return };
+        if !Arc::ptr_eq(doc, &st.doc) {
+            let failed = std::mem::replace(&mut st.doc, doc.clone());
+            st.follow_layout(&failed);
+        }
+        st.selection.clone_from(selection);
     }
 
     /// Bump the revision without an undo step (view-only or settings changes that redraw).

@@ -412,6 +412,56 @@ fn edit_and_delete_in_batches_all_or_nothing() {
     assert!(!l["layers"].as_array().unwrap().iter().any(|x| x["name"] == "TEMP"));
 }
 
+/// The undo history `drawing.inspect` reports (the latest steps first).
+fn undo_steps(m: &mut Mcp) -> Value {
+    m.call("edit", json!({"command": "drawing.inspect"}))["results"][0]["result"]["undo"].clone()
+}
+
+#[test]
+fn a_call_that_fails_part_way_keeps_nothing_of_itself() {
+    let mut m = Mcp::start("undo-call", &["--automation-no-old-copies"]);
+    m.call("new_drawing", json!({}));
+    let circle = json!({"op": "add", "type": "circle", "center": [0, 0], "radius": 1});
+    let first = made(&m.call("edit", json!({"ops": [circle, circle]}))["results"][0]);
+    m.call("edit", json!({"ops": [{"op": "undo"}]}));
+    let (entities, undo) = (m.call("read_drawing", json!({}))["entities"].clone(), undo_steps(&mut m));
+    // Atomic: an undo, a new step, then a failure: the history is as it was, not truncated.
+    let e = m.error(
+        "edit",
+        json!({"ops": [{"op": "undo"}, {"op": "add", "type": "line", "points": [[0, 0], [5, 5]]}, {"op": "command", "command": "no-such-command"}]}),
+    );
+    assert_eq!(e["rolled_back"], true);
+    assert!(e["next_step"].as_str().unwrap().contains("nothing of this call was applied"), "{e}");
+    assert_eq!(m.call("read_drawing", json!({}))["entities"], entities);
+    assert_eq!(undo_steps(&mut m), undo);
+    // atomic: false: an operation that fails part way (a script of two lines, a command that made
+    // a layer before failing) keeps none of it; the operation that worked stays.
+    let r = m.call(
+        "edit",
+        json!({"atomic": false, "ops": [
+            {"op": "cmdline", "text": "circle {\"center\": [0, 0], \"radius\": 1}\nno-such-command"},
+            {"op": "set_properties", "handles": [first], "layer": "WALLS", "dimStyle": "NO-SUCH-STYLE"},
+            {"op": "add", "type": "line", "points": [[0, 0], [5, 5]]}
+        ]}),
+    );
+    assert_eq!((r["applied"].as_u64(), r["failed"].as_u64()), (Some(1), Some(2)), "{r}");
+    assert_eq!(r["results"][0]["rolled_back"], true, "{r}");
+    assert_eq!(r["entities"].as_u64(), entities.as_u64().map(|n| n + 1), "only the line was added: {r}");
+    let layers = m.call("read_drawing", json!({"section": "layers"}));
+    assert!(!layers["layers"].as_array().unwrap().iter().any(|l| l["name"] == "WALLS"), "{layers}");
+    // A multi-file export or preview that fails part way names the files it already wrote.
+    m.call("edit", json!({"ops": [{"op": "add", "type": "line", "points": [[0, 0], [10, 10]]}]}));
+    std::fs::create_dir_all(m.dir.join("out/plan-Layout1.svg/x")).unwrap();
+    let e = m.error("export", json!({"path": "plan.svg", "space": "all"}));
+    let written: Vec<&str> = e["files_written"].as_array().unwrap_or_else(|| panic!("{e}")).iter().filter_map(|f| f["path"].as_str()).collect();
+    assert!(written.len() == 1 && written[0].ends_with("plan-Model.svg"), "{e}");
+    assert!(e["reason"].as_str().unwrap().contains("files_written"), "{e}");
+    std::fs::create_dir_all(m.dir.join("out/prev-c1r0.svg/x")).unwrap();
+    let e = m.error("render_preview", json!({"tiles": [2, 1], "output": "prev.svg"}));
+    let written: Vec<&str> = e["files_written"].as_array().unwrap_or_else(|| panic!("{e}")).iter().filter_map(|f| f["path"].as_str()).collect();
+    assert!(written.len() == 1 && written[0].ends_with("prev-c0r0.svg"), "{e}");
+}
+
 #[test]
 fn save_as_dwg_and_dxf_versions_and_open_them_back() {
     let mut m = Mcp::start("save", &[]);
