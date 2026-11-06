@@ -1093,7 +1093,11 @@ fn worker_loop(shared: &Shared, rx: mpsc::Receiver<Work>) {
                         let mut e = ToolError::new(
                             code::INTERNAL,
                             format!("{tool} failed inside the engine"),
-                            "nothing of this call was applied: the drawing is as it was before it (also auto-saved as the recovered file) — send it again (fixed), or with other arguments",
+                            if undone {
+                                "nothing of this call was applied: the drawing is as it was before it (also auto-saved as the recovered file) — send it again (fixed), or with other arguments"
+                            } else {
+                                "the drawing may hold part of this call (it is auto-saved as the recovered file): inspect it before going on, then send what is missing (fixed), or with other arguments"
+                            },
                         )
                         .with("rolled_back", json!(undone));
                         if let Some(p) = saved.first() {
