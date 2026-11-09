@@ -104,7 +104,8 @@ fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> Di
         let paper = matches!(space, Space::Paper(_));
         #[cfg(not(target_arch = "wasm32"))]
         if !paper && !plotting && b.styles.is_none() && store.len() >= 2 * PARALLEL_CHUNK {
-            build_parallel(&mut b, d, store);
+            let ents: Vec<&Entity> = store.iter().map(|e| e.as_ref()).collect();
+            build_parallel(&mut b, d, &ents);
             return b.list;
         }
         let mut viewports = 0usize;
@@ -139,10 +140,11 @@ pub(crate) const PARALLEL_CHUNK: usize = 256;
 /// stopped blocking the UI) and after every edit; one core made both slow on real drawings. Plots, layouts and plot styles keep the one-thread
 /// path (they run once, and their pens and per-primitive layers are built along the way).
 #[cfg(not(target_arch = "wasm32"))]
-fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStore) {
+fn build_parallel(b: &mut Builder, d: &Drawing, ents: &[&Entity]) {
     use rayon::prelude::*;
-    let ents: Vec<&std::sync::Arc<Entity>> = store.iter().collect();
-    let budget = std::sync::atomic::AtomicUsize::new(0);
+    // The block-expansion count starts where the builder's is (0, or the earlier slices' in
+    // [`build_slice`]).
+    let budget = std::sync::atomic::AtomicUsize::new(b.list.expanded);
     let (opts, plotting) = (b.opts, b.plotting);
     let parts: Vec<DisplayList> = ents
         .par_chunks(PARALLEL_CHUNK)
@@ -201,6 +203,28 @@ pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents:
         opts
     };
     let mut b = Builder { list: DisplayList::default(), opts, plotting: false, styles: None, named: None, shared_budget: None, transparency: 0 };
+    for e in ents {
+        entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
+    }
+    b.list
+}
+
+/// Build one slice of model-space entities for an export written slice by slice. The entities
+/// are in stored draw order and the slices follow each other, so the lists drawn one after the
+/// other are the list [`build`] makes of all of them at once (same primitives, same order); a big
+/// slice is built on all cores like [`build`] does. `expanded` is the block-expansion count of the
+/// earlier slices ([`DisplayList::expanded`] of the previous one), so [`MAX_BLOCK_EXPANSION`] caps
+/// the whole drawing, not each slice.
+pub fn build_slice(d: &Drawing, ents: &[&Entity], opts: &Options, expanded: usize) -> DisplayList {
+    let opts = &with_point_view(d, &Space::Model, opts);
+    let styler = style_table(d, &Space::Model, opts, false).map(|t| plotstyle::Styler::new(d, t));
+    let list = DisplayList { expanded, ..DisplayList::default() };
+    let mut b = Builder { list, opts, plotting: false, styles: styler.as_ref(), named: None, shared_budget: None, transparency: 0 };
+    #[cfg(not(target_arch = "wasm32"))]
+    if ents.len() >= 2 * PARALLEL_CHUNK && b.styles.is_none() {
+        build_parallel(&mut b, d, ents);
+        return b.list;
+    }
     for e in ents {
         entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
     }

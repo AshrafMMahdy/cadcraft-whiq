@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 
 use super::contract::{ToolError, code};
 use super::docs::{Ctx, Doc, Docs, engine_error};
-use super::files::{Access, WritePolicy, io_error, saved_entry, write_file};
+use super::files::{Access, WritePolicy, io_error, saved_entry, write_file, write_file_with};
 use super::{preview, read};
 
 /// What a tool answers: the structured result, extra content blocks (pictures), the text block
@@ -633,22 +633,6 @@ impl Engine {
                             }
                         }
                         let prep = preview::prepare(d, &args, ctx)?;
-                        let bytes = if fmt == "svg" {
-                            let wpx = f64::from(a.get("width").and_then(Value::as_u64).map_or(1600, |w| u32::try_from(w).unwrap_or(1600)));
-                            let list = prep.list_for(&prep.window, wpx, ctx)?;
-                            preview::svg_tile(&list, &prep.layers, &prep.window, wpx, false, ctx)?.0.into_bytes()
-                        } else {
-                            let w = a.get("width").and_then(Value::as_u64).map_or(2400, |w| u32::try_from(w).unwrap_or(2400));
-                            preview::png(
-                                &prep,
-                                &prep.window,
-                                w,
-                                a.get("height").and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok()),
-                                false,
-                                ctx,
-                            )?
-                            .0
-                        };
                         let f = if many {
                             let stem = file.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| "drawing".into());
                             let safe: String = name.chars().map(|c| if c.is_alphanumeric() || "-_ ".contains(c) { c } else { '_' }).collect();
@@ -657,8 +641,25 @@ impl Engine {
                             file.clone()
                         };
                         let p = ctx.resolve(&f.to_string_lossy(), Access::Write)?;
-                        let kept = write_file(&p, &bytes, policy)?;
-                        let mut e = saved_entry(ctx.roots(), &p, bytes.len(), &fmt, kept.as_ref());
+                        let (kept, size) = if fmt == "svg" {
+                            // Written as it is made (display list slice by slice) through the same
+                            // atomic file write: a call that stops part way leaves nothing of it.
+                            let wpx = f64::from(a.get("width").and_then(Value::as_u64).map_or(1600, |w| u32::try_from(w).unwrap_or(1600)));
+                            write_file_with(&p, policy, |w| prep.write_svg(w, &prep.window, wpx, ctx))?
+                        } else {
+                            let w = a.get("width").and_then(Value::as_u64).map_or(2400, |w| u32::try_from(w).unwrap_or(2400));
+                            let bytes = preview::png(
+                                &prep,
+                                &prep.window,
+                                w,
+                                a.get("height").and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok()),
+                                false,
+                                ctx,
+                            )?
+                            .0;
+                            (write_file(&p, &bytes, policy)?, bytes.len())
+                        };
+                        let mut e = saved_entry(ctx.roots(), &p, size, &fmt, kept.as_ref());
                         e["space"] = json!(name);
                         saved.push(e);
                     }
@@ -1494,6 +1495,87 @@ mod tests {
         let written = err.extra["files_written"].as_array().unwrap_or_else(|| panic!("{}", err.to_value()));
         assert_eq!(written.len(), 1);
         assert!(written[0]["path"].as_str().unwrap().ends_with("prev-c0r0.svg"), "{written:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sample drawing the SVG fixture was made from (with the code that wrote the whole SVG
+    /// into one string): lines, a circle, text, a point, an infinite line, a wipeout, on 3 layers.
+    fn svg_sample() -> (Engine, Ctx) {
+        let (mut e, c) = engine();
+        edit(
+            &mut e,
+            &c,
+            json!({"ops": [
+                {"op": "command", "command": "layer.new", "params": {"name": "WALLS", "color": 1}},
+                {"op": "command", "command": "layer.new", "params": {"name": "TEXT", "color": 3}},
+                {"op": "add", "type": "line", "points": [[0, 0], [100, 50]]},
+                {"op": "layer", "action": "current", "name": "WALLS"},
+                {"op": "add", "type": "circle", "center": [30, 30], "radius": 12.5},
+                {"op": "add", "type": "line", "points": [[5, 90], [60, 10]]},
+                {"op": "layer", "action": "current", "name": "TEXT"},
+                {"op": "add", "type": "text", "at": [10, 70], "text": "Hello & <World>", "height": 6},
+                {"op": "add", "type": "mtext", "at": [50, 80], "text": "Multi line\\Ptext", "height": 4},
+                {"op": "layer", "action": "current", "name": "0"},
+                {"op": "add", "type": "point", "at": [70, 20]},
+                {"op": "add", "type": "xline", "base": [20, 20], "angle": 45},
+                {"op": "add", "type": "pline", "points": [[0, 0], [20, 0], [20, 20], [0, 20]], "closed": true},
+                {"op": "add", "type": "wipeout", "points": [[25, 25], [45, 25], [45, 45], [25, 45]]},
+                {"op": "add", "type": "line", "points": [[0, 100], [100, 0]]}
+            ]}),
+        )
+        .unwrap();
+        (e, c)
+    }
+
+    /// The SVG written slice by slice is byte for byte the one the old whole-string code wrote
+    /// (`testdata/export_sample.svg` was made with it before the change), whatever the slice size,
+    /// and so is `svg_tile` of the whole display list.
+    #[test]
+    fn an_svg_written_in_slices_is_byte_identical_to_the_whole_string_one() {
+        let (e, c) = svg_sample();
+        let d = e.docs.list[0].drawing().unwrap();
+        let expected = include_str!("testdata/export_sample.svg");
+        let prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        let whole = preview::svg_tile(&prep.list_for(&prep.window, 1600.0, &c).unwrap(), &prep.layers, &prep.window, 1600.0, false, &c).unwrap().0;
+        assert_eq!(whole, expected);
+        for slice in [1, 2, 3, 7, preview::SLICE_ENTITIES] {
+            let mut out = Vec::new();
+            let n = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
+            assert_eq!(n, out.len());
+            assert_eq!(String::from_utf8(out).unwrap(), expected, "slice of {slice} entities");
+        }
+    }
+
+    /// `export` writes that same SVG to the file and answers its size; an earlier file is kept as
+    /// OLD_<name>; no temporary file stays.
+    #[test]
+    fn export_svg_writes_the_file_and_reports_its_size() {
+        let dir = scratch("export-svg-stream");
+        let c = ctx(Some(dir.clone()), true);
+        let (mut e, _) = svg_sample();
+        let r = e.call("export", &json!({"path": "plan.svg"}), &c).unwrap().value;
+        let expected = include_str!("testdata/export_sample.svg");
+        assert_eq!(std::fs::read_to_string(dir.join("plan.svg")).unwrap(), expected);
+        assert_eq!(r["saved"][0]["bytes"], json!(expected.len()));
+        e.call("export", &json!({"path": "plan.svg"}), &c).unwrap();
+        assert!(dir.join("OLD_plan.svg").is_file());
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|f| f.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.iter().all(|n| !n.ends_with(".cctmp")), "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An SVG export that is stopped leaves nothing of itself: no file, no temporary file, and an
+    /// earlier file stays where it was.
+    #[test]
+    fn a_stopped_svg_export_leaves_nothing() {
+        let dir = scratch("export-svg-stopped");
+        let c = ctx(Some(dir.clone()), true);
+        let (mut e, _) = svg_sample();
+        std::fs::write(dir.join("plan.svg"), "earlier").unwrap();
+        c.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(e.call("export", &json!({"path": "plan.svg"}), &c).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("plan.svg")).unwrap(), "earlier");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

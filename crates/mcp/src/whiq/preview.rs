@@ -7,13 +7,14 @@
 
 use std::fmt::Write as _;
 
-use cadcraft_engine::doc::{Drawing, EntityKind, Handle, Space};
+use cadcraft_engine::doc::{Drawing, Entity, EntityKind, Handle, Space};
 use cadcraft_engine::geom::{Bounds2, Vec2};
 use cadcraft_engine::render::{DisplayList, Kind};
 use serde_json::{Value, json};
 
 use super::contract::{ToolError, code};
 use super::docs::Ctx;
+use super::files::WriteErr;
 use super::read::window_arg;
 
 /// The layer switches of a call: `layers_off`, `layers_on`, `only_layers` (names, any case).
@@ -163,6 +164,161 @@ fn decimals(size: f64) -> usize {
     d.clamp(0.0, 9.0) as usize
 }
 
+/// Model-space entities per display-list slice when an SVG is written to a file (a batch: it
+/// bounds the memory of one slice and does not change the output).
+pub const SLICE_ENTITIES: usize = 16_384;
+
+/// An SVG written in pieces: it sends what it has made to `out` in blocks, so the SVG of a huge
+/// drawing is never one string in memory.
+pub struct SvgWriter<'a, W: std::io::Write> {
+    out: W,
+    /// Text made and not yet sent to `out`.
+    buf: String,
+    layers: &'a std::collections::HashMap<Handle, String>,
+    window: Bounds2,
+    vw: f64,
+    vh: f64,
+    dp: usize,
+    x0: f64,
+    y1: f64,
+    bg: cadcraft_engine::doc::color::Rgb,
+    /// The layer of the open `<g>` (layer runs continue from one display list to the next).
+    open: Option<String>,
+    prims: usize,
+    bytes: usize,
+}
+
+/// Text made before it is sent to the sink.
+const SVG_FLUSH: usize = 1 << 16;
+
+impl<'a, W: std::io::Write> SvgWriter<'a, W> {
+    /// Start the SVG of `window` (the header depends on the window and width only, never on the
+    /// primitives, so it can be written before any of them exists).
+    pub fn new(out: W, layers: &'a std::collections::HashMap<Handle, String>, window: &Bounds2, width_px: f64, dark: bool) -> Self {
+        let (vw, vh) = (window.width().max(1e-9), window.height().max(1e-9));
+        let dp = decimals(vw.max(vh));
+        let (x0, y1) = (window.min.x, window.max.y);
+        let bg = if dark { cadcraft_engine::doc::color::Rgb(33, 40, 48) } else { cadcraft_engine::doc::color::Rgb(255, 255, 255) };
+        let mut buf = String::new();
+        let _ = write!(
+            buf,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vw:.dp$} {vh:.dp$}" width="{:.0}" height="{:.0}" data-x0="{x0}" data-y1="{y1}"><rect width="100%" height="100%" fill="{}"/>"#,
+            width_px,
+            width_px * vh / vw,
+            bg.hex()
+        );
+        SvgWriter { out, buf, layers, window: *window, vw, vh, dp, x0, y1, bg, open: None, prims: 0, bytes: 0 }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.write_all(self.buf.as_bytes())?;
+        self.bytes += self.buf.len();
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Write the primitives of `list` (only those that reach into the window), after the ones
+    /// written before.
+    pub fn add(&mut self, list: &DisplayList, ctx: &Ctx) -> Result<(), WriteErr> {
+        let (vw, vh, dp, bg, window) = (self.vw, self.vh, self.dp, self.bg, self.window);
+        let (x0, y1) = (self.x0, self.y1);
+        let tx = |x: f64| x - x0;
+        let ty = |y: f64| y1 - y;
+        for (k, p) in list.prims.iter().enumerate() {
+            if k % 8192 == 0 {
+                ctx.check()?;
+            }
+            let pts = list.points(p);
+            if !matches!(p.kind, Kind::Infinite { .. }) && !prim_bounds(list, p).intersects(&window) {
+                continue;
+            }
+            let layer = self.layers.get(&p.handle).map(String::as_str).unwrap_or("");
+            let s = &mut self.buf;
+            if self.open.as_deref() != Some(layer) {
+                if self.open.is_some() {
+                    s.push_str("</g>");
+                }
+                let _ = write!(s, r#"<g data-layer="{}">"#, esc(layer));
+                self.open = Some(layer.to_string());
+            }
+            self.prims += 1;
+            let c = p.display_rgb(bg).hex();
+            let op = if p.kind == Kind::Mask || p.transparency == 0 {
+                String::new()
+            } else {
+                format!(r#" opacity="{:.2}""#, f64::from(p.alpha()) / 255.0)
+            };
+            let sw = if p.lw > 0.35 { 2.0 } else { 1.0 };
+            match p.kind {
+                Kind::Polyline => {
+                    let _ = write!(
+                        s,
+                        r#"<polyline fill="none" stroke="{c}"{op} stroke-width="{sw}" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round" points=""#
+                    );
+                    for q in pts {
+                        let _ = write!(s, "{:.dp$},{:.dp$} ", tx(q.x), ty(q.y));
+                    }
+                    s.push_str(r#""/>"#);
+                }
+                Kind::Tris | Kind::Mask => {
+                    let c = if p.kind == Kind::Mask { bg.hex() } else { c };
+                    let _ = write!(s, r#"<path fill="{c}"{op} d=""#);
+                    for t in pts.chunks(3) {
+                        if let [a, b, cc] = t {
+                            let _ = write!(
+                                s,
+                                "M{:.dp$} {:.dp$}L{:.dp$} {:.dp$}L{:.dp$} {:.dp$}Z",
+                                tx(a.x),
+                                ty(a.y),
+                                tx(b.x),
+                                ty(b.y),
+                                tx(cc.x),
+                                ty(cc.y)
+                            );
+                        }
+                    }
+                    s.push_str(r#""/>"#);
+                }
+                Kind::Point => {
+                    if let Some(q) = pts.first() {
+                        let _ = write!(s, r#"<circle cx="{:.dp$}" cy="{:.dp$}" r="{:.dp$}" fill="{c}"{op}/>"#, tx(q.x), ty(q.y), vw.max(vh) / 1500.0);
+                    }
+                }
+                Kind::Infinite { ray } => {
+                    if let (Some(bp), Some(dir)) = (pts.first(), pts.get(1)) {
+                        let far = (vw + vh) * 2.0 + bp.dist(window.center());
+                        let a = if ray { *bp } else { *bp - *dir * far };
+                        let e = *bp + *dir * far;
+                        let _ = write!(
+                            s,
+                            r#"<line x1="{:.dp$}" y1="{:.dp$}" x2="{:.dp$}" y2="{:.dp$}" stroke="{c}"{op} stroke-width="1" vector-effect="non-scaling-stroke"/>"#,
+                            tx(a.x),
+                            ty(a.y),
+                            tx(e.x),
+                            ty(e.y)
+                        );
+                    }
+                }
+            }
+            if self.buf.len() >= SVG_FLUSH {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the SVG and send the rest: the sink, the primitives written and the bytes.
+    pub fn finish(mut self) -> Result<(W, usize, usize), WriteErr> {
+        if self.open.is_some() {
+            self.buf.push_str("</g>");
+        }
+        self.buf.push_str("</svg>");
+        self.flush()?;
+        self.out.flush()?;
+        Ok((self.out, self.prims, self.bytes))
+    }
+}
+
 /// One SVG of `window` from the display list: only the primitives that reach into it.
 pub fn svg_tile(
     list: &DisplayList,
@@ -172,92 +328,15 @@ pub fn svg_tile(
     dark: bool,
     ctx: &Ctx,
 ) -> Result<(String, usize), ToolError> {
-    let (vw, vh) = (window.width().max(1e-9), window.height().max(1e-9));
-    let dp = decimals(vw.max(vh));
-    let (x0, y1) = (window.min.x, window.max.y);
-    let bg = if dark { cadcraft_engine::doc::color::Rgb(33, 40, 48) } else { cadcraft_engine::doc::color::Rgb(255, 255, 255) };
-    let mut s = String::new();
-    let _ = write!(
-        s,
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vw:.dp$} {vh:.dp$}" width="{:.0}" height="{:.0}" data-x0="{x0}" data-y1="{y1}"><rect width="100%" height="100%" fill="{}"/>"#,
-        width_px,
-        width_px * vh / vw,
-        bg.hex()
-    );
-    let tx = |x: f64| x - x0;
-    let ty = |y: f64| y1 - y;
-    let mut open: Option<String> = None;
-    let mut n = 0usize;
-    for (k, p) in list.prims.iter().enumerate() {
-        if k % 8192 == 0 {
-            ctx.check()?;
-        }
-        let pts = list.points(p);
-        if !matches!(p.kind, Kind::Infinite { .. }) && !prim_bounds(list, p).intersects(window) {
-            continue;
-        }
-        let layer = layers.get(&p.handle).map(String::as_str).unwrap_or("");
-        if open.as_deref() != Some(layer) {
-            if open.is_some() {
-                s.push_str("</g>");
-            }
-            let _ = write!(s, r#"<g data-layer="{}">"#, esc(layer));
-            open = Some(layer.to_string());
-        }
-        n += 1;
-        let c = p.display_rgb(bg).hex();
-        let op =
-            if p.kind == Kind::Mask || p.transparency == 0 { String::new() } else { format!(r#" opacity="{:.2}""#, f64::from(p.alpha()) / 255.0) };
-        let sw = if p.lw > 0.35 { 2.0 } else { 1.0 };
-        match p.kind {
-            Kind::Polyline => {
-                let _ = write!(
-                    s,
-                    r#"<polyline fill="none" stroke="{c}"{op} stroke-width="{sw}" vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round" points=""#
-                );
-                for q in pts {
-                    let _ = write!(s, "{:.dp$},{:.dp$} ", tx(q.x), ty(q.y));
-                }
-                s.push_str(r#""/>"#);
-            }
-            Kind::Tris | Kind::Mask => {
-                let c = if p.kind == Kind::Mask { bg.hex() } else { c };
-                let _ = write!(s, r#"<path fill="{c}"{op} d=""#);
-                for t in pts.chunks(3) {
-                    if let [a, b, cc] = t {
-                        let _ =
-                            write!(s, "M{:.dp$} {:.dp$}L{:.dp$} {:.dp$}L{:.dp$} {:.dp$}Z", tx(a.x), ty(a.y), tx(b.x), ty(b.y), tx(cc.x), ty(cc.y));
-                    }
-                }
-                s.push_str(r#""/>"#);
-            }
-            Kind::Point => {
-                if let Some(q) = pts.first() {
-                    let _ = write!(s, r#"<circle cx="{:.dp$}" cy="{:.dp$}" r="{:.dp$}" fill="{c}"{op}/>"#, tx(q.x), ty(q.y), vw.max(vh) / 1500.0);
-                }
-            }
-            Kind::Infinite { ray } => {
-                if let (Some(bp), Some(dir)) = (pts.first(), pts.get(1)) {
-                    let far = (vw + vh) * 2.0 + bp.dist(window.center());
-                    let a = if ray { *bp } else { *bp - *dir * far };
-                    let e = *bp + *dir * far;
-                    let _ = write!(
-                        s,
-                        r#"<line x1="{:.dp$}" y1="{:.dp$}" x2="{:.dp$}" y2="{:.dp$}" stroke="{c}"{op} stroke-width="1" vector-effect="non-scaling-stroke"/>"#,
-                        tx(a.x),
-                        ty(a.y),
-                        tx(e.x),
-                        ty(e.y)
-                    );
-                }
-            }
-        }
-    }
-    if open.is_some() {
-        s.push_str("</g>");
-    }
-    s.push_str("</svg>");
-    Ok((s, n))
+    let fail = |e: WriteErr| match e {
+        WriteErr::Tool(e) => e,
+        WriteErr::Io(e) => ToolError::new(code::FAILED, e.to_string(), "retry"),
+    };
+    let mut w = SvgWriter::new(Vec::new(), layers, window, width_px, dark);
+    w.add(list, ctx).map_err(fail)?;
+    let (bytes, n, _) = w.finish().map_err(fail)?;
+    let svg = String::from_utf8(bytes).map_err(|e| ToolError::new(code::FAILED, e.to_string(), "retry"))?;
+    Ok((svg, n))
 }
 
 /// Everything a preview is built from: the drawing (with the layer switches), the area shown
@@ -281,20 +360,35 @@ impl Prepared<'_> {
         self.switched.as_ref().unwrap_or(self.base)
     }
 
-    /// The display list of `window` drawn `width_px` wide: curves as fine as an eighth of a pixel
-    /// (room to zoom in on the SVG), and in model space only the objects that reach into the
-    /// window (infinite lines always).
-    pub fn list_for(&self, window: &Bounds2, width_px: f64, ctx: &Ctx) -> Result<DisplayList, ToolError> {
-        let d = self.drawing();
+    /// The build options of a display list of `window` drawn `width_px` wide: curves as fine as an
+    /// eighth of a pixel (room to zoom in on the SVG).
+    fn options(&self, window: &Bounds2, width_px: f64, ctx: &Ctx) -> cadcraft_engine::render::Options {
         let size = window.width().max(window.height());
-        let opts = cadcraft_engine::render::Options {
+        cadcraft_engine::render::Options {
             transparency: true,
             lineweights: self.lineweights,
             tolerance: (size / (width_px.max(16.0) * 8.0)).max(1e-9),
             view_height: window.height(),
             cancel: Some(ctx.cancel.clone()),
             ..cadcraft_engine::render::Options::default()
-        };
+        }
+    }
+
+    /// Whether model-space `e` reaches into `reach` (rays and infinite lines always do).
+    fn reaches(&self, e: &Entity, reach: &Bounds2) -> bool {
+        matches!(e.kind, EntityKind::Ray(_) | EntityKind::XLine(_)) || {
+            let b = cadcraft_engine::doc::extent_bounds(self.drawing(), e);
+            b.is_empty() || b.intersects(reach)
+        }
+    }
+
+    /// The display list of `window` drawn `width_px` wide: curves as fine as an eighth of a pixel
+    /// (room to zoom in on the SVG), and in model space only the objects that reach into the
+    /// window (infinite lines always).
+    pub fn list_for(&self, window: &Bounds2, width_px: f64, ctx: &Ctx) -> Result<DisplayList, ToolError> {
+        let d = self.drawing();
+        let size = window.width().max(window.height());
+        let opts = self.options(window, width_px, ctx);
         ctx.stage("building the display list", 0);
         let list = match &self.target.space {
             Space::Model => {
@@ -305,11 +399,7 @@ impl Prepared<'_> {
                     if k % 65_536 == 0 {
                         ctx.check()?;
                     }
-                    let keep = matches!(e.kind, EntityKind::Ray(_) | EntityKind::XLine(_)) || {
-                        let b = cadcraft_engine::doc::extent_bounds(d, e);
-                        b.is_empty() || b.intersects(&reach)
-                    };
-                    if keep {
+                    if self.reaches(e, &reach) {
                         picked.push(e.as_ref());
                     }
                 }
@@ -323,6 +413,77 @@ impl Prepared<'_> {
         };
         ctx.check()?;
         Ok(list)
+    }
+
+    /// What [`Prepared::list_for`] returns, handed to `each` in pieces drawn one after the other:
+    /// model space in slices of [`SLICE_ENTITIES`] entities in their stored draw order (so
+    /// overlaps and wipeouts draw as in the whole list), each built, handed over and dropped
+    /// before the next; a layout, whose viewports and sheet need the whole build, in one piece.
+    /// For a drawing too big to hold the display list of at once.
+    pub fn each_list(
+        &self,
+        window: &Bounds2,
+        width_px: f64,
+        ctx: &Ctx,
+        mut each: impl FnMut(&DisplayList) -> Result<(), WriteErr>,
+    ) -> Result<(), WriteErr> {
+        self.each_list_sliced(window, width_px, ctx, SLICE_ENTITIES, &mut each)
+    }
+
+    fn each_list_sliced(
+        &self,
+        window: &Bounds2,
+        width_px: f64,
+        ctx: &Ctx,
+        slice: usize,
+        each: &mut dyn FnMut(&DisplayList) -> Result<(), WriteErr>,
+    ) -> Result<(), WriteErr> {
+        if !matches!(self.target.space, Space::Model) {
+            return Ok(each(&self.list_for(window, width_px, ctx)?)?);
+        }
+        let d = self.drawing();
+        let opts = self.options(window, width_px, ctx);
+        let reach = window.expand(window.width().max(window.height()) * 1e-6);
+        ctx.stage("building the display list", 0);
+        let mut picked: Vec<&Entity> = Vec::new();
+        // Block contents expanded so far: the cap on them is the drawing's, not a slice's.
+        let mut expanded = 0usize;
+        let mut build = |picked: &mut Vec<&Entity>| -> Result<(), WriteErr> {
+            ctx.check()?;
+            let list = cadcraft_engine::render::build_slice(d, picked, &opts, expanded);
+            expanded = list.expanded;
+            picked.clear();
+            ctx.check()?;
+            each(&list)
+        };
+        for (k, e) in d.model.iter().enumerate() {
+            if k % 65_536 == 0 {
+                ctx.check()?;
+            }
+            if self.reaches(e, &reach) {
+                picked.push(e.as_ref());
+                if picked.len() >= slice {
+                    build(&mut picked)?;
+                }
+            }
+        }
+        if !picked.is_empty() {
+            build(&mut picked)?;
+        }
+        Ok(())
+    }
+
+    /// The SVG of `window` written to `out` as it is made: the same bytes as
+    /// [`svg_tile`] of [`Prepared::list_for`], without the whole display list or the whole text in
+    /// memory. Returns the bytes written.
+    pub fn write_svg<W: std::io::Write>(&self, out: W, window: &Bounds2, width_px: f64, ctx: &Ctx) -> Result<usize, WriteErr> {
+        self.write_svg_sliced(out, window, width_px, ctx, SLICE_ENTITIES)
+    }
+
+    pub fn write_svg_sliced<W: std::io::Write>(&self, out: W, window: &Bounds2, width_px: f64, ctx: &Ctx, slice: usize) -> Result<usize, WriteErr> {
+        let mut w = SvgWriter::new(out, &self.layers, window, width_px, false);
+        self.each_list_sliced(window, width_px, ctx, slice, &mut |list| w.add(list, ctx))?;
+        Ok(w.finish()?.2)
     }
 }
 

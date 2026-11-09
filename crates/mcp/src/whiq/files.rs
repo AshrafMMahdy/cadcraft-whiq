@@ -142,20 +142,54 @@ fn old_name(path: &Path) -> Option<PathBuf> {
     (1..10_000).map(|n| if n == 1 { dir.join(format!("OLD_{name}")) } else { dir.join(format!("OLD_{n}_{name}")) }).find(|p| !p.exists())
 }
 
+/// Why a [`write_file_with`] filler stopped: the call's own error (a cancel, a bad argument) or a
+/// failed write to the file.
+pub enum WriteErr {
+    Tool(ToolError),
+    Io(std::io::Error),
+}
+
+impl From<ToolError> for WriteErr {
+    fn from(e: ToolError) -> Self {
+        WriteErr::Tool(e)
+    }
+}
+
+impl From<std::io::Error> for WriteErr {
+    fn from(e: std::io::Error) -> Self {
+        WriteErr::Io(e)
+    }
+}
+
+/// Removes the temporary file unless the write finished (also when the filler panics).
+struct TmpFile(Option<PathBuf>);
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Write `bytes` to `path` atomically (a temporary file in the same folder, flushed to disk, then
 /// renamed over it). Returns `{path, previous}` when an earlier file was kept as an OLD_ copy.
 pub fn write_file(path: &Path, bytes: &[u8], policy: WritePolicy) -> Result<Option<(PathBuf, PathBuf)>, ToolError> {
+    write_file_with(path, policy, |w| w.write_all(bytes).map_err(WriteErr::from)).map(|(kept, ())| kept)
+}
+
+/// [`write_file`] for content produced as it is written: `fill` writes it to a buffered writer on
+/// the temporary file, so a huge file is never held whole in memory. The guarantees are the
+/// same: nothing is at `path` until `fill` and the flush to disk have finished, an earlier file
+/// is renamed to its OLD_ copy only then, and a failed or stopped call leaves no temporary file
+/// and the earlier file where it was. Returns what `fill` returned beside the OLD_ copy.
+pub fn write_file_with<T>(
+    path: &Path,
+    policy: WritePolicy,
+    fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T, WriteErr>,
+) -> Result<(Option<(PathBuf, PathBuf)>, T), ToolError> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir).map_err(|e| io_error(&dir, &e))?;
-    let mut kept = None;
-    if path.exists()
-        && policy.old_copies
-        && !policy.overwrite
-        && let Some(old) = old_name(path)
-    {
-        std::fs::rename(path, &old).map_err(|e| io_error(path, &e))?;
-        kept = Some((path.to_path_buf(), old));
-    }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     let mut tmp = None;
     for n in 0..1000u32 {
@@ -169,20 +203,36 @@ pub fn write_file(path: &Path, bytes: &[u8], policy: WritePolicy) -> Result<Opti
             Err(e) => return Err(io_error(&t, &e)),
         }
     }
-    let Some((tmp_path, mut f)) = tmp else {
+    let Some((tmp_path, f)) = tmp else {
         return Err(ToolError::new(code::FAILED, format!("no temporary file could be made in {}", dir.display()), "free the folder and retry"));
     };
-    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    let mut guard = TmpFile(Some(tmp_path.clone()));
+    let mut w = std::io::BufWriter::new(f);
+    let made = match fill(&mut w) {
+        Ok(v) => v,
+        Err(WriteErr::Tool(e)) => return Err(e),
+        Err(WriteErr::Io(e)) => return Err(io_error(path, &e)),
+    };
+    let f = w.into_inner().map_err(|e| io_error(path, e.error()))?;
+    f.sync_all().map_err(|e| io_error(path, &e))?;
     drop(f);
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(io_error(path, &e));
+    let mut kept = None;
+    if path.exists()
+        && policy.old_copies
+        && !policy.overwrite
+        && let Some(old) = old_name(path)
+    {
+        std::fs::rename(path, &old).map_err(|e| io_error(path, &e))?;
+        kept = Some((path.to_path_buf(), old));
     }
     if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
+        if let Some((_, old)) = &kept {
+            let _ = std::fs::rename(old, path);
+        }
         return Err(io_error(path, &e));
     }
-    Ok(kept)
+    guard.0 = None;
+    Ok((kept, made))
 }
 
 /// A file-system failure in the contract's words (`disk_full`, `locked`, `failed`).
@@ -258,6 +308,34 @@ mod tests {
         let leftovers =
             std::fs::read_dir(d.join("out")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".cctmp")).count();
         assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A streamed write that stops part way (a cancel, a write error, a panic) leaves nothing: no
+    /// temporary file, no file at the path, and the earlier file where it was (not renamed).
+    #[test]
+    fn a_streamed_write_that_stops_leaves_nothing() {
+        let d = tmp("stream");
+        let p = d.join("out/a.svg");
+        let policy = WritePolicy { old_copies: true, overwrite: false };
+        std::fs::write(&p, b"earlier").unwrap();
+        let stopped = |w: &mut std::io::BufWriter<std::fs::File>| -> Result<(), WriteErr> {
+            w.write_all(&vec![b'x'; 1 << 20])?;
+            Err(ToolError::new(code::CANCELLED, "stopped", "run it again").into())
+        };
+        assert_eq!(write_file_with(&p, policy, stopped).unwrap_err().code, code::CANCELLED);
+        let broke =
+            |_: &mut std::io::BufWriter<std::fs::File>| -> Result<(), WriteErr> { Err(std::io::Error::other("no space left on device").into()) };
+        assert_eq!(write_file_with(&p, policy, broke).unwrap_err().code, code::DISK_FULL);
+        let panicked = std::panic::catch_unwind(|| write_file_with(&p, policy, |_| -> Result<(), WriteErr> { panic!("boom") }));
+        assert!(panicked.is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"earlier");
+        assert_eq!(std::fs::read_dir(d.join("out")).unwrap().count(), 1, "no OLD_ copy, no temporary file");
+        // Finished: the pieces are one file, the earlier one kept.
+        let (kept, n) = write_file_with(&p, policy, |w| w.write_all(b"new").map(|()| 3).map_err(WriteErr::from)).unwrap();
+        assert_eq!(n, 3);
+        assert!(kept.unwrap().1.ends_with("OLD_a.svg"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
