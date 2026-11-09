@@ -136,6 +136,7 @@ pub(super) fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], c
         transparency: app.session.settings.transparency_display,
         skip_viewport: split,
         cancel: None,
+        max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
     };
     if view_only {
         let t = Tokens::get();

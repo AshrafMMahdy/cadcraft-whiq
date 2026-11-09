@@ -1541,7 +1541,7 @@ mod tests {
         assert_eq!(whole, expected);
         for slice in [1, 2, 3, 7, preview::SLICE_ENTITIES] {
             let mut out = Vec::new();
-            let n = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
+            let (n, _) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
             assert_eq!(n, out.len());
             assert_eq!(String::from_utf8(out).unwrap(), expected, "slice of {slice} entities");
         }
@@ -1565,8 +1565,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// More than 2,000 entities, among them inserts of a block, so `build_slice` builds big slices
+    /// on all cores and seeds the block-expansion count: lines, circles and references to a
+    /// block of a line and a circle.
+    fn many_entities() -> (Engine, Ctx) {
+        let (mut e, c) = engine();
+        let r = edit(
+            &mut e,
+            &c,
+            json!({"ops": [
+                {"op": "add", "type": "line", "points": [[0, 0], [8, 0]]},
+                {"op": "add", "type": "circle", "center": [4, 4], "radius": 2}
+            ]}),
+        )
+        .unwrap();
+        let (l, ci) = (made(&r, 0), made(&r, 1));
+        let mut ops = vec![json!({"op": "block", "action": "define", "name": "B", "base": [0, 0], "handles": [l, ci], "keep": "delete"})];
+        for k in 0..700 {
+            let x = f64::from(k) * 20.0;
+            ops.push(json!({"op": "add", "type": "line", "points": [[x, 20], [x + 5.0, 30]]}));
+            ops.push(json!({"op": "block", "action": "insert", "name": "B", "at": [x, 40]}));
+            ops.push(json!({"op": "add", "type": "circle", "center": [x, 60], "radius": 3}));
+        }
+        edit(&mut e, &c, json!({"ops": ops})).unwrap();
+        (e, c)
+    }
+
+    /// The same, for a drawing big enough that the slices of 512 and more are built in parallel
+    /// and later slices start from the earlier ones' expansion count: slices of 1, 512 and 16,384
+    /// entities are byte for byte the SVG of the whole display list.
+    #[test]
+    fn a_big_svg_written_in_slices_is_byte_identical_to_the_whole_list_one() {
+        let (e, c) = many_entities();
+        let d = e.docs.list[0].drawing().unwrap();
+        assert!(d.model.len() >= 2_000, "{}", d.model.len());
+        let prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        let whole = preview::svg_tile(&prep.list_for(&prep.window, 1600.0, &c).unwrap(), &prep.layers, &prep.window, 1600.0, false, &c).unwrap().0;
+        for slice in [1, 512, preview::SLICE_ENTITIES] {
+            let mut out = Vec::new();
+            let (n, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
+            assert_eq!(n, out.len());
+            assert!(expanded > 0 && prep.blocks_note(expanded).is_none());
+            assert!(String::from_utf8(out).unwrap() == whole, "slice of {slice} entities");
+        }
+    }
+
+    /// Past the block-expansion cap the export says so in words, with the number expanded; under
+    /// it the answer has nothing to add. The same SVG comes out of every slice size.
+    #[test]
+    fn passing_the_block_cap_is_reported() {
+        let (e, c) = many_entities();
+        let d = e.docs.list[0].drawing().unwrap();
+        let mut prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        prep.block_cap = 300;
+        let mut first = None;
+        for slice in [1, 512, preview::SLICE_ENTITIES] {
+            let mut out = Vec::new();
+            let (_, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
+            let note = prep.blocks_note(expanded).unwrap_or_else(|| panic!("expanded {expanded}"));
+            assert_eq!(note["blocks_truncated"], json!(true));
+            assert_eq!(note["blocks_expanded"], json!(300));
+            assert_eq!(note["warning"], json!("block contents past 300 expanded entities were not drawn"));
+            let svg = String::from_utf8(out).unwrap();
+            assert!(first.get_or_insert_with(|| svg.clone()) == &svg, "slice of {slice} entities");
+        }
+        let mut entry = merged(json!({"path": "a.svg"}), prep.blocks_note(1_000));
+        assert_eq!(entry["blocks_truncated"], json!(true));
+        entry = merged(json!({"path": "a.svg"}), prep.blocks_note(300));
+        assert!(entry.get("blocks_truncated").is_none());
+    }
+
     /// An SVG export that is stopped leaves nothing of itself: no file, no temporary file, and an
-    /// earlier file stays where it was.
+    /// earlier file stays where it was. Also when the stop comes after bytes were written.
     #[test]
     fn a_stopped_svg_export_leaves_nothing() {
         let dir = scratch("export-svg-stopped");
@@ -1577,6 +1647,39 @@ mod tests {
         assert!(e.call("export", &json!({"path": "plan.svg"}), &c).is_err());
         assert_eq!(std::fs::read_to_string(dir.join("plan.svg")).unwrap(), "earlier");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // The stop arrives once the file has bytes in it: the writer sets the flag after its
+        // first write, the next slice's check ends the call.
+        struct StopAfterBytes<'a, W> {
+            inner: W,
+            stop: &'a std::sync::atomic::AtomicBool,
+            wrote: &'a std::cell::Cell<usize>,
+        }
+        impl<W: std::io::Write> std::io::Write for StopAfterBytes<'_, W> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = self.inner.write(buf)?;
+                self.wrote.set(self.wrote.get() + n);
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+        let (big, _) = many_entities();
+        let d = big.docs.list[0].drawing().unwrap();
+        let c = ctx(Some(dir.clone()), true);
+        let prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        let wrote = std::cell::Cell::new(0);
+        let err = write_file_with(&dir.join("plan.svg"), WritePolicy { old_copies: true, overwrite: false }, |w| {
+            let out = StopAfterBytes { inner: w, stop: &c.cancel, wrote: &wrote };
+            prep.write_svg_sliced(out, &prep.window, 1600.0, &c, 512)
+        })
+        .unwrap_err();
+        assert!(wrote.get() > 0, "bytes were written before the stop");
+        assert_eq!(err.code, code::CANCELLED);
+        assert_eq!(std::fs::read_to_string(dir.join("plan.svg")).unwrap(), "earlier");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file, no OLD_ copy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
