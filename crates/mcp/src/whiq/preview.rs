@@ -353,6 +353,8 @@ pub struct Prepared<'a> {
     /// Each layer and whether it is shown (after the switches).
     pub layer_states: Vec<(String, bool)>,
     lineweights: bool,
+    /// Block contents expanded before the rest are not drawn (a test lowers it).
+    pub block_cap: usize,
 }
 
 impl Prepared<'_> {
@@ -370,8 +372,19 @@ impl Prepared<'_> {
             tolerance: (size / (width_px.max(16.0) * 8.0)).max(1e-9),
             view_height: window.height(),
             cancel: Some(ctx.cancel.clone()),
+            max_block_expansion: self.block_cap,
             ..cadcraft_engine::render::Options::default()
         }
+    }
+
+    /// What an answer says when a build of `expanded` block contents passed the cap (and nothing
+    /// when it did not): the contents past the cap were not drawn.
+    pub fn blocks_note(&self, expanded: usize) -> Option<Value> {
+        let cap = self.block_cap;
+        (expanded > cap).then(|| {
+            json!({"blocks_truncated": true, "blocks_expanded": cap,
+                "warning": format!("block contents past {cap} expanded entities were not drawn")})
+        })
     }
 
     /// Whether model-space `e` reaches into `reach` (rays and infinite lines always do).
@@ -426,7 +439,7 @@ impl Prepared<'_> {
         width_px: f64,
         ctx: &Ctx,
         mut each: impl FnMut(&DisplayList) -> Result<(), WriteErr>,
-    ) -> Result<(), WriteErr> {
+    ) -> Result<usize, WriteErr> {
         self.each_list_sliced(window, width_px, ctx, SLICE_ENTITIES, &mut each)
     }
 
@@ -437,9 +450,11 @@ impl Prepared<'_> {
         ctx: &Ctx,
         slice: usize,
         each: &mut dyn FnMut(&DisplayList) -> Result<(), WriteErr>,
-    ) -> Result<(), WriteErr> {
+    ) -> Result<usize, WriteErr> {
         if !matches!(self.target.space, Space::Model) {
-            return Ok(each(&self.list_for(window, width_px, ctx)?)?);
+            let list = self.list_for(window, width_px, ctx)?;
+            each(&list)?;
+            return Ok(list.expanded);
         }
         let d = self.drawing();
         let opts = self.options(window, width_px, ctx);
@@ -470,20 +485,20 @@ impl Prepared<'_> {
         if !picked.is_empty() {
             build(&mut picked)?;
         }
-        Ok(())
+        Ok(expanded)
     }
 
     /// The SVG of `window` written to `out` as it is made: the same bytes as
     /// [`svg_tile`] of [`Prepared::list_for`], without the whole display list or the whole text in
-    /// memory. Returns the bytes written.
-    pub fn write_svg<W: std::io::Write>(&self, out: W, window: &Bounds2, width_px: f64, ctx: &Ctx) -> Result<usize, WriteErr> {
+    /// memory. Returns the bytes written and the block contents expanded ([`Prepared::blocks_note`]).
+    pub fn write_svg<W: std::io::Write>(&self, out: W, window: &Bounds2, width_px: f64, ctx: &Ctx) -> Result<(usize, usize), WriteErr> {
         self.write_svg_sliced(out, window, width_px, ctx, SLICE_ENTITIES)
     }
 
-    pub fn write_svg_sliced<W: std::io::Write>(&self, out: W, window: &Bounds2, width_px: f64, ctx: &Ctx, slice: usize) -> Result<usize, WriteErr> {
+    pub fn write_svg_sliced<W: std::io::Write>(&self, out: W, window: &Bounds2, width_px: f64, ctx: &Ctx, slice: usize) -> Result<(usize, usize), WriteErr> {
         let mut w = SvgWriter::new(out, &self.layers, window, width_px, false);
-        self.each_list_sliced(window, width_px, ctx, slice, &mut |list| w.add(list, ctx))?;
-        Ok(w.finish()?.2)
+        let expanded = self.each_list_sliced(window, width_px, ctx, slice, &mut |list| w.add(list, ctx))?;
+        Ok((w.finish()?.2, expanded))
     }
 }
 
@@ -515,7 +530,18 @@ pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>,
     let layers = layer_of(dd, &target.space);
     let layer_states = dd.layers.iter().map(|l| (l.name.clone(), l.on && !l.frozen)).collect();
     let lineweights = a.get("lineweights").and_then(Value::as_bool).unwrap_or(true);
-    Ok(Prepared { base: d, switched, layers, window, extents, target, unknown_layers: unknown, layer_states, lineweights })
+    Ok(Prepared {
+        base: d,
+        switched,
+        layers,
+        window,
+        extents,
+        target,
+        unknown_layers: unknown,
+        layer_states,
+        lineweights,
+        block_cap: cadcraft_engine::render::MAX_BLOCK_EXPANSION,
+    })
 }
 
 /// The tiles of `window`: `tiles: {cols, rows}` (or `[cols, rows]`, or a number for both),
@@ -572,7 +598,15 @@ pub fn win_value(w: &Bounds2) -> Value {
 }
 
 /// PNG of the window (a picture for a visual check), as base64.
-pub fn png(p: &Prepared<'_>, window: &Bounds2, width: u32, height: Option<u32>, dark: bool, ctx: &Ctx) -> Result<(Vec<u8>, u32, u32), ToolError> {
+/// The PNG of `window` with its size and the block contents expanded ([`Prepared::blocks_note`]).
+pub fn png(
+    p: &Prepared<'_>,
+    window: &Bounds2,
+    width: u32,
+    height: Option<u32>,
+    dark: bool,
+    ctx: &Ctx,
+) -> Result<(Vec<u8>, u32, u32, usize), ToolError> {
     let view = cadcraft_engine::render::raster::View::of_window(window, Some(width), height);
     let (w, h) = (view.width, view.height);
     let list = p.list_for(window, f64::from(w) / 8.0, ctx)?;
@@ -582,5 +616,5 @@ pub fn png(p: &Prepared<'_>, window: &Bounds2, width: u32, height: Option<u32>, 
     }
     let bytes = cadcraft_engine::render::raster::render_png(&list, &view, &opts)
         .ok_or_else(|| ToolError::new(code::FAILED, "the picture could not be drawn", "try a smaller width or a window"))?;
-    Ok((bytes, w, h))
+    Ok((bytes, w, h, list.expanded))
 }

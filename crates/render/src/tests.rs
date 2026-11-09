@@ -1122,3 +1122,64 @@ fn raster_hatch_pattern_matches_one_by_one() {
         assert!(render(&l, &view, &o).unwrap().data() == render_one_by_one(&l, &view, &o).data());
     }
 }
+
+/// `n` references to a nested block (`Outer` holds two `Inner`, each three lines) along the x
+/// axis, with a plain line after every tenth.
+fn many_nested_inserts(n: usize) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    let mut inner = cadcraft_doc::Block::new("Inner");
+    for k in 0..3u64 {
+        let (c, kind) = line_common(Common::default());
+        inner.entities.push(block_entity(1 + k, c, kind));
+    }
+    d.blocks.insert("Inner".into(), std::sync::Arc::new(inner));
+    let mut outer = cadcraft_doc::Block::new("Outer");
+    for k in 0..2u32 {
+        let EntityKind::Insert(mut i) = insert_of("Inner") else { unreachable!() };
+        i.insert = Vec3::new(f64::from(k) * 20.0, 5.0, 0.0);
+        outer.entities.push(block_entity(10 + u64::from(k), Common::default(), EntityKind::Insert(i)));
+    }
+    d.blocks.insert("Outer".into(), std::sync::Arc::new(outer));
+    for k in 0..n {
+        let EntityKind::Insert(mut i) = insert_of("Outer") else { unreachable!() };
+        i.insert = Vec3::new(k as f64 * 100.0, 0.0, 0.0);
+        d.add(&Space::Model, Common::default(), EntityKind::Insert(i)).unwrap();
+        if k % 10 == 9 {
+            let (c, kind) = line_common(Common::default());
+            d.add(&Space::Model, c, kind).unwrap();
+        }
+    }
+    d
+}
+
+/// Once the block-expansion cap is reached, a slice built on all cores is the list a one-thread
+/// build makes (the first block contents in draw order take the budget), every run; and the build
+/// says the cap was passed. Below the cap nothing is reported and the lists are the same too.
+#[test]
+fn a_slice_past_the_block_cap_is_the_serial_list_every_run() {
+    let d = many_nested_inserts(600);
+    let ents: Vec<&cadcraft_doc::Entity> = d.model.iter().map(|e| e.as_ref()).collect();
+    assert!(ents.len() >= 2 * crate::pipeline::PARALLEL_CHUNK && ents.len() >= 600);
+    let same = |a: &DisplayList, b: &DisplayList| {
+        assert!(a.prims == b.prims && a.verts == b.verts && a.tris == b.tris, "lists differ");
+        assert_eq!(a.expanded, b.expanded);
+    };
+    let capped = Options { max_block_expansion: 2_000, ..Default::default() };
+    let serial = build_entities(&d, ents.iter().copied(), &capped);
+    let full = build_entities(&d, ents.iter().copied(), &Options::default());
+    assert!(capped.blocks_truncated(serial.expanded), "{}", serial.expanded);
+    assert!(!Options::default().blocks_truncated(full.expanded));
+    assert!(serial.prims.len() < full.prims.len() && !serial.prims.is_empty());
+    for _ in 0..30 {
+        same(&build_slice(&d, &ents, &capped, 0), &serial);
+        same(&build(&d, &Space::Model, &capped), &serial);
+    }
+    // Slices after the first start from what the earlier ones expanded: together the serial list.
+    let (head, tail) = ents.split_at(300);
+    let first = build_slice(&d, head, &capped, 0);
+    let second = build_slice(&d, tail, &capped, first.expanded);
+    assert_eq!(first.prims.len() + second.prims.len(), serial.prims.len());
+    assert_eq!(second.expanded, serial.expanded);
+    // Under the cap: the parallel list, equal to the serial one.
+    same(&build_slice(&d, &ents, &Options::default(), 0), &full);
+}

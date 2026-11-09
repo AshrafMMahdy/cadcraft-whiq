@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 
 use super::contract::{ToolError, code};
 use super::docs::{Ctx, Doc, Docs, engine_error};
-use super::files::{Access, WritePolicy, io_error, saved_entry, write_file, write_file_with};
+use super::files::{Access, WritePolicy, io_error, old_name, saved_entry, write_file, write_file_with};
 use super::{preview, read};
 
 /// What a tool answers: the structured result, extra content blocks (pictures), the text block
@@ -86,7 +86,7 @@ pub fn definitions() -> Vec<Value> {
                 "background": {"type": "string", "enum": ["light", "dark"]}, "lineweights": {"type": "boolean"},
                 "output": {"type": "string", "description": "Write the SVG/PNG file(s) here (tiles get -c<col>r<row>) instead of answering them"}}},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true.",
+        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG of model space is written in slices as it is made; a paper-space layout is still built whole in memory before it is written.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "source": {"type": "string", "description": "Open this drawing first"}, "path": {"type": "string", "description": "The file to write (its extension picks the format)"},
                 "format": {"type": "string", "enum": ["dxf", "dwg", "pdf", "svg", "png"]}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"},
                 "space": {"type": ["string", "array"], "description": "model (default), a layout, a list, or all"}, "window": window,
@@ -462,12 +462,12 @@ impl Engine {
                 ctx.check()?;
                 let mut t = json!({"tile": cr, "window": preview::win_value(win)});
                 let (bytes, mime, ext, info): (Vec<u8>, &str, &str, Value) = if png {
-                    let (b, w, h) = preview::png(&prep, win, width, height, dark, ctx)?;
-                    (b, "image/png", "png", json!({"width": w, "height": h}))
+                    let (b, w, h, expanded) = preview::png(&prep, win, width, height, dark, ctx)?;
+                    (b, "image/png", "png", merged(json!({"width": w, "height": h}), prep.blocks_note(expanded)))
                 } else {
                     let list = prep.list_for(win, f64::from(width), ctx)?;
                     let (svg, n) = preview::svg_tile(&list, &prep.layers, win, f64::from(width), dark, ctx)?;
-                    (svg.into_bytes(), "image/svg+xml", "svg", json!({"primitives": n}))
+                    (svg.into_bytes(), "image/svg+xml", "svg", merged(json!({"primitives": n}), prep.blocks_note(list.expanded)))
                 };
                 if let Value::Object(o) = info {
                     for (kk, vv) in o {
@@ -641,25 +641,25 @@ impl Engine {
                             file.clone()
                         };
                         let p = ctx.resolve(&f.to_string_lossy(), Access::Write)?;
-                        let (kept, size) = if fmt == "svg" {
+                        let (kept, size, note) = if fmt == "svg" {
                             // Written as it is made (display list slice by slice) through the same
                             // atomic file write: a call that stops part way leaves nothing of it.
                             let wpx = f64::from(a.get("width").and_then(Value::as_u64).map_or(1600, |w| u32::try_from(w).unwrap_or(1600)));
-                            write_file_with(&p, policy, |w| prep.write_svg(w, &prep.window, wpx, ctx))?
+                            let (kept, (size, expanded)) = write_file_with(&p, policy, |w| prep.write_svg(w, &prep.window, wpx, ctx))?;
+                            (kept, size, prep.blocks_note(expanded))
                         } else {
                             let w = a.get("width").and_then(Value::as_u64).map_or(2400, |w| u32::try_from(w).unwrap_or(2400));
-                            let bytes = preview::png(
+                            let (bytes, _, _, expanded) = preview::png(
                                 &prep,
                                 &prep.window,
                                 w,
                                 a.get("height").and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok()),
                                 false,
                                 ctx,
-                            )?
-                            .0;
-                            (write_file(&p, &bytes, policy)?, bytes.len())
+                            )?;
+                            (write_file(&p, &bytes, policy)?, bytes.len(), prep.blocks_note(expanded))
                         };
-                        let mut e = saved_entry(ctx.roots(), &p, size, &fmt, kept.as_ref());
+                        let mut e = merged(saved_entry(ctx.roots(), &p, size, &fmt, kept.as_ref()), note);
                         e["space"] = json!(name);
                         saved.push(e);
                     }
@@ -700,16 +700,9 @@ impl Engine {
         let p = ctx.resolve(&path, Access::Write)?;
         let mut kept = None;
         if p.exists() && ctx.settings.old_copies && !flag(a, "overwrite").unwrap_or(false) {
-            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            if let Some(dir) = p.parent() {
-                let old = (1..10_000)
-                    .map(|n| if n == 1 { dir.join(format!("OLD_{name}")) } else { dir.join(format!("OLD_{n}_{name}")) })
-                    .find(|x| !x.exists());
-                if let Some(old) = old {
-                    std::fs::rename(&p, &old).map_err(|e| io_error(&p, &e))?;
-                    kept = Some((p.clone(), old));
-                }
-            }
+            let old = old_name(&p)?;
+            std::fs::rename(&p, &old).map_err(|e| io_error(&p, &e))?;
+            kept = Some((p.clone(), old));
         }
         if let Some(c) = caller
             && let Ok(dr) = doc.session.doc_mut()
@@ -907,6 +900,14 @@ fn mtext_example(key: &str) -> Value {
 
 /// A call that writes several files and fails part way: the error lists the files already
 /// written (`files_written`, as `saved` lists them) and says so, as they stay on disk.
+/// `v` (an object) with the fields of `note` (the block-expansion cap report, when there is one).
+fn merged(mut v: Value, note: Option<Value>) -> Value {
+    if let (Some(o), Some(Value::Object(n))) = (v.as_object_mut(), note) {
+        o.extend(n);
+    }
+    v
+}
+
 fn with_written(e: ToolError, written: &[Value]) -> ToolError {
     if written.is_empty() {
         return e;

@@ -37,12 +37,22 @@ pub struct Options {
     /// rebuild the view no longer needs). A cancelled build returns a partial list, which the
     /// caller must discard; see [`Options::cancelled`].
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Block contents expanded before the rest are not drawn: [`MAX_BLOCK_EXPANSION`] (only
+    /// tests give another value). A build that went past it has [`DisplayList::expanded`] above
+    /// this; see [`Options::blocks_truncated`].
+    pub max_block_expansion: usize,
 }
 
 impl Options {
     /// Whether [`Options::cancel`] has been set.
     pub fn cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Whether a list built with these options left block contents out because of the cap
+    /// (`expanded` counts every expansion asked for, drawn or not).
+    pub fn blocks_truncated(&self, expanded: usize) -> bool {
+        expanded > self.max_block_expansion
     }
 }
 
@@ -60,6 +70,7 @@ impl Default for Options {
             skip_viewport: None,
             transparency: false,
             cancel: None,
+            max_block_expansion: super::MAX_BLOCK_EXPANSION,
         }
     }
 }
@@ -157,6 +168,17 @@ fn build_parallel(b: &mut Builder, d: &Drawing, ents: &[&Entity]) {
             part.list
         })
         .collect();
+    // Chunks racing for the budget drop block contents by thread timing once it runs out. Then
+    // the parallel result is thrown away and the entities are built in draw order on this thread,
+    // where the first contents in draw order take the budget: the same list every run, and the
+    // one a one-thread build makes. Below the cap nothing is dropped, so the chunks' list is
+    // already that list.
+    if budget.load(std::sync::atomic::Ordering::Relaxed) > opts.max_block_expansion {
+        for e in ents {
+            entity(b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
+        }
+        return;
+    }
     // One allocation per array for the joined list.
     b.list.prims.reserve(parts.iter().map(|p| p.prims.len()).sum());
     b.list.verts.reserve(parts.iter().map(|p| p.verts.len()).sum());

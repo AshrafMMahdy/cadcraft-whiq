@@ -135,11 +135,26 @@ pub struct WritePolicy {
     pub overwrite: bool,
 }
 
-/// The free `OLD_<name>`, `OLD_2_<name>`, … beside `path`.
-fn old_name(path: &Path) -> Option<PathBuf> {
-    let dir = path.parent()?;
-    let name = path.file_name()?.to_string_lossy().into_owned();
-    (1..10_000).map(|n| if n == 1 { dir.join(format!("OLD_{name}")) } else { dir.join(format!("OLD_{n}_{name}")) }).find(|p| !p.exists())
+/// The free `OLD_<name>`, `OLD_2_<name>`, … beside `path`: the search has no end (an earlier file
+/// is never overwritten for want of a name). A dangling link counts as taken. Only a path with no
+/// file name has none, and that call is refused with the earlier file untouched.
+pub fn old_name(path: &Path) -> Result<PathBuf, ToolError> {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return Err(ToolError::new(
+            code::INVALID_ARGUMENT,
+            format!("{}: there is no file name to keep an OLD_ copy under", path.display()),
+            "give a file name, or overwrite: true to replace without a copy",
+        ));
+    };
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut n = 1u64;
+    loop {
+        let p = if n == 1 { dir.join(format!("OLD_{name}")) } else { dir.join(format!("OLD_{n}_{name}")) };
+        if std::fs::symlink_metadata(&p).is_err() {
+            return Ok(p);
+        }
+        n += 1;
+    }
 }
 
 /// Why a [`write_file_with`] filler stopped: the call's own error (a cancel, a bad argument) or a
@@ -188,6 +203,16 @@ pub fn write_file_with<T>(
     policy: WritePolicy,
     fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T, WriteErr>,
 ) -> Result<(Option<(PathBuf, PathBuf)>, T), ToolError> {
+    write_file_renaming(path, policy, fill, &|from, to| std::fs::rename(from, to))
+}
+
+/// [`write_file_with`] with the rename as a parameter (a test makes it fail).
+fn write_file_renaming<T>(
+    path: &Path,
+    policy: WritePolicy,
+    fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<T, WriteErr>,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(Option<(PathBuf, PathBuf)>, T), ToolError> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir).map_err(|e| io_error(&dir, &e))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
@@ -217,22 +242,36 @@ pub fn write_file_with<T>(
     f.sync_all().map_err(|e| io_error(path, &e))?;
     drop(f);
     let mut kept = None;
-    if path.exists()
-        && policy.old_copies
-        && !policy.overwrite
-        && let Some(old) = old_name(path)
-    {
-        std::fs::rename(path, &old).map_err(|e| io_error(path, &e))?;
+    if path.exists() && policy.old_copies && !policy.overwrite {
+        let old = old_name(path)?;
+        rename(path, &old).map_err(|e| io_error(path, &e))?;
         kept = Some((path.to_path_buf(), old));
     }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        if let Some((_, old)) = &kept {
-            let _ = std::fs::rename(old, path);
+    if let Err(e) = rename(&tmp_path, path) {
+        let mut err = io_error(path, &e);
+        if let Some((_, old)) = &kept
+            && let Err(undo) = rename(old, path)
+        {
+            // The earlier file stays where the first rename put it; say where.
+            let at = old.display().to_string();
+            err.reason = format!("{}; the earlier file could not be put back ({undo}) and is at {at}", err.reason);
+            err.next_step = format!("the earlier file is at {at}: rename it back to {} once the cause is gone, then retry", path.display());
+            err = err.with("previous_renamed_to", json!(at));
         }
-        return Err(io_error(path, &e));
+        return Err(err);
     }
     guard.0 = None;
     Ok((kept, made))
+}
+
+/// Whether `e` is a full disk or quota: the error kinds, Windows' ERROR_DISK_FULL (112) and
+/// ERROR_HANDLE_DISK_FULL (39) (on other systems those numbers mean something else), and the words
+/// ("No space left on device", "There is not enough space on the disk", "Disk quota exceeded").
+fn disk_full(e: &std::io::Error, lower: &str) -> bool {
+    use std::io::ErrorKind::{QuotaExceeded, StorageFull};
+    matches!(e.kind(), StorageFull | QuotaExceeded)
+        || (cfg!(windows) && matches!(e.raw_os_error(), Some(112 | 39)))
+        || ["no space", "not enough space", "disk full", "quota"].iter().any(|w| lower.contains(w))
 }
 
 /// A file-system failure in the contract's words (`disk_full`, `locked`, `failed`).
@@ -240,7 +279,7 @@ pub fn io_error(path: &Path, e: &std::io::Error) -> ToolError {
     let shown = path.display();
     let text = e.to_string();
     let lower = text.to_ascii_lowercase();
-    if lower.contains("no space") || lower.contains("disk full") || lower.contains("quota") {
+    if disk_full(e, &lower) {
         ToolError::new(code::DISK_FULL, format!("{shown}: {text}"), "free disk space and retry")
     } else if e.kind() == std::io::ErrorKind::PermissionDenied || lower.contains("being used by another process") {
         ToolError::new(code::LOCKED, format!("{shown}: {text}"), "close the program holding the file, or write to another name")
@@ -337,5 +376,88 @@ mod tests {
         assert!(kept.unwrap().1.ends_with("OLD_a.svg"));
         assert_eq!(std::fs::read(&p).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The final rename fails and so does the undo of the OLD_ rename: the error says where the
+    /// earlier file is, in its words and its data. When only the final one fails the earlier file
+    /// is back at its path.
+    #[test]
+    fn a_failed_undo_names_where_the_earlier_file_is() {
+        let d = tmp("undo");
+        let p = d.join("out/a.svg");
+        let policy = WritePolicy { old_copies: true, overwrite: false };
+        std::fs::write(&p, b"earlier").unwrap();
+        let fill = |w: &mut std::io::BufWriter<std::fs::File>| -> Result<(), WriteErr> { w.write_all(b"new").map_err(WriteErr::from) };
+        let tmp_name = |from: &Path| from.to_string_lossy().ends_with(".cctmp");
+        // The new file cannot be moved in; putting the earlier one back works.
+        let one = |from: &Path, to: &Path| if tmp_name(from) { Err(std::io::Error::other("locked")) } else { std::fs::rename(from, to) };
+        assert!(write_file_renaming(&p, policy, fill, &one).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), b"earlier");
+        // Neither works.
+        let both = |from: &Path, to: &Path| {
+            if tmp_name(from) || to == p.as_path() { Err(std::io::Error::other("locked")) } else { std::fs::rename(from, to) }
+        };
+        let e = write_file_renaming(&p, policy, fill, &both).unwrap_err();
+        let old = d.join("out/OLD_a.svg");
+        assert_eq!(std::fs::read(&old).unwrap(), b"earlier");
+        assert_eq!(e.extra["previous_renamed_to"], json!(old.display().to_string()));
+        assert!(e.reason.contains(&old.display().to_string()), "{}", e.reason);
+        assert!(e.next_step.contains(&old.display().to_string()));
+        assert!(!p.exists());
+        assert_eq!(std::fs::read_dir(d.join("out")).unwrap().count(), 1, "no temporary file");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// No count ends the search for a free OLD_ name in an overwrite: with 10,010 names taken the
+    /// next is used and every earlier file is still there.
+    #[test]
+    fn the_old_name_search_has_no_end() {
+        let d = tmp("oldname");
+        let p = d.join("out/a.pdf");
+        std::fs::write(d.join("out/OLD_a.pdf"), b"1").unwrap();
+        for n in 2..=10_010 {
+            std::fs::write(d.join(format!("out/OLD_{n}_a.pdf")), b"x").unwrap();
+        }
+        std::fs::write(&p, b"earlier").unwrap();
+        let kept = write_file(&p, b"new", WritePolicy { old_copies: true, overwrite: false }).unwrap().unwrap();
+        assert!(kept.1.ends_with("OLD_10011_a.pdf"), "{:?}", kept.1);
+        assert_eq!(std::fs::read(&kept.1).unwrap(), b"earlier");
+        assert_eq!(std::fs::read(d.join("out/OLD_a.pdf")).unwrap(), b"1");
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        // A path with no file name has nowhere to keep a copy: refused, not overwritten.
+        assert_eq!(old_name(Path::new("/")).unwrap_err().code, code::INVALID_ARGUMENT);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A full disk is `disk_full` whichever way the system says it.
+    #[test]
+    fn a_full_disk_is_disk_full_in_every_wording() {
+        use std::io::{Error, ErrorKind};
+        let p = Path::new("a.svg");
+        let words = "There is not enough space on the disk. (os error 112)";
+        let cases = [
+            Error::from(ErrorKind::StorageFull),
+            Error::from(ErrorKind::QuotaExceeded),
+            Error::other(words),
+            Error::other("No space left on device (os error 28)"),
+            Error::other("Disk quota exceeded"),
+        ];
+        for e in &cases {
+            assert_eq!(io_error(p, e).code, code::DISK_FULL, "{e}");
+        }
+        #[cfg(windows)]
+        for raw in [112, 39] {
+            assert_eq!(io_error(p, &Error::from_raw_os_error(raw)).code, code::DISK_FULL, "os error {raw}");
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(io_error(p, &Error::from_raw_os_error(28)).code, code::DISK_FULL);
+            // 39 and 112 are other errors here (not empty, host down): not a full disk.
+            for raw in [39, 112] {
+                assert_eq!(io_error(p, &Error::from_raw_os_error(raw)).code, code::FAILED, "os error {raw}");
+            }
+        }
+        assert_eq!(io_error(p, &Error::from(ErrorKind::PermissionDenied)).code, code::LOCKED);
+        assert_eq!(io_error(p, &Error::other("boom")).code, code::FAILED);
     }
 }

@@ -5,7 +5,7 @@ use super::draw::entity;
 #[cfg(not(target_arch = "wasm32"))]
 use super::pipeline::PARALLEL_CHUNK;
 use super::pipeline::{Options, style_table, top_ctx, with_point_view};
-use super::{Bounds2, Builder, Ctx, Drawing, Entity, EntityKind, Handle, MAX_BLOCK_EXPANSION, Mat3, Space, Vec2, clip, paper, pen, plotstyle};
+use super::{Bounds2, Builder, Ctx, Drawing, Entity, EntityKind, Handle, Mat3, Space, Vec2, clip, paper, pen, plotstyle};
 
 /// Upper bound on viewports drawn per layout (hostile files).
 pub(crate) const MAX_VIEWPORTS: usize = 256;
@@ -76,7 +76,7 @@ pub fn viewport_content(d: &Drawing, space: &Space, handle: Handle, area: Bounds
 /// Model space seen through `vp`, in paper units, appended to `b`'s list clipped to `clip`;
 /// `area` (the clip's bounds on paper) picks the model objects to draw.
 fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bounds2, clip: &Clip, unit_mm: f64) {
-    if b.list.expanded >= MAX_BLOCK_EXPANSION || !vp.on {
+    if b.list.expanded >= b.opts.max_block_expansion || !vp.on {
         return;
     }
     let center = vp.center.xy();
