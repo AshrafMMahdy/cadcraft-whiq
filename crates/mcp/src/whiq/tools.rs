@@ -77,7 +77,7 @@ pub fn definitions() -> Vec<Value> {
                 "space": space, "layer": {"type": ["string", "array"]}, "window": window, "expand_blocks": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1}, "format": {"type": "string", "enum": ["json", "markdown"]}},
                 "required": ["query"]},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every answer says blocks_expanded_total (what the build took: a number, a decimal string above 2^53, or the words \"more than can be counted\" when nested references multiply past 1.8e19) and, when the build went past the limit, blocks_truncated, blocks_not_drawn, largest_object, reference_layers, layers_that_reduce and ways_through. A window or a tile is a build of its own that expands only the objects reaching it, so a drawing with more block content than that comes whole as tiles (tiles with output, one file each) or as layer passes (layers_off / only_layers: the layer the block references are on, not the layers of their contents) - but one object (a MINSERT, a block holding a whole plan) that alone needs more than the limit is expanded whole in every window touching it: the answer names it (largest_object) and the ways that work (explode it, or make an array's copies separate references, with edit: these edits are ONLY to draw the picture - draw, then undo them (1 undo step for explode, 3 for the array route) or close_drawing with discard: true, and never save_drawing with them in place unless the user asked for the drawing itself to be changed). A layout is built whole, so draw the model space its viewports show (viewport: handle) in tiles instead. Reading, search and measuring never expand blocks. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
+        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every answer says blocks_expanded_total and, when the build went past the limit, blocks_truncated, blocks_expanded, blocks_not_drawn, largest_object, reference_layers, layers_that_reduce and ways_through. Field types: blocks_expanded_total and blocks_not_drawn, largest_object.blocks_expanded and layers_that_reduce[].blocks_expanded_total_if_off are each a JSON number up to 2^53, a decimal string above 2^53 (JSON clients lose precision there), or the words \"more than can be counted (nested references multiply past 1.8e19)\" when the count overflows (then no number of windows is given); blocks_expanded is the limit (a number). blocks_truncated is true only when the build itself went past the limit; blocks_expanded_total is what the build took when it drew everything, else the count of what the drawing asks for. A window or a tile is a build of its own that expands only the objects reaching it, so a drawing with more block content than that comes whole as tiles (tiles with output, one file each) or as layer passes (layers_off / only_layers: the layer the block references are on, not the layers of their contents). One object (a MINSERT, a block holding a whole plan) that alone needs more than the limit is expanded whole in every window touching it: the answer names it in largest_object (handle, kind, block, blocks_expanded), does not advise windows, lists the layers whose switching off reduces the count, and says plainly when no complete picture of it can be drawn today (what is drawn is the first expansions in draw order). Reading, search, measuring and extents never expand blocks. A layout is built whole, so draw the model space its viewports show (viewport: handle) in tiles instead. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "path": {"type": "string", "description": "Open this drawing first"},
                 "space": {"type": "string"}, "viewport": {"type": ["string", "integer"]}, "window": window,
                 "tiles": {"type": ["object", "array", "integer"]}, "tile": {"type": "array"},
@@ -86,7 +86,7 @@ pub fn definitions() -> Vec<Value> {
                 "background": {"type": "string", "enum": ["light", "dark"]}, "lineweights": {"type": "boolean"},
                 "output": {"type": "string", "description": "Write the SVG/PNG file(s) here (tiles get -c<col>r<row>) instead of answering them"}}},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG is written to the file in slices as it is made: model space in slices of objects in draw order, and a paper-space layout the same (its own objects and each viewport's model-space contents in draw order, each viewport's clip applied), so a big layout is not held whole in memory. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every svg / png / pdf answer says blocks_expanded_total (a number, a decimal string above 2^53, or the words \"more than can be counted\" when nested references multiply past 1.8e19) and, past the limit, blocks_truncated, blocks_not_drawn, largest_object, reference_layers, layers_that_reduce and ways_through (a PDF sheet is one build of the whole space, its window only places it on the page; the PDF answer gives each sheet's own figures in sheets). Ways through: export svg / png once per window (a window expands only the objects reaching it, each export is its own build), or layers_off / only_layers for a pass per layer set (the layer the block references are on); one object that alone needs more than the limit is not split by windows, the answer names it and the ways that work (edits only to draw the picture: undo them afterwards, 1 step for explode, 3 for the array route, or close_drawing with discard: true; never save_drawing with them in place unless the user asked for the drawing itself to be changed). A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
+        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG is written to the file in slices as it is made: model space in slices of objects in draw order, and a paper-space layout the same (its own objects and each viewport's model-space contents in draw order, each viewport's clip applied), so a big layout is not held whole in memory. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every svg / png / pdf answer says blocks_expanded_total and, past the limit, blocks_truncated, blocks_expanded, blocks_not_drawn, largest_object, reference_layers, layers_that_reduce and ways_through. Field types: blocks_expanded_total and blocks_not_drawn, largest_object.blocks_expanded and layers_that_reduce[].blocks_expanded_total_if_off are each a JSON number up to 2^53, a decimal string above 2^53, or the words \"more than can be counted (nested references multiply past 1.8e19)\" when the count overflows. blocks_truncated is true only when the build itself went past the limit. A PDF sheet is one build of the whole space (its window only places it on the page): the PDF answer gives each sheet's own figures in sheets (blocks_expanded_total, blocks_not_drawn, and for a truncated sheet its own largest_object, reference_layers, layers_that_reduce); the top-level blocks_expanded_total and blocks_not_drawn are the sums over the sheets, and the top-level largest_object, reference_layers, layers_that_reduce and ways_through are those of the sheet named in details_of_sheet (the one needing the most). Ways through: export svg / png once per window (a window expands only the objects reaching it, each export is its own build), or layers_off / only_layers for a pass per layer set (the layer the block references are on); one object that alone needs more than the limit is not split by windows: the answer names it, lists the layers that reduce the count and says plainly when no complete picture of it can be drawn today. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "source": {"type": "string", "description": "Open this drawing first"}, "path": {"type": "string", "description": "The file to write (its extension picks the format)"},
                 "format": {"type": "string", "enum": ["dxf", "dwg", "pdf", "svg", "png"]}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"},
                 "space": {"type": ["string", "array"], "description": "model (default), a layout, a list, or all"}, "window": window,
@@ -1715,6 +1715,318 @@ mod tests {
         assert!(prep.write_svg_sliced(Vec::new(), &prep.window, 1600.0, &c, 512).is_err());
     }
 
+    /// A block array of `cols` x `rows` copies of the 4-line block `Tree`, on layer `layer`.
+    fn tree_array(cols: u32, rows: u32) -> cadcraft_engine::doc::EntityKind {
+        use cadcraft_engine::doc::Insert;
+        use cadcraft_engine::geom::Vec3;
+        EntityKind::Insert(Insert {
+            block: "Tree".into(),
+            insert: Vec3::ZERO,
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            attribs: vec![],
+            cols,
+            rows,
+            col_spacing: 10.0,
+            row_spacing: 10.0,
+        })
+    }
+
+    /// A drawing with the block `Tree` (four lines) and the layers `names`.
+    fn tree_drawing(names: &[&str]) -> Drawing {
+        use cadcraft_engine::doc::{Block, Entity, Handle, Layer, Line};
+        use cadcraft_engine::geom::Vec3;
+        let mut d = Drawing::new_metric();
+        for n in names {
+            d.layers.push(Layer { name: (*n).into(), on: true, ..Default::default() });
+        }
+        let mut b = Block::new("Tree");
+        for k in 0..4u64 {
+            b.entities.push(Entity::new(Handle(900 + k), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(3.0, 1.0 + k as f64, 0.0) })));
+        }
+        d.blocks.insert("Tree".into(), std::sync::Arc::new(b));
+        d
+    }
+
+    fn words(note: &Value) -> String {
+        note["ways_through"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Past the block-expansion cap the answer says so in words: how many expansions the drawing
+    /// needs (counted up front), how many were not drawn and the ways through, and the way works:
+    /// no object needs more than the cap, so each tile (a window of its own) needs fewer than the
+    /// cap and is drawn whole. Under the cap the answer only gives the build's count. The same SVG
+    /// comes out of every slice size.
+    #[test]
+    fn passing_the_block_cap_is_reported_with_the_ways_through() {
+        let (e, c) = many_entities();
+        let d = e.docs.list[0].drawing().unwrap();
+        let mut prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        // 700 references to a block of two entities: each is the copy and its two entities.
+        let total = prep.expansions(&prep.window, &c).unwrap();
+        assert_eq!(total, 700 * 3);
+        prep.block_cap = 300;
+        let mut first = None;
+        for slice in [1, 512, preview::SLICE_ENTITIES] {
+            let mut out = Vec::new();
+            let (_, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
+            assert!(expanded > 300);
+            let note = prep.blocks_note(&prep.window, expanded, None, &c).unwrap().unwrap();
+            assert_eq!(note["blocks_truncated"], json!(true));
+            assert_eq!(note["blocks_expanded"], json!(300));
+            assert_eq!(note["blocks_expanded_total"], json!(2100));
+            assert_eq!(note["blocks_not_drawn"], json!(1800));
+            let warning = note["warning"].as_str().unwrap();
+            assert!(warning.starts_with("block contents past 300 expanded entities were not drawn"), "{warning}");
+            let ways = words(&note);
+            assert!(ways.contains("tiles {cols, rows}") && ways.contains("window [[x0, y0], [x1, y1]]"), "{ways}");
+            assert!(ways.contains("at least 7 windows") && ways.contains("2100"), "{ways}");
+            assert!(ways.contains("reading is not affected"), "{ways}");
+            assert!(!ways.contains("no complete picture"), "{ways}");
+            assert_eq!(note["largest_object"]["fits_one_build"], json!(true));
+            let svg = String::from_utf8(out).unwrap();
+            assert!(first.get_or_insert_with(|| svg.clone()) == &svg, "slice of {slice} entities");
+        }
+        // The way through: ten tiles (at least 7) each need under the cap and come out whole.
+        let tiles = preview::tiles(&prep.window, &json!({"tiles": {"cols": 10, "rows": 1}})).unwrap();
+        let mut sum = 0;
+        for (_, win) in &tiles {
+            let need = prep.expansions(win, &c).unwrap();
+            assert!(need <= 300, "{need}");
+            sum += need;
+            let mut out = Vec::new();
+            let (_, expanded) = prep.write_svg(&mut out, win, 1600.0, &c).unwrap_or_else(|_| panic!("tile"));
+            assert_eq!(expanded as u64, need);
+            let note = prep.blocks_note(win, expanded, None, &c).unwrap().unwrap();
+            assert!(note.get("blocks_truncated").is_none(), "{note}");
+        }
+        assert!(sum >= total);
+        // A layout and a PDF get their own words.
+        let none = cadcraft_engine::render::BlockCensus::default();
+        let layout = preview::ways_through(300, 2100, preview::Through::Layout, &none).join(" ");
+        assert!(layout.contains("viewport: <handle>") && layout.contains("does not reduce"), "{layout}");
+        let pdf = preview::ways_through(300, 2100, preview::Through::Pdf, &none).join(" ");
+        assert!(pdf.contains("only places the drawing on the page"), "{pdf}");
+    }
+
+    /// The build is the ground truth for the flag: a build that drew everything gives its own
+    /// figure whatever a count says, a build past the limit is truncated and its total is the count
+    /// (never below what the build took).
+    #[test]
+    fn the_build_decides_whether_an_answer_is_truncated() {
+        let (e, c) = many_entities();
+        let d = e.docs.list[0].drawing().unwrap();
+        let mut prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        prep.block_cap = 300;
+        let census = |total| cadcraft_engine::render::BlockCensus { total, ..Default::default() };
+        // A count of 2,000 and a build that took 5 and was complete: not truncated, 5.
+        assert_eq!(prep.blocks_note_for(5, &census(2_000)), json!({"blocks_expanded_total": 5}));
+        // The build stopped past 300 and the count says 100 (disagreeing): truncated, the build's 301.
+        let note = prep.blocks_note_for(301, &census(100));
+        assert_eq!(note["blocks_truncated"], json!(true));
+        assert_eq!((&note["blocks_expanded_total"], &note["blocks_not_drawn"]), (&json!(301), &json!(1)));
+    }
+
+    /// A count that overflows answers in words and no number; above 2^53 a decimal string (a JSON
+    /// client reads numbers as doubles), up to it a number.
+    #[test]
+    fn a_count_that_overflows_answers_the_words_and_no_number() {
+        let (e, c) = many_entities();
+        let d = e.docs.list[0].drawing().unwrap();
+        let mut prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        prep.block_cap = 300;
+        let words_only = "more than can be counted (nested references multiply past 1.8e19)";
+        let huge = cadcraft_engine::render::BlockCensus {
+            total: u64::MAX,
+            largest: Some(cadcraft_engine::render::LargestRef { handle: cadcraft_engine::doc::Handle(0x2A), kind: "block reference", block: "L0".into(), count: u64::MAX }),
+            ..Default::default()
+        };
+        let note = prep.blocks_note_for(301, &huge);
+        let text = note.to_string();
+        assert!(!text.contains("18446744073709551615") && !text.contains("at least") && !text.contains("render_preview with tiles"), "{text}");
+        assert_eq!(note["blocks_expanded_total"], json!(words_only));
+        assert_eq!(note["blocks_not_drawn"], json!(words_only));
+        assert_eq!(note["largest_object"]["blocks_expanded"], json!(words_only));
+        assert!(note["warning"].as_str().unwrap().contains(words_only));
+        assert!(words(&note).contains("no complete picture of this object can be drawn today"));
+        let census = |total| cadcraft_engine::render::BlockCensus { total, ..Default::default() };
+        let note = prep.blocks_note_for(301, &census((1u64 << 53) + 1));
+        assert_eq!(note["blocks_expanded_total"], json!("9007199254740993"));
+        assert_eq!(note["blocks_not_drawn"], json!(9_007_199_254_740_693u64));
+        let note = prep.blocks_note_for(301, &census(1u64 << 60));
+        assert_eq!((&note["blocks_expanded_total"], &note["blocks_not_drawn"]), (&json!("1152921504606846976"), &json!("1152921504606846676")));
+        let note = prep.blocks_note_for(301, &census(1u64 << 53));
+        assert_eq!(note["blocks_expanded_total"], json!(1u64 << 53));
+        // The layer list carries the same types.
+        let layered = cadcraft_engine::render::BlockCensus {
+            total: 1u64 << 60,
+            layers_off: vec![
+                cadcraft_engine::render::LayerOff { layer: "A".into(), total_if_off: 1u64 << 60 },
+                cadcraft_engine::render::LayerOff { layer: "B".into(), total_if_off: 7 },
+            ],
+            ..Default::default()
+        };
+        let note = prep.blocks_note_for(301, &layered);
+        assert_eq!(note["layers_that_reduce"][0]["blocks_expanded_total_if_off"], json!("1152921504606846976"));
+        assert_eq!(note["layers_that_reduce"][1]["blocks_expanded_total_if_off"], json!(7));
+    }
+
+    /// The descriptions of `render_preview` and `export` say what each field that can be a number or
+    /// a string is, and that the build decides `blocks_truncated`; neither tells the agent to change
+    /// the drawing to get a picture.
+    #[test]
+    fn the_descriptions_document_the_number_or_string_fields() {
+        let defs = definitions();
+        for tool in ["render_preview", "export"] {
+            let d = defs.iter().find(|t| t["name"] == tool).unwrap()["description"].as_str().unwrap().to_string();
+            for field in ["blocks_expanded_total", "blocks_not_drawn", "largest_object.blocks_expanded", "blocks_expanded_total_if_off", "decimal string above 2^53", "more than can be counted"] {
+                assert!(d.contains(field), "{tool}: {field}");
+            }
+            assert!(d.contains("blocks_truncated is true only when the build itself went past the limit"), "{tool}");
+            for edit in ["explode", "arrayrect", "discard", "undo", "save_drawing"] {
+                assert!(!d.contains(edit), "{tool} names an editing route: {edit}");
+            }
+        }
+        let export = defs.iter().find(|t| t["name"] == "export").unwrap()["description"].as_str().unwrap().to_string();
+        assert!(export.contains("details_of_sheet") && export.contains("sums over the sheets"));
+    }
+
+    /// Annotative dimensions are drawn from their definition, so a drawing of them is a complete
+    /// picture (the build expands nothing) even though the stored blocks they name hold more than
+    /// the limit: render_preview and export (svg and png) do not answer it as truncated.
+    #[test]
+    fn a_picture_of_annotative_dimensions_is_not_answered_as_truncated() {
+        use cadcraft_engine::doc::{AnnoScale, Block, Common, Dimension, Entity, Handle, Line};
+        use cadcraft_engine::geom::Vec3;
+        let dir = scratch("annotative-dims");
+        let c = ctx(Some(dir.clone()), true);
+        let mut e = Engine::default();
+        e.call("new_drawing", &json!({}), &c).unwrap();
+        let d = e.docs.list[0].session.doc_mut().unwrap();
+        // 50,000 lines in the block each dimension names: 41 dimensions would count 2,050,041 > 2,000,000.
+        let mut b = Block::new("DB");
+        for k in 0..50_000u64 {
+            b.entities.push(Entity::new(Handle(10_000 + k), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(1.0, 1.0, 0.0) })));
+        }
+        d.blocks.insert("DB".into(), std::sync::Arc::new(b));
+        let annotative = Common { anno_scales: vec![AnnoScale::new("1:1", 1.0, 1.0)], ..Common::default() };
+        let dims = |d: &mut Drawing, common: &Common| {
+            for k in 0..41 {
+                let at = f64::from(k) * 20.0;
+                let dim = Dimension {
+                    kind: cadcraft_engine::doc::DimKind::Linear { rotation: 0.0 },
+                    defpt: Vec3::new(at, 2.0, 0.0),
+                    text_mid: Vec3::ZERO,
+                    p13: Vec3::new(at, 0.0, 0.0),
+                    p14: Vec3::new(at + 10.0, 0.0, 0.0),
+                    p15: Vec3::ZERO,
+                    p16: Vec3::ZERO,
+                    text: String::new(),
+                    style: "Standard".into(),
+                    measurement: 0.0,
+                    text_rotation: 0.0,
+                    user_text_pos: false,
+                    block: Some("DB".into()),
+                    overrides: Default::default(),
+                    assoc: Vec::new(),
+                    marks: Default::default(),
+                };
+                d.add(&Space::Model, common.clone(), EntityKind::Dimension(dim)).unwrap();
+            }
+        };
+        // The same dimensions, not annotative, take the stored block's entities: that is the count
+        // a naive reading of the block table gives, over the limit.
+        let mut plain = d.clone();
+        dims(&mut plain, &Common::default());
+        let naive = cadcraft_engine::render::count_space(&plain, &Space::Model, false);
+        assert_eq!(naive, 41 * 50_000);
+        assert!(naive > cadcraft_engine::render::MAX_BLOCK_EXPANSION as u64);
+        dims(d, &annotative);
+        let r = e.call("render_preview", &json!({}), &c).unwrap().value;
+        let tile = &r["tiles"][0];
+        assert_eq!(tile["blocks_expanded_total"], json!(0), "{tile}");
+        assert!(tile.get("blocks_truncated").is_none() && tile.get("ways_through").is_none(), "{tile}");
+        let r = e.call("render_preview", &json!({"format": "png"}), &c).unwrap().value;
+        assert!(r["tiles"][0].get("blocks_truncated").is_none() && r["tiles"][0]["blocks_expanded_total"] == json!(0), "{r}");
+        for f in ["a.svg", "a.png"] {
+            let r = e.call("export", &json!({"path": f}), &c).unwrap().value;
+            let saved = &r["saved"][0];
+            assert_eq!(saved["blocks_expanded_total"], json!(0), "{f}: {saved}");
+            assert!(saved.get("blocks_truncated").is_none() && saved.get("ways_through").is_none(), "{f}: {saved}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One reference that alone needs more than the limit is expanded whole in every window that
+    /// touches it. The answer names it (handle, kind, block, count), says windows cannot split it,
+    /// does not advise windows, and offers only what leaves the drawing as it is: the layer the
+    /// references are on, whose switching off really reduces the build's `expanded` to the figure
+    /// given, and reading. When no layer leaves a build that fits, it says no complete picture can
+    /// be drawn today.
+    #[test]
+    fn one_object_over_the_limit_is_named_and_only_routes_that_leave_the_drawing_are_offered() {
+        use cadcraft_engine::doc::Common;
+        let c = ctx(None, true);
+        let cap = 300;
+        // A 30 x 30 array on "Refs" (900 copies x 5 = 4,500) and three small references on "Small" (15).
+        let mut d = tree_drawing(&["Refs", "Small", "Other"]);
+        let big = d.add(&Space::Model, Common { layer: "Refs".into(), ..Common::default() }, tree_array(30, 30)).unwrap();
+        for _ in 0..3 {
+            d.add(&Space::Model, Common { layer: "Small".into(), ..Common::default() }, tree_array(1, 1)).unwrap();
+        }
+        let mut prep = preview::prepare(&d, &json!({"space": "Model"}), &c).unwrap();
+        prep.block_cap = cap;
+        let list = prep.list_for(&prep.window, 800.0, &c).unwrap();
+        let note = prep.blocks_note(&prep.window, list.expanded, None, &c).unwrap().unwrap();
+        assert_eq!(note["blocks_expanded_total"], json!(4_515));
+        assert_eq!(
+            note["largest_object"],
+            json!({"handle": big.hex(), "kind": "array of block references (MINSERT)", "block": "Tree", "blocks_expanded": 4_500, "fits_one_build": false})
+        );
+        let ways = words(&note);
+        assert!(ways.starts_with("windows and tiles cannot complete this"), "{ways}");
+        assert!(ways.contains(&big.hex()) && ways.contains("block Tree") && ways.contains("4500"), "{ways}");
+        assert!(!ways.contains("at least") && !ways.contains("draw it in windows"), "windows are not advised: {ways}");
+        assert!(ways.contains("reading is not affected"), "{ways}");
+        for edit in ["explode", "arrayrect", "undo", "discard", "save_drawing", "edit"] {
+            assert!(!ways.contains(edit) && !note.to_string().contains(edit), "an editing route is offered: {edit}");
+        }
+        // Windows really do not help: every tile that reaches the array is truncated.
+        let mut cut = 0;
+        let tiles = preview::tiles(&prep.window, &json!({"tiles": {"cols": 6, "rows": 6}})).unwrap();
+        for (_, win) in &tiles {
+            let l = prep.list_for(win, 800.0, &c).unwrap();
+            cut += usize::from(l.expanded > cap);
+        }
+        assert!(cut >= 6, "{cut}");
+        // The layer route: "Refs" off leaves the 15 of the small ones, the figure the answer gave,
+        // and a build with that layer off takes exactly that, under the limit.
+        assert_eq!(note["layers_that_reduce"][0], json!({"layer": "Refs", "blocks_expanded_total_if_off": 15, "fits_one_build": true}));
+        assert!(ways.contains("Refs leaves 15, which fits one build"), "{ways}");
+        assert!(!ways.contains("no complete picture"), "a layer fits: {ways}");
+        let mut off = preview::prepare(&d, &json!({"space": "Model", "layers_off": ["REFS"]}), &c).unwrap();
+        off.block_cap = cap;
+        let l = off.list_for(&off.window, 800.0, &c).unwrap();
+        assert_eq!(l.expanded, 15);
+        assert!(off.blocks_note(&off.window, l.expanded, None, &c).unwrap().unwrap().get("blocks_truncated").is_none());
+
+        // Two big arrays on two layers: no layer leaves a build that fits. Said in plain words, with
+        // what is really drawn: the first expansions in draw order, `cap` of them.
+        let mut d = tree_drawing(&["Refs", "Other"]);
+        d.add(&Space::Model, Common { layer: "Refs".into(), ..Common::default() }, tree_array(30, 30)).unwrap();
+        d.add(&Space::Model, Common { layer: "Other".into(), ..Common::default() }, tree_array(30, 30)).unwrap();
+        let mut prep = preview::prepare(&d, &json!({"space": "Model"}), &c).unwrap();
+        prep.block_cap = cap;
+        let list = prep.list_for(&prep.window, 800.0, &c).unwrap();
+        let note = prep.blocks_note(&prep.window, list.expanded, None, &c).unwrap().unwrap();
+        let ways = words(&note);
+        assert!(ways.contains("no complete picture of this object can be drawn today; what is drawn is the first 300 expansions in draw order"), "{ways}");
+        assert!(list.expanded > cap && list.prims.len() < 1_800 && !list.prims.is_empty(), "{} {}", list.expanded, list.prims.len());
+        for l in note["layers_that_reduce"].as_array().unwrap() {
+            assert_eq!(l["fits_one_build"], json!(false));
+        }
+    }
+
     /// Which layer to switch off: the build takes one expansion for every entity of a block before
     /// it looks at the entity's layer, so switching off the layer of a block's CONTENTS reduces
     /// nothing and only the layer the REFERENCES are on does. The answer says so, lists the
@@ -1833,8 +2145,8 @@ mod tests {
         assert!(note.get("blocks_truncated").is_none(), "{note}");
         assert_eq!(note["arrays_clamped"], json!([{"handle": h.hex(), "block": "Pole", "cols": 12_000, "rows": 1, "drawn_cols": 10_000, "drawn_rows": 1}]));
         let text = note["arrays_clamped_note"].as_str().unwrap();
-        assert!(text.contains("drawn short") && text.contains("10,000 columns and 10,000 rows") && text.contains("arrayrect"), "{text}");
-        assert!(text.contains("ONLY to draw the picture") && text.contains("exactly 3 undo steps") && text.contains("never save_drawing"), "{text}");
+        assert!(text.contains("drawn short") && text.contains("10,000 columns and 10,000 rows"), "{text}");
+        assert!(!text.contains("arrayrect") && !text.contains("explode") && text.contains("No way to draw more"), "{text}");
         // An array within the limit says nothing.
         let mut ok = d.clone();
         ok.remove_entity(h);
@@ -1885,8 +2197,10 @@ mod tests {
         assert_eq!(note["blocks_not_drawn"], json!(sum("blocks_not_drawn")));
         assert!(sheets.iter().all(|s| s["blocks_not_drawn"].as_u64() <= s["blocks_expanded_total"].as_u64()));
         assert_eq!(note["blocks_truncated_sheets"], json!(["Model"]));
-        assert_eq!(note["largest_object"], serde_json::Value::Null);
-        assert_eq!(sheets[0]["largest_object"]["kind"], json!("array of block references (MINSERT)"));
+        // The cause is at the top level too, for the sheet that needs the most.
+        assert_eq!(note["details_of_sheet"], json!("Model"));
+        assert_eq!(note["largest_object"], sheets[0]["largest_object"]);
+        assert_eq!(note["largest_object"]["kind"], json!("array of block references (MINSERT)"));
         let ways = note["ways_through"][0].as_str().unwrap();
         assert!(ways.starts_with("windows and tiles cannot complete this"), "{ways}");
         // Nothing past the limit: the figures only.

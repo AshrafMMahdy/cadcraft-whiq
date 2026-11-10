@@ -17,7 +17,7 @@
 //! top-level object, the layers the drawn references sit on, and arrays drawn short by the
 //! 1..=10,000 clamp on a MINSERT's columns and rows.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cadcraft_doc::{AnnoDraw, Drawing, Entity, EntityKind, Handle, MAX_BLOCK_DEPTH};
@@ -56,8 +56,12 @@ pub struct ClampedArray {
 #[derive(Default)]
 pub(crate) struct Stats {
     pub largest: Option<LargestRef>,
-    /// The layers (as the build resolves them) the drawn references sit on.
-    pub layers: BTreeSet<String>,
+    /// The layers (as the build resolves them, names compared ignoring case: the key is the
+    /// lower-case name, the value the first spelling met) the drawn references sit on, that are in
+    /// the layer table.
+    pub layers: BTreeMap<String, String>,
+    /// A drawn reference sits on a layer that is not in the layer table (no switch can name it).
+    pub off_table: bool,
     pub clamped: BTreeMap<u64, ClampedArray>,
 }
 
@@ -68,7 +72,10 @@ impl Stats {
         {
             self.largest = Some(l);
         }
-        self.layers.extend(other.layers);
+        for (k, v) in other.layers {
+            self.layers.entry(k).or_insert(v);
+        }
+        self.off_table |= other.off_table;
         for (k, v) in other.clamped {
             self.clamped.entry(k).or_insert(v);
         }
@@ -172,8 +179,13 @@ impl<'a> Counter<'a> {
     }
 
     fn note_layer(&mut self, name: &str) {
-        if !self.stats.layers.contains(name) {
-            self.stats.layers.insert(name.to_string());
+        let Some(l) = self.d.layer(name) else {
+            self.stats.off_table = true;
+            return;
+        };
+        let key = l.name.to_ascii_lowercase();
+        if !self.stats.layers.contains_key(&key) {
+            self.stats.layers.insert(key, l.name.clone());
         }
     }
 

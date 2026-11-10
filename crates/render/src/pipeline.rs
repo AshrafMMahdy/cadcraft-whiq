@@ -277,6 +277,9 @@ pub struct BlockCensus {
     /// entity's layer, so only the layer the *references* are on can reduce a count, not the
     /// layers of their contents.
     pub reference_layers: Vec<String>,
+    /// A drawn reference sits on a layer missing from the layer table: no layer switch reaches it,
+    /// so the reference layers do not say where every reference is.
+    pub references_off_table: bool,
     /// Only when `total` is past [`Options::max_block_expansion`]: each reference layer that
     /// makes the count smaller when switched off, the smallest count first.
     pub layers_off: Vec<LayerOff>,
@@ -291,7 +294,8 @@ fn census_of(opts: &Options, run: impl Fn(&[String]) -> (u64, Stats)) -> BlockCe
     let mut c = BlockCensus {
         total,
         largest: stats.largest,
-        reference_layers: stats.layers.into_iter().collect(),
+        reference_layers: stats.layers.into_values().collect(),
+        references_off_table: stats.off_table,
         layers_off: Vec::new(),
         clamped: stats.clamped.into_values().collect(),
     };

@@ -647,49 +647,27 @@ fn clamped_fields(note: &mut Value, census: &BlockCensus) {
         }))
         .collect::<Vec<_>>());
     note["arrays_clamped_note"] = json!(format!(
-        "{} block array{} drawn short: a block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows and the rest of its copies are not in this picture (arrays_clamped lists them; reading, measuring and extents still see the whole array). {SEPARATE_REFERENCES}",
+        "{} block array{} drawn short: a block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows and the rest of its copies are not in this picture (arrays_clamped lists them; reading, measuring and extents still see the whole array). No way to draw more of such an array exists today",
         census.clamped.len(),
         if census.clamped.len() == 1 { " is" } else { "s are" }
     ));
 }
 
-/// How to turn an array into separate references the build draws all of (and windows can split);
-/// proved in the tests (`the_ways_the_answer_names_work`).
-const SEPARATE_REFERENCES: &str = "To draw all of an array, make its copies separate references with edit: erase the array (op \"delete\", handles), insert the block once at the array's insertion point with its rotation (op \"block\", action \"insert\", name, at, rotation) and run arrayrect {handles: [that reference], rows, cols, rowSpacing, colSpacing, axisAngle: the array's rotation in degrees, associative: false}; each copy is then an object of its own. These edits are ONLY to draw the picture and change the customer's open drawing in memory: do them, draw, then take them back with exactly 3 undo steps (edit {ops: [{op: \"undo\"}, {op: \"undo\"}, {op: \"undo\"}]}: one each for the delete, the insert and the arrayrect) or close_drawing with discard: true; never save_drawing with them in place unless the user asked for the drawing itself to be changed";
-
-/// How to open up one block reference, proved in the tests.
-const EXPLODE_ONE: &str = "edit {op: \"command\", command: \"explode\", params: {handles: [\"HANDLE\"]}} replaces a block reference by the block's own entities, so the references nested inside it become objects of the drawing that windows can split (explode again for one that is still too big); this edit is ONLY to draw the picture and changes the customer's open drawing in memory: do it, draw, then take it back with exactly 1 undo step (edit {ops: [{op: \"undo\"}]}) or close_drawing with discard: true; never save_drawing with it in place unless the user asked for the drawing itself to be changed. Exploding a MINSERT gives one copy only, so for a MINSERT use the separate-references route";
-
 /// The ways to a complete picture when a build needs `total` block expansions and the limit is
-/// `cap` per build, in words for the agent. Each is something the tools do today, and what does
-/// not work is said. Windows are advised only when the largest single object fits the limit: a
-/// build expands an object whole in every window that touches it.
+/// `cap` per build, in words for the agent. Only routes that leave the drawing as it is; each is
+/// proved by a test, and what does not exist is said. Windows are advised only when the largest
+/// single object fits the limit: a build expands an object whole in every window that touches it.
 pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus) -> Vec<String> {
     let mut ways = Vec::new();
-    let largest = census.largest.as_ref();
-    let too_big = largest.filter(|l| l.count > cap as u64);
+    let too_big = census.largest.as_ref().filter(|l| l.count > cap as u64);
     if let Some(l) = too_big {
-        let (kind_text, h) = (l.kind, l.handle.hex());
         ways.push(format!(
-            "windows and tiles cannot complete this: the {kind_text} {h} (block {}) alone needs {} expansions, more than the {cap} one build draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again",
+            "windows and tiles cannot complete this: the {} {} (block {}) alone needs {} expansions, more than the {cap} one build draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again",
+            l.kind,
+            l.handle.hex(),
             l.block,
             count_text(l.count)
         ));
-        if l.count == COUNT_SATURATED {
-            ways.push(
-                "this reference nests blocks so deeply that it multiplies past what can be counted: opening it one level (explode) leaves references that still multiply past it, so no route draws all of it today. Reading is unaffected (below)".to_string(),
-            );
-        } else if l.kind.starts_with("array") {
-            ways.push(format!(
-                "make the copies separate references so windows can split them: {}",
-                SEPARATE_REFERENCES.replace("To draw all of an array, make", "make")
-            ));
-        } else {
-            ways.push(format!("open the reference so its parts can be split by windows: {}", EXPLODE_ONE.replace("HANDLE", &h)));
-        }
-        ways.push(
-            "render_preview and export take only model space, a layout or a layout viewport as the space to draw: a block's own definition cannot be drawn as a space of its own".to_string(),
-        );
     } else {
         let windows = total.div_ceil((cap as u64).max(1)).max(2);
         let how_many = if total == COUNT_SATURATED {
@@ -711,8 +689,9 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus)
             )),
         }
     }
+    let single = census.reference_layers.len() == 1 && !census.references_off_table;
     if census.layers_off.is_empty() {
-        if census.reference_layers.len() == 1 {
+        if single {
             ways.push(format!(
                 "every block reference is on one layer ({}), so layers_off / only_layers cannot split the drawing into passes: switching that layer off leaves none of them",
                 census.reference_layers.first().map_or("", String::as_str)
@@ -729,9 +708,9 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus)
             .collect::<Vec<_>>()
             .join("; ");
         ways.push(format!(
-            "switch off the layer the block references are on (layers_off / only_layers): with it off the count is {list}. Switching off the layers of the references' contents does not reduce the count (the build takes one expansion for each entity of a block before it looks at the entity's layer)"
+            "switch off the layer the block references are on (layers_off / only_layers); the references on it are then not in the picture, and the count with it off is: {list}. Switching off the layers of the references' contents does not reduce the count (the build takes one expansion for each entity of a block before it looks at the entity's layer)"
         ));
-        if census.reference_layers.len() == 1 {
+        if single {
             ways.push(format!(
                 "every block reference is on one layer ({}), so layers cannot split the drawing into passes: switching it off leaves none of them",
                 census.reference_layers.first().map_or("", String::as_str)
@@ -741,10 +720,18 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus)
     ways.push(
         "reading is not affected by the limit: read_drawing (entities with expand_blocks, takeoff, text, dimensions), search_drawing, measuring and the extents do not expand blocks into a picture, so everything in the drawing can still be read, searched and measured".to_string(),
     );
-    ways.push(format!(
-        "one file of the whole drawing needs {} expansions in one build and {cap} is the most one build draws, so a complete picture comes as several files (windows, layer passes or opened-up references as above), not one",
-        count_text(total)
-    ));
+    if too_big.is_some() {
+        if !census.layers_off.iter().any(|l| l.total_if_off <= cap as u64) {
+            ways.push(format!(
+                "no complete picture of this object can be drawn today; what is drawn is the first {cap} expansions in draw order, the rest of its block contents is left out"
+            ));
+        }
+    } else {
+        ways.push(format!(
+            "one file of the whole drawing needs {} expansions in one build and {cap} is the most one build draws, so a complete picture comes as several files (windows or layer passes as above), not one",
+            count_text(total)
+        ));
+    }
     ways
 }
 
@@ -780,6 +767,9 @@ pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
             count_text(over)
         ));
         note["ways_through"] = json!(ways_through(cap, worst.total, Through::Pdf, &worst.census));
+        // The details of the sheet that needs the most (every truncated sheet has its own in `sheets`).
+        truncated_fields(&mut note, cap, &worst.census);
+        note["details_of_sheet"] = json!(worst.sheet);
     }
     // Arrays drawn short on any sheet.
     let mut seen = std::collections::BTreeSet::new();

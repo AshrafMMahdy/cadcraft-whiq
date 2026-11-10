@@ -213,85 +213,94 @@ byte-identical) or the build runs twice (once for the bounds). `build_plot` also
 
 ## 10. Round 2b: what the blind review changed
 
-**The build is the ground truth; the count explains it.** Every answer that draws takes `blocks_expanded_total` from
-the build's own `DisplayList::expanded` when the build drew everything; `blocks_truncated` is true only when that
-count went past the limit. Past the limit the build stops, so the total is then the count from the block table
+A picture-making answer never tells the agent to change the customer's drawing: no route that edits it (explode, arrays
+rebuilt as separate references, undo, close with discard) is offered anywhere. Editing routes were written and removed:
+they alter customer data, have limits of their own (arrayrect refuses very large arrays), lose properties and are not
+safe to undo blind.
+
+**The build is the ground truth; the count explains it.** Every answer that draws takes `blocks_expanded_total` from the
+build's own `DisplayList::expanded` when the build drew everything; `blocks_truncated` is true only when that count went
+past the limit. Past the limit the build stops, so the total is then the count from the block table
 (`render::census_space` / `census_entities`), never below what the build took. A count and a build that disagree under
-the limit give the build's figure (test `the_build_decides_whether_an_answer_is_truncated`).
+the limit give the build's figure. Tests: mcp `the_build_decides_whether_an_answer_is_truncated` and
+`a_picture_of_annotative_dimensions_is_not_answered_as_truncated` (41 annotative dimensions whose block table count is
+2,050,000 > the limit; the build expands 0; render_preview, export svg and export png do not say truncated).
 
 **Annotative dimensions.** At depth 0 a non-hidden annotative object goes through `anno_scaled`, which sets a
-dimension's `block` to `None`: the build expands nothing for it. The counter now takes the object's `AnnoDraw`
+dimension's `block` to `None`: the build expands nothing for it. The counter takes the object's `AnnoDraw`
 (`Counter::top`): hidden costs 0, a scaled dimension costs 0, scaled multileaders and references keep their block (a
-dimension nested in a block is not scaled and keeps its block). Tests `annotative_dimensions_count_what_the_build_expands`
-(render: model space, layout, viewport; equal to the unlimited build) and
-`a_picture_of_annotative_dimensions_is_not_answered_as_truncated` (mcp).
+dimension nested in a block is not scaled and keeps its block). Render test
+`annotative_dimensions_count_what_the_build_expands` (model space, layout, viewport; equal to the unlimited build).
 
-**Dimension blocks are memoised** in their own map (no unit for the copy, AttDefs included) on (block, depth, layer),
-so a dimension block holding k dimensions of itself costs 16 x k visits, not k^16 (k = 10 is 11,111,111,111,111,110
-expansions, counted at once: `a_dimension_block_of_dimensions_is_counted_at_once`). The counter checks the build's
-`Options::cancel` at every entity. The memo key no longer clones the layer name per visit (two-level map looked up by
-`&str`).
+**Dimension blocks are memoised** in their own map (no unit for the copy, AttDefs included) on (block, depth, layer), so
+a dimension block holding k dimensions of itself costs 16 x k visits, not k^16 (k = 10 is 11,111,111,111,111,110
+expansions, counted at once: render `a_dimension_block_of_dimensions_is_counted_at_once`). The counter checks the
+build's `Options::cancel` at every entity. The memo key no longer clones the layer name per visit (two-level map looked
+up by `&str`).
 
 **One object over the limit (windows cannot split it).** The counting pass finds the largest single top-level object
 with its handle, kind and block (`BlockCensus::largest`; answer field `largest_object`). When it needs more than the
 limit, the answer says that windows and tiles cannot complete it (a build expands every object that reaches its window
-whole) and does not advise windows. Routes that work today, each proved by a test that runs it:
+whole) and does not advise windows. It offers only routes that leave the drawing as it is:
 
-1. *Layers*, when switching off the layer the **references** are on reduces the count (answer fields `reference_layers`
-   and `layers_that_reduce`, each with what the count becomes and whether that fits one build). The build takes one
-   expansion for every entity of a block before it looks at that entity's layer, so switching off the layers of the
-   block's contents reduces nothing (`only_the_layer_of_the_references_reduces_the_count`,
-   `the_layer_advice_names_the_reference_layers_and_it_reduces_the_build`). When every reference is on one layer the
-   answer says no split into passes exists.
-2. *Explode a block reference* (edit `{op: command, command: explode, params: {handles}}`): the block's own entities,
-   nested references included, become objects of the drawing and windows can split them
-   (`one_object_over_the_limit_is_named_and_the_routes_named_work`: one block wrapping 40 trees, every tile truncated
-   before, none after). Exploding a MINSERT gives one copy only, so for a MINSERT: erase it, insert the block once and
-   run `arrayrect {handles, rows, cols, rowSpacing, colSpacing, axisAngle: rotation, associative: false}`, which makes
-   every copy a separate reference (`a_minsert_over_the_limit_is_named_and_the_route_named_works`: 30 x 30, also
-   rotated 30 degrees: same primitives and bounds, tiles complete). Both edits change the customer's open document in
-   memory, so the answer says in the same sentence that they are ONLY to draw the picture: do them, draw, then take
-   them back with exactly 1 undo step (explode) or 3 (delete, insert, arrayrect; `edit {ops: [{op: "undo"}, ...]}`),
-   or `close_drawing` with `discard: true`, and never `save_drawing` with them in place unless the user asked for
-   the drawing itself to be changed (the tests undo and compare the drawing with the original). There is no copy
-   route: `open_drawing` of a file already open returns the same handle, so no second handle on the file exists.
-3. *Reading* (`read_drawing`, `search_drawing`, measuring, extents) does not expand blocks, so the information stays
+1. *Layers.* Switching off the layer the **references** are on (answer fields `reference_layers` and
+   `layers_that_reduce`, each with what the count becomes and whether that fits one build; layer names compare ignoring
+   case, and a layer missing from the layer table is not offered). The build takes one expansion for every entity of a
+   block before it looks at that entity's layer, so switching off the layers of the block's contents reduces nothing.
+   When every reference is on one known layer the answer says no split into passes exists. The references on the layer
+   switched off are then not in the picture.
+2. *Reading* (`read_drawing`, `search_drawing`, measuring, extents) does not expand blocks, so the information stays
    reachable.
 
-Not a route: `render_preview` / `export` take only model space, a layout or a layout viewport as the space, so a block
-definition cannot be drawn as a space of its own (the answer says so instead of promising it).
+If no layer leaves a build that fits, the answer says "no complete picture of this object can be drawn today; what is
+drawn is the first N expansions in draw order". Tests: mcp
+`one_object_over_the_limit_is_named_and_only_routes_that_leave_the_drawing_are_offered` (names the 30 x 30 array, tiles
+stay truncated, the layer figure given equals the `expanded` of a build with that layer off, no editing words in the
+answer, the plain statement when no layer fits), render `only_the_layer_of_the_references_reduces_the_count`,
+`reference_layers_ignore_case_and_leave_out_layers_missing_from_the_table`; mcp
+`the_layer_advice_names_the_reference_layers_and_it_reduces_the_build`. Windows are advised only when the largest object
+fits the limit: mcp `passing_the_block_cap_is_reported_with_the_ways_through` ("at least 7 windows", each tile under
+the limit drawn whole).
 
-**Drawings with no complete route today** (the owner is deciding on new routes: PDF by window, blocks drawn as boxes,
+**Drawings with no complete picture today** (the owner is deciding on new routes: PDF by window, blocks drawn as boxes,
 streaming by expansion):
 
-* A PDF of a space past the limit: one sheet is one build, so no PDF holds it all (SVG / PNG windows do, a PDF does not).
-* One paper-space sheet past the limit as a single picture (SVG, PNG or PDF page): the layout is built whole. The
-  model space its viewports show is complete in tiles (`viewport: handle`), the sheet itself with its title block is not.
-* A reference whose nesting multiplies past what can be counted (10 levels of 1,000 = 10^30): opening it one level
-  leaves references that still multiply past it; only the reading routes remain.
-* An array too large to open up in memory (a 10,000 x 10,000 MINSERT: 10^8 references as separate objects).
-* Any single object whose exploded pieces are each still over the limit and nest deeper than one can explode by hand.
+* One block reference or array that alone exceeds the limit and whose references sit on one layer (or on layers that all
+  still leave a build over the limit): windows cannot split it, layers cannot split it; reading is the only route.
+* A PDF of a space past the limit: one sheet is one build, so no PDF holds it all (SVG / PNG windows can).
+* One paper-space sheet past the limit as a single picture (SVG, PNG or PDF page): the layout is built whole. The model
+  space its viewports show is complete in tiles (`viewport: handle`), the sheet itself with its title block is not.
+* A reference whose nesting multiplies past what can be counted (10 levels of 1,000 = 10^30).
+* An array with more than 10,000 columns or rows: drawn with 10,000 (the clamp in `blocks::insert`, unchanged: the
+  owner decides); the answer says so (`arrays_clamped`) and that no way to draw more exists today.
 
 **Saturated and huge counts.** A count that overflows `u64` is `COUNT_SATURATED` (`u64::MAX`); the answer then says
-"more than can be counted (nested references multiply past 1.8e19)" in `blocks_expanded_total` and
-`blocks_not_drawn`, gives no number of windows and never prints the saturated value. Any count above 2^53 is a
-decimal string (JSON clients lose precision above that); up to it a number. The tool descriptions name the types.
+"more than can be counted (nested references multiply past 1.8e19)" in the field and the warning, gives no number of
+windows and never prints the saturated value. Any count above 2^53 is a decimal string; up to it a number. Fields that
+can be a number, a string or the words: `blocks_expanded_total`, `blocks_not_drawn`, `largest_object.blocks_expanded`,
+`layers_that_reduce[].blocks_expanded_total_if_off`; documented in the `render_preview` and `export` descriptions (mcp
+`the_descriptions_document_the_number_or_string_fields`). Behaviour: mcp `a_count_that_overflows_answers_the_words_and_no_number`;
+render `the_census_names_the_largest_object_clamped_arrays_and_overflow`.
 
 **PDF.** `plot_with_blocks` / `SheetBlocks` carry each sheet's `total` (the build's count when drawn whole, else the
-count), `expanded`, `limit` and the census. The answer has `sheets: [{sheet, blocks_expanded_total,
-blocks_not_drawn}]` and totals that are the sums of them (before, "total" was the largest sheet and "not drawn" the sum
-over sheets). The test builds a real plot past a lowered limit (`PdfOptions::max_block_expansion`, not read from JSON).
+count), `expanded`, `limit` and the census. The answer has `sheets: [{sheet, blocks_expanded_total, blocks_not_drawn,
+and for a truncated sheet its own largest_object, reference_layers, layers_that_reduce}]`, totals that are the sums of
+them, and at the top level the largest object, reference layers and ways of the sheet that needs the most
+(`details_of_sheet` names it). Tests: mcp `a_pdf_note_gives_the_sheets_figures_and_they_add_up`; io
+`a_pdf_plot_past_the_limit_says_how_much_was_not_drawn` (a real plot past a lowered limit,
+`PdfOptions::max_block_expansion`, not read from JSON).
 
-**Arrays drawn short.** A MINSERT with more than 10,000 columns or rows is drawn with 10,000 (`blocks::insert`'s
-clamp, unchanged: the owner decides). Every answer that draws now lists them (`arrays_clamped: [{handle, block, cols,
-rows, drawn_cols, drawn_rows}]` and a note naming the way to draw all of an array); test `an_array_drawn_short_is_reported`.
+**Arrays drawn short.** Every answer that draws lists them (`arrays_clamped: [{handle, block, cols, rows, drawn_cols,
+drawn_rows}]` and a note); mcp `an_array_drawn_short_is_reported`.
 
-**Cost.** The census runs once per tile on the objects the tile's build already picked (it used to pick them again),
-and once per call for a layout. Measured on 4 x 4 tiles of 400,000 objects (`counting_cost_per_tile`): 3.25 s for
-picking twice and counting, 1.45 s for picking once and counting from it (the count itself is below the noise of the
-pick). The per-layer recounts that fill `layers_that_reduce` run only when the build went past the limit, one walk per
-layer the references are on.
+**Layout slices.** Render `a_layout_built_in_slices_is_the_whole_list` now covers frozen layers, `skip_viewport`,
+annotative objects and a wipeout through a viewport, and more viewports than are drawn; mcp
+`a_layout_svg_written_in_slices_is_byte_identical_to_the_whole_list_one` also runs past the limit.
 
-**Streaming writer (L3).** Nothing in the workspace writes a file with `svg::write_list` (the plotter's SVG at
-`plotter.rs` and `write_framed` return bytes, as their callers expect), so none was changed; the doc comments now say
-what it does.
+**Cost.** The census runs once per tile on the objects the tile's build already picked (it used to pick them again), and
+once per call for a layout. Measured on 4 x 4 tiles of 400,000 objects (mcp `counting_cost_per_tile`, ignored): 3.25 s
+for picking twice and counting, 1.45 s for picking once and counting from it. The per-layer recounts that fill
+`layers_that_reduce` run only when the build went past the limit, one walk per layer the references are on.
+
+**Streaming writer.** Nothing in the workspace writes a file with `svg::write_list` (the plotter's SVG and
+`write_framed` return bytes, as their callers expect), so none was changed; the doc comments now say what it does.

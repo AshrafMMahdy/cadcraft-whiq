@@ -1769,3 +1769,25 @@ fn the_census_names_the_largest_object_clamped_arrays_and_overflow() {
     assert_eq!(c.total, COUNT_SATURATED);
     assert_eq!(c.largest.unwrap().count, COUNT_SATURATED);
 }
+
+/// The layers the references are on are one entry per layer whatever the case of the name, and a
+/// reference on a layer the table does not have is not offered as a layer to switch off (it is
+/// said apart, so "all references are on one layer" is not claimed).
+#[test]
+fn reference_layers_ignore_case_and_leave_out_layers_missing_from_the_table() {
+    let mut d = refs_on_layers(10, "Trees", "Contents");
+    for (k, layer) in ["TREES", "trees", "Ghost"].into_iter().enumerate() {
+        let EntityKind::Insert(mut i) = insert_of("Tree") else { unreachable!() };
+        i.insert = Vec3::new(k as f64 * 20.0, 50.0, 0.0);
+        d.add(&Space::Model, Common { layer: layer.into(), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+    }
+    d.layers.retain(|l| l.name != "Ghost");
+    let opts = Options { max_block_expansion: 10, ..Default::default() };
+    let c = census_space(&d, &Space::Model, false, &opts);
+    assert_eq!(c.reference_layers, vec!["Trees".to_string()]);
+    assert!(c.references_off_table);
+    // Switching "Trees" off removes the 12 references on it (any spelling) and leaves the ghost's.
+    assert_eq!(c.layers_off, vec![LayerOff { layer: "Trees".into(), total_if_off: 5 }]);
+    d.layer_mut("Trees").unwrap().on = false;
+    assert_eq!(build(&d, &Space::Model, &uncapped()).expanded, 5);
+}
