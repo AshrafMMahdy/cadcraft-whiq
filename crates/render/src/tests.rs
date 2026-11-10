@@ -1183,3 +1183,151 @@ fn a_slice_past_the_block_cap_is_the_serial_list_every_run() {
     // Under the cap: the parallel list, equal to the serial one.
     same(&build_slice(&d, &ents, &Options::default(), 0), &full);
 }
+
+fn uncapped() -> Options {
+    Options { max_block_expansion: usize::MAX, ..Default::default() }
+}
+
+fn layer_named(name: &str, on: bool) -> cadcraft_doc::Layer {
+    cadcraft_doc::Layer { name: name.into(), on, ..Default::default() }
+}
+
+/// The count made from the block table alone is the number a build with no limit takes: nested
+/// blocks, arrays, layers that hide references (and layer 0 contents following the reference's
+/// layer), a block that refers to itself (stopped at the depth limit like the build), and a
+/// layout whose viewports show only part of model space.
+#[test]
+fn the_up_front_count_is_what_an_unlimited_build_expands() {
+    let check = |d: &Drawing, space: &Space, what: &str| {
+        let built = build(d, space, &uncapped()).expanded as u64;
+        assert!(built > 0, "{what}: nothing expanded");
+        assert_eq!(count_space(d, space, false), built, "{what}");
+        let plot = build_plot(d, space, &uncapped()).expanded as u64;
+        assert_eq!(count_space(d, space, true), plot, "{what} (plot)");
+    };
+    // Nested blocks, the parallel path (600 > 2 chunks).
+    let nested = many_nested_inserts(600);
+    check(&nested, &Space::Model, "nested");
+    let ents: Vec<&cadcraft_doc::Entity> = nested.model.iter().map(|e| e.as_ref()).collect();
+    assert_eq!(count_expansions(&nested, ents.iter().copied(), false), build_entities(&nested, ents.iter().copied(), &uncapped()).expanded as u64);
+
+    // An array of a block that holds a reference, a hidden layer and layer-0 contents.
+    let mut d = Drawing::new_imperial();
+    d.layers.push(layer_named("Shown", true));
+    d.layers.push(layer_named("Hidden", false));
+    d.layers.push(layer_named("NoPlot", true));
+    if let Some(l) = d.layer_mut("NoPlot") {
+        l.plot = false;
+    }
+    let mut leaf = cadcraft_doc::Block::new("Leaf");
+    for (k, layer) in ["0", "Shown", "Hidden", "0"].into_iter().enumerate() {
+        let (c, kind) = line_common(Common { layer: layer.into(), ..Default::default() });
+        leaf.entities.push(block_entity(1 + k as u64, c, kind));
+    }
+    d.blocks.insert("Leaf".into(), std::sync::Arc::new(leaf));
+    let mut mid = cadcraft_doc::Block::new("Mid");
+    for (k, layer) in ["0", "Hidden", "Shown", "NoPlot"].into_iter().enumerate() {
+        let EntityKind::Insert(i) = insert_of("Leaf") else { unreachable!() };
+        mid.entities.push(block_entity(20 + k as u64, Common { layer: layer.into(), ..Default::default() }, EntityKind::Insert(i)));
+    }
+    d.blocks.insert("Mid".into(), std::sync::Arc::new(mid));
+    for layer in ["Shown", "Hidden", "NoPlot", "0"] {
+        let EntityKind::Insert(mut i) = insert_of("Mid") else { unreachable!() };
+        i.cols = 3;
+        i.rows = 4;
+        i.col_spacing = 50.0;
+        i.row_spacing = 50.0;
+        d.add(&Space::Model, Common { layer: layer.into(), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+    }
+    check(&d, &Space::Model, "layers and arrays");
+
+    // A block that refers to itself twice: the depth limit stops it.
+    let mut d = Drawing::new_imperial();
+    let mut s = cadcraft_doc::Block::new("S");
+    for k in 0..2u64 {
+        let EntityKind::Insert(i) = insert_of("S") else { unreachable!() };
+        s.entities.push(block_entity(1 + k, Common::default(), EntityKind::Insert(i)));
+    }
+    let (c, kind) = line_common(Common::default());
+    s.entities.push(block_entity(9, c, kind));
+    d.blocks.insert("S".into(), std::sync::Arc::new(s));
+    d.add(&Space::Model, Common::default(), insert_of("S")).unwrap();
+    check(&d, &Space::Model, "self reference");
+
+    // A layout: one viewport shows the left part of model space with a layer frozen in it, a
+    // second is off, and a paper-space reference.
+    let mut d = many_nested_inserts(40);
+    let paper = Space::Paper("Layout1".into());
+    let mut v1 = vp(Vec2::new(50.0, 50.0), 100.0, 100.0, Vec2::new(1000.0, 0.0), 400.0, 2);
+    v1.frozen_layers = vec!["Hidden".into()];
+    let mut v2 = vp(Vec2::new(50.0, 50.0), 100.0, 100.0, Vec2::new(3000.0, 0.0), 400.0, 3);
+    v2.on = false;
+    for v in [v1, v2] {
+        d.add(&paper, Common::default(), EntityKind::Viewport(v)).unwrap();
+    }
+    d.add(&paper, Common::default(), insert_of("Outer")).unwrap();
+    let in_view = count_space(&d, &paper, false);
+    let all_model = count_space(&d, &Space::Model, false);
+    assert!(in_view > 0 && in_view < all_model, "{in_view} of {all_model}");
+    check(&d, &paper, "layout");
+}
+
+/// Bytes the display list holds per expanded entity, for the block-expansion write-up
+/// (`cargo test -p cadcraft-render bytes_per_expanded -- --nocapture --ignored`).
+#[test]
+#[ignore]
+fn bytes_per_expanded_entity() {
+    let d = many_nested_inserts(20_000);
+    let l = build(&d, &Space::Model, &uncapped());
+    let bytes = l.prims.len() * std::mem::size_of::<DPrim>() + (l.verts.len() + l.tris.len()) * std::mem::size_of::<Vec2>();
+    println!(
+        "expanded {} prims {} verts {} tris {} size_of DPrim {} -> {:.1} bytes per expanded entity, {:.1} per primitive",
+        l.expanded,
+        l.prims.len(),
+        l.verts.len(),
+        l.tris.len(),
+        std::mem::size_of::<DPrim>(),
+        bytes as f64 / l.expanded as f64,
+        bytes as f64 / l.prims.len() as f64
+    );
+}
+
+/// Counting against building on a nested site layout: `Tree` (a circle and six lines), `Row`
+/// (100 trees), `Grid` (100 rows), `n` grids in model space. Prints the count, how long it took,
+/// and the same for building (`cargo test -p cadcraft-render nested_count_vs_build -- --ignored --nocapture`).
+#[test]
+#[ignore]
+fn nested_count_vs_build() {
+    let mut d = Drawing::new_imperial();
+    let mut tree = cadcraft_doc::Block::new("Tree");
+    tree.entities.push(block_entity(1, Common::default(), EntityKind::Circle(cadcraft_doc::Circle { center: Vec3::ZERO, radius: 2.0 })));
+    for k in 0..6u64 {
+        let (c, kind) = line_common(Common::default());
+        tree.entities.push(block_entity(2 + k, c, kind));
+    }
+    d.blocks.insert("Tree".into(), std::sync::Arc::new(tree));
+    for (name, inner, step) in [("Row", "Tree", (10.0, 0.0)), ("Grid", "Row", (0.0, 10.0))] {
+        let mut b = cadcraft_doc::Block::new(name);
+        for k in 0..100u64 {
+            let EntityKind::Insert(mut i) = insert_of(inner) else { unreachable!() };
+            i.insert = Vec3::new(step.0 * k as f64, step.1 * k as f64, 0.0);
+            b.entities.push(block_entity(100 + k, Common::default(), EntityKind::Insert(i)));
+        }
+        d.blocks.insert(name.into(), std::sync::Arc::new(b));
+    }
+    for k in 0..20 {
+        let EntityKind::Insert(mut i) = insert_of("Grid") else { unreachable!() };
+        i.insert = Vec3::new(f64::from(k) * 2000.0, 0.0, 0.0);
+        d.add(&Space::Model, Common::default(), EntityKind::Insert(i)).unwrap();
+    }
+    let t = std::time::Instant::now();
+    let n = count_space(&d, &Space::Model, false);
+    println!("count {n} in {:?}", t.elapsed());
+    let t = std::time::Instant::now();
+    let l = build(&d, &Space::Model, &uncapped());
+    let held = l.prims.len() * std::mem::size_of::<DPrim>() + (l.verts.len() + l.tris.len()) * 16;
+    println!("built expanded {} prims {} held {} MB in {:?}, {:.1} bytes per expanded", l.expanded, l.prims.len(), held >> 20, t.elapsed(), held as f64 / l.expanded as f64);
+    let t = std::time::Instant::now();
+    let l = build(&d, &Space::Model, &Options::default());
+    println!("built at the limit: expanded {} (limit {}) prims {} in {:?}", l.expanded, MAX_BLOCK_EXPANSION, l.prims.len(), t.elapsed());
+}

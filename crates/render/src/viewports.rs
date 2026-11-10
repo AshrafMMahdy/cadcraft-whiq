@@ -79,34 +79,12 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
     if b.list.expanded >= b.opts.max_block_expansion || !vp.on {
         return;
     }
-    let center = vp.center.xy();
-    let ok = |v: f64| v.is_finite() && v > 0.0;
-    if !(ok(vp.width) && ok(vp.height) && ok(vp.view_height) && center.is_finite() && vp.view_center.is_finite()) {
-        return;
-    }
-    let s = vp.height / vp.view_height;
-    if !ok(s) {
-        return;
-    }
-    let xf = Mat3::translate(center).then_before(Mat3::scale(s, s)).then_before(Mat3::translate(-vp.view_center));
-    let mhalf = Vec2::new(area.width(), area.height()) / (2.0 * s);
-    let mcenter = vp.view_center + (area.center() - center) / s;
-    // Model window with slack: entity bounds are approximate (text, dimensions).
-    let win = Bounds2::new(mcenter - mhalf, mcenter + mhalf).expand(mhalf.x.max(mhalf.y) * 0.1);
+    let Some(View { s, xf, win }) = View::of(vp, area) else { return };
     // PSLTSCALE on: model-space dashes are scaled so they measure the same on paper as in
     // paper space, whatever the viewport scale.
     let lt_factor = if d.header.i64("PSLTSCALE", 1) != 0 { 1.0 / s } else { 1.0 };
     let ctx = || Ctx { lt_factor, ..top_ctx(d, xf, VIEWPORT_CONTENT, &vp.frozen_layers, &vp.layer_colors) };
-    let seen = |me: &Entity| {
-        if matches!(me.kind, EntityKind::Viewport(_)) {
-            return false;
-        }
-        if matches!(me.kind, EntityKind::Ray(_) | EntityKind::XLine(_)) {
-            return true;
-        }
-        let eb = cadcraft_doc::entity_bounds(d, me, 0);
-        eb.is_empty() || eb.intersects(&win)
-    };
+    let seen = |me: &Entity| model_seen(d, &win, me);
     // One expansion budget for the whole build: seed it with what the enclosing list has already
     // spent so a viewport's contents cannot start over with a fresh allowance and exceed the
     // documented limit (CWE-400). Both the serial sub-builder and the parallel chunks share it.
@@ -175,6 +153,72 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
     pen::apply(&mut sub.list, unit_mm);
     b.list.expanded = b.list.expanded.saturating_add(sub.list.expanded);
     append_clipped(&mut b.list, &sub.list, clip);
+}
+
+/// A viewport's scale, model-to-paper transform and the model window it shows (with slack: entity
+/// bounds are approximate, text and dimensions especially), for the part `area` of it (paper
+/// units). `None` for an unusable size, centre or scale.
+struct View {
+    s: f64,
+    xf: Mat3,
+    win: Bounds2,
+}
+
+impl View {
+    fn of(vp: &cadcraft_doc::Viewport, area: Bounds2) -> Option<View> {
+        let center = vp.center.xy();
+        let ok = |v: f64| v.is_finite() && v > 0.0;
+        if !(ok(vp.width) && ok(vp.height) && ok(vp.view_height) && center.is_finite() && vp.view_center.is_finite()) {
+            return None;
+        }
+        let s = vp.height / vp.view_height;
+        if !ok(s) {
+            return None;
+        }
+        let xf = Mat3::translate(center).then_before(Mat3::scale(s, s)).then_before(Mat3::translate(-vp.view_center));
+        let mhalf = Vec2::new(area.width(), area.height()) / (2.0 * s);
+        let mcenter = vp.view_center + (area.center() - center) / s;
+        let win = Bounds2::new(mcenter - mhalf, mcenter + mhalf).expand(mhalf.x.max(mhalf.y) * 0.1);
+        Some(View { s, xf, win })
+    }
+}
+
+/// Whether model-space `me` is built for a viewport showing `win`: rays and infinite lines always,
+/// other objects when their bounds reach into it (and no viewports).
+fn model_seen(d: &Drawing, win: &Bounds2, me: &Entity) -> bool {
+    if matches!(me.kind, EntityKind::Viewport(_)) {
+        return false;
+    }
+    if matches!(me.kind, EntityKind::Ray(_) | EntityKind::XLine(_)) {
+        return true;
+    }
+    let eb = cadcraft_doc::entity_bounds(d, me, 0);
+    eb.is_empty() || eb.intersects(win)
+}
+
+/// The block expansions the layout viewport `e` asks for (see [`super::count`]): what
+/// [`viewport`] builds, counted.
+pub(crate) fn count_viewport(d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewport, plotting: bool) -> u64 {
+    if !viewport_shown(d, e, vp) || !vp.on {
+        return 0;
+    }
+    let poly = viewport_clip(d, e.handle, vp);
+    let area = match &poly {
+        Some(p) => Some(p.bounds()),
+        None => viewport_rect(vp),
+    };
+    let Some(View { s, win, .. }) = area.and_then(|a| View::of(vp, a)) else { return 0 };
+    let mut counter = super::count::Counter::new(d, plotting, &vp.frozen_layers);
+    let all = d.anno_all_visible();
+    d.model
+        .iter()
+        .filter(|me| model_seen(d, &win, me))
+        .map(|me| {
+            let hidden = cadcraft_doc::is_annotative(me)
+                && matches!(cadcraft_doc::anno_draw(me, 1.0 / s.max(1e-12), all), cadcraft_doc::AnnoDraw::Hidden);
+            counter.top(me, hidden)
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// The clip region of a clipped viewport: the outline of its clip boundary entity, when that

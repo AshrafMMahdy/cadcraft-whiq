@@ -217,6 +217,38 @@ fn window(v: Option<&Value>) -> Option<Bounds2> {
 
 /// Plot with JSON options (the engine's `plot` hook).
 pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
+    plot_with_blocks(d, space, opts).map(|p| p.bytes)
+}
+
+/// The block contents one plotted sheet needed and drew (see [`cadcraft_render::MAX_BLOCK_EXPANSION`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SheetBlocks {
+    /// The sheet: `Model` or the layout's name.
+    pub sheet: String,
+    /// Block expansions the sheet asks for, counted from the block table before it was built.
+    pub total: u64,
+    /// What the build counted of them: above [`cadcraft_render::MAX_BLOCK_EXPANSION`] the contents
+    /// past it were not drawn.
+    pub expanded: usize,
+}
+
+impl SheetBlocks {
+    /// Whether block contents were left out of the sheet because of the limit.
+    pub fn truncated(&self) -> bool {
+        self.total > cadcraft_render::MAX_BLOCK_EXPANSION as u64
+    }
+}
+
+/// A plotted file and what each of its sheets did with block contents.
+#[derive(Clone, Debug)]
+pub struct Plotted {
+    pub bytes: Vec<u8>,
+    /// One entry per sheet, in page order.
+    pub blocks: Vec<SheetBlocks>,
+}
+
+/// [`plot`] that also says, per sheet, how many block expansions it needed and drew.
+pub fn plot_with_blocks(d: &Drawing, space: &Space, opts: &Value) -> Result<Plotted> {
     validate_plot_offset_json(opts)?;
     // `layouts: [name | "Model"] | "all"` plots those sheets into one file, one page each,
     // instead of `space`; "all" = Model if it has objects, then the layouts in tab order.
@@ -243,7 +275,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                 Ok((Space::Model, po))
             })
             .collect::<Result<Vec<_>>>()?;
-        return pdf_items(d, &items, &o);
+        return pdf_items_with_blocks(d, &items, &o);
     }
     match opts.get("layouts") {
         Some(Value::String(a)) if a.eq_ignore_ascii_case("all") => {
@@ -251,7 +283,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
             layouts.sort_by_key(|l| l.tab_order);
             let model = (!d.model.is_empty()).then_some(Space::Model);
             let spaces: Vec<Space> = model.into_iter().chain(layouts.iter().map(|l| Space::Paper(l.name.clone()))).collect();
-            pdf_sheets(d, &spaces, &o)
+            pdf_sheets_with_blocks(d, &spaces, &o)
         }
         Some(v) => {
             let names = v.as_array().ok_or_else(|| IoError::Format("`layouts` must be a list of layout names".into()))?;
@@ -266,9 +298,9 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
                     None => Err(IoError::Format("`layouts` must be a list of layout names".into())),
                 })
                 .collect::<Result<Vec<_>>>()?;
-            pdf_sheets(d, &spaces, &o)
+            pdf_sheets_with_blocks(d, &spaces, &o)
         }
-        None => pdf(d, space, &o),
+        None => pdf_sheets_with_blocks(d, std::slice::from_ref(space), &o),
     }
 }
 
@@ -357,14 +389,22 @@ fn sheet_name(space: &Space) -> String {
 /// Write a vector PDF with one page per space (at most [`MAX_PAGES`]), each labelled with its
 /// layout name. The options apply to every sheet; layouts use their own page setups.
 pub fn pdf_sheets(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Vec<u8>> {
+    pdf_sheets_with_blocks(d, spaces, o).map(|p| p.bytes)
+}
+
+fn pdf_sheets_with_blocks(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Plotted> {
     let items: Vec<(Space, PdfOptions)> = spaces.iter().take(MAX_PAGES + 1).map(|s| (s.clone(), o.clone())).collect();
-    pdf_items(d, &items, o)
+    pdf_items_with_blocks(d, &items, o)
 }
 
 /// Write a vector PDF with one page per `(space, options)` item (at most [`MAX_PAGES`]): each
 /// page plots with its own options (window, paper, orientation); `o` supplies the file-wide
 /// ones (compression, title, layers, links).
 pub fn pdf_items(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<Vec<u8>> {
+    pdf_items_with_blocks(d, items, o).map(|p| p.bytes)
+}
+
+fn pdf_items_with_blocks(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<Plotted> {
     if items.iter().any(|(_, io)| io.offset.is_some_and(|offset| !valid_plot_offset(offset))) {
         return Err(IoError::Format("plot offset must contain two finite values within ±100000 mm".into()));
     }
@@ -421,7 +461,7 @@ impl Failure {
 
 /// Write the file, one sheet at a time: each sheet's display list is built, written as its page
 /// and dropped before the next.
-fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as_geometry: bool) -> std::result::Result<Vec<u8>, Failure> {
+fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as_geometry: bool) -> std::result::Result<Plotted, Failure> {
     write::guard(|| {
         // Layers that are off plot on PDF layers that start hidden: draw them from a copy with
         // them on.
@@ -453,8 +493,10 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
         let mut writer = Writer::new(settings, metadata);
         let mut fonts = fonts::Fonts::new(!text_as_geometry);
         let mut groups = Groups::default();
+        let mut blocks = Vec::new();
         for (s, po) in items {
             let page = sheet(drawn, s, po, &links)?;
+            blocks.push(SheetBlocks { sheet: page.label.clone(), total: page.blocks_total, expanded: page.list.expanded });
             let doc = writer.document_mut();
             // Groups are added to the document, so they must exist before the page starts.
             groups.add(doc, d, &page.layers);
@@ -463,7 +505,7 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
         if items.len() == 1 && !groups.ids.is_empty() {
             writer.document_mut().set_optional_content_page_mode(true);
         }
-        Ok(writer.finish()?)
+        Ok(Plotted { bytes: writer.finish()?, blocks })
     })
 }
 
@@ -506,6 +548,8 @@ struct SheetPage {
     links: Vec<(Bounds2, String)>,
     /// Page label: the layout name.
     label: String,
+    /// Block expansions the sheet asks for ([`cadcraft_render::count_space`]).
+    blocks_total: u64,
 }
 
 /// Plot one space.
@@ -538,6 +582,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     let tolerance = if tol.is_finite() && tol > 0.0 { tol } else { ropts.tolerance };
     // Relative point sizes follow the plotted window (else the extents).
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
+    let blocks_total = cadcraft_render::count_space(d, space, true);
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
     let b = window.unwrap_or(list.bounds);
     let s = plot_scale(&b, &sheet, fit, o.scale);
@@ -567,7 +612,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         }
     }
     let links = links(&list, &map, &clip_pt, links_to);
-    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space) })
+    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space), blocks_total })
 }
 
 /// Source and destination origins for the shared model-space PDF/PNG placement behavior.

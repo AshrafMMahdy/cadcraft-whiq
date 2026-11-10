@@ -253,6 +253,46 @@ pub fn build_slice(d: &Drawing, ents: &[&Entity], opts: &Options, expanded: usiz
     b.list
 }
 
+/// The block expansions building the loose entities `ents` asks for ([`DisplayList::expanded`] of
+/// a build with no limit), counted from the block table without building: what [`build_entities`]
+/// and [`build_slice`] (`plotting` false) or the plot's top-level objects (`plotting` true) will
+/// take from [`Options::max_block_expansion`]. Saturates at `u64::MAX`.
+pub fn count_expansions<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents: I, plotting: bool) -> u64 {
+    let mut counter = super::count::Counter::new(d, plotting, &[]);
+    ents.into_iter().map(|e| counter.top(e, hidden_by_scale(d, e))).fold(0, u64::saturating_add)
+}
+
+/// The block expansions [`build`] (`plotting` false) or [`build_plot`] (`plotting` true) of `space`
+/// asks for: the entities' own and, for a layout, those of each viewport's model-space contents.
+/// Counted from the block table without building; see [`count_expansions`].
+pub fn count_space(d: &Drawing, space: &Space, plotting: bool) -> u64 {
+    let Some(store) = d.space(space) else { return 0 };
+    if !matches!(space, Space::Paper(_)) {
+        return count_expansions(d, store.iter().map(|e| e.as_ref()), plotting);
+    }
+    let mut counter = super::count::Counter::new(d, plotting, &[]);
+    let mut viewports = 0usize;
+    let mut n = 0u64;
+    for e in store.iter() {
+        let more = if let EntityKind::Viewport(vp) = &e.kind {
+            if viewports >= MAX_VIEWPORTS {
+                continue;
+            }
+            viewports += 1;
+            super::viewports::count_viewport(d, e, vp, plotting)
+        } else {
+            counter.top(e, hidden_by_scale(d, e))
+        };
+        n = n.saturating_add(more);
+    }
+    n
+}
+
+/// Whether the drawing's annotation scale hides the annotative top-level object `e`.
+fn hidden_by_scale(d: &Drawing, e: &Entity) -> bool {
+    cadcraft_doc::is_annotative(e) && matches!(d.anno_draw(e), cadcraft_doc::AnnoDraw::Hidden)
+}
+
 /// After a viewport is appended to a plot: the layers its contents carry in their handles
 /// (see [`entity`]) go to [`DisplayList::prim_layers`], and the handles back to
 /// [`VIEWPORT_CONTENT`]. The viewport's border was tagged when it was drawn.

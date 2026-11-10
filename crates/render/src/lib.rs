@@ -302,6 +302,7 @@ mod table;
 pub use table::{MAX_LAYOUT_CELLS, TableFill, TableGeom, TableLine, TableText, table_covered, table_geometry, table_style_of};
 
 mod blocks;
+mod count;
 mod dim_draw;
 mod display;
 mod draw;
@@ -312,7 +313,7 @@ mod viewports;
 
 pub use dim_draw::{dim_text, dimension_in};
 pub use display::{DPrim, DisplayList, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
-pub use pipeline::{Options, build, build_entities, build_plot, build_slice};
+pub use pipeline::{Options, build, build_entities, build_plot, build_slice, count_expansions, count_space};
 use props::{default_lineweight, resolve_common};
 use text_entity::text_style;
 pub use text_entity::{layout_mtext_entity, place_text_entity, text_align};

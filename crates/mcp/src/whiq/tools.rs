@@ -77,7 +77,7 @@ pub fn definitions() -> Vec<Value> {
                 "space": space, "layer": {"type": ["string", "array"]}, "window": window, "expand_blocks": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1}, "format": {"type": "string", "enum": ["json", "markdown"]}},
                 "required": ["query"]},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first.",
+        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every answer says blocks_expanded_total, and past the limit blocks_truncated, blocks_not_drawn and ways_through. A window or a tile is a build of its own that expands only the objects reaching it, so a drawing with more block content than that comes whole as tiles (tiles with output, one file each) or as layer passes (layers_off / only_layers); a layout is built whole, so draw the model space its viewports show (viewport: handle) in tiles instead.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "path": {"type": "string", "description": "Open this drawing first"},
                 "space": {"type": "string"}, "viewport": {"type": ["string", "integer"]}, "window": window,
                 "tiles": {"type": ["object", "array", "integer"]}, "tile": {"type": "array"},
@@ -86,7 +86,7 @@ pub fn definitions() -> Vec<Value> {
                 "background": {"type": "string", "enum": ["light", "dark"]}, "lineweights": {"type": "boolean"},
                 "output": {"type": "string", "description": "Write the SVG/PNG file(s) here (tiles get -c<col>r<row>) instead of answering them"}}},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG of model space is written in slices as it is made; a paper-space layout is still built whole in memory before it is written.",
+        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG of model space is written in slices as it is made; a paper-space layout is still built whole in memory before it is written. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every svg / png / pdf answer says blocks_expanded_total, and past the limit blocks_truncated, blocks_not_drawn and ways_through (a PDF sheet is one build of the whole space, its window only places it on the page). Ways through: export svg / png once per window (a window expands only the objects reaching it, each export is its own build), or layers_off / only_layers for a pass per layer set.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "source": {"type": "string", "description": "Open this drawing first"}, "path": {"type": "string", "description": "The file to write (its extension picks the format)"},
                 "format": {"type": "string", "enum": ["dxf", "dwg", "pdf", "svg", "png"]}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"},
                 "space": {"type": ["string", "array"], "description": "model (default), a layout, a list, or all"}, "window": window,
@@ -462,12 +462,12 @@ impl Engine {
                 ctx.check()?;
                 let mut t = json!({"tile": cr, "window": preview::win_value(win)});
                 let (bytes, mime, ext, info): (Vec<u8>, &str, &str, Value) = if png {
-                    let (b, w, h, expanded) = preview::png(&prep, win, width, height, dark, ctx)?;
-                    (b, "image/png", "png", merged(json!({"width": w, "height": h}), prep.blocks_note(expanded)))
+                    let (b, w, h, _) = preview::png(&prep, win, width, height, dark, ctx)?;
+                    (b, "image/png", "png", merged(json!({"width": w, "height": h}), prep.blocks_note(win)))
                 } else {
                     let list = prep.list_for(win, f64::from(width), ctx)?;
                     let (svg, n) = preview::svg_tile(&list, &prep.layers, win, f64::from(width), dark, ctx)?;
-                    (svg.into_bytes(), "image/svg+xml", "svg", merged(json!({"primitives": n}), prep.blocks_note(list.expanded)))
+                    (svg.into_bytes(), "image/svg+xml", "svg", merged(json!({"primitives": n}), prep.blocks_note(win)))
                 };
                 if let Value::Object(o) = info {
                     for (kk, vv) in o {
@@ -609,12 +609,12 @@ impl Engine {
                     }
                     _ => {}
                 }
-                let bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cadcraft_io::pdf::plot(d, &space, &Value::Object(o))))
+                let plotted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cadcraft_io::plot_with_blocks(d, &space, &Value::Object(o))))
                     .map_err(|_| ToolError::new(code::FAILED, "the PDF writer failed on this drawing", "try one layout, or a window"))?
                     .map_err(|e| ToolError::new(code::INVALID_ARGUMENT, e.to_string(), "check space, paper, scale and window"))?;
                 let p = ctx.resolve(&file.to_string_lossy(), Access::Write)?;
-                let kept = write_file(&p, &bytes, policy)?;
-                saved.push(saved_entry(ctx.roots(), &p, bytes.len(), "pdf", kept.as_ref()));
+                let kept = write_file(&p, &plotted.bytes, policy)?;
+                saved.push(merged(saved_entry(ctx.roots(), &p, plotted.bytes.len(), "pdf", kept.as_ref()), Some(preview::pdf_blocks_note(&plotted.blocks))));
             }
             "svg" | "png" => {
                 let sp = match a.get("space") {
@@ -645,11 +645,11 @@ impl Engine {
                             // Written as it is made (display list slice by slice) through the same
                             // atomic file write: a call that stops part way leaves nothing of it.
                             let wpx = f64::from(a.get("width").and_then(Value::as_u64).map_or(1600, |w| u32::try_from(w).unwrap_or(1600)));
-                            let (kept, (size, expanded)) = write_file_with(&p, policy, |w| prep.write_svg(w, &prep.window, wpx, ctx))?;
-                            (kept, size, prep.blocks_note(expanded))
+                            let (kept, (size, _)) = write_file_with(&p, policy, |w| prep.write_svg(w, &prep.window, wpx, ctx))?;
+                            (kept, size, prep.blocks_note(&prep.window))
                         } else {
                             let w = a.get("width").and_then(Value::as_u64).map_or(2400, |w| u32::try_from(w).unwrap_or(2400));
-                            let (bytes, _, _, expanded) = preview::png(
+                            let (bytes, _, _, _) = preview::png(
                                 &prep,
                                 &prep.window,
                                 w,
@@ -657,7 +657,7 @@ impl Engine {
                                 false,
                                 ctx,
                             )?;
-                            (write_file(&p, &bytes, policy)?, bytes.len(), prep.blocks_note(expanded))
+                            (write_file(&p, &bytes, policy)?, bytes.len(), prep.blocks_note(&prep.window))
                         };
                         let mut e = merged(saved_entry(ctx.roots(), &p, size, &fmt, kept.as_ref()), note);
                         e["space"] = json!(name);
@@ -1605,34 +1605,76 @@ mod tests {
             let mut out = Vec::new();
             let (n, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
             assert_eq!(n, out.len());
-            assert!(expanded > 0 && prep.blocks_note(expanded).is_none());
+            let note = prep.blocks_note(&prep.window).unwrap();
+            assert!(expanded > 0 && note["blocks_expanded_total"] == json!(expanded), "{note}");
+            assert!(note.get("blocks_truncated").is_none() && note.get("ways_through").is_none());
             assert!(String::from_utf8(out).unwrap() == whole, "slice of {slice} entities");
         }
     }
 
-    /// Past the block-expansion cap the export says so in words, with the number expanded; under
-    /// it the answer has nothing to add. The same SVG comes out of every slice size.
+    /// Past the block-expansion cap the answer says so in words: how many expansions the drawing
+    /// needs (counted up front), how many were not drawn and the ways through, and those ways work:
+    /// a window that needs fewer than the cap is drawn whole. Under the cap the answer only gives
+    /// the count. The same SVG comes out of every slice size.
     #[test]
-    fn passing_the_block_cap_is_reported() {
+    fn passing_the_block_cap_is_reported_with_the_ways_through() {
         let (e, c) = many_entities();
         let d = e.docs.list[0].drawing().unwrap();
         let mut prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
+        // 700 references to a block of two entities: each is the copy and its two entities.
+        let total = prep.expansions(&prep.window);
+        assert_eq!(total, 700 * 3);
         prep.block_cap = 300;
         let mut first = None;
         for slice in [1, 512, preview::SLICE_ENTITIES] {
             let mut out = Vec::new();
             let (_, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
-            let note = prep.blocks_note(expanded).unwrap_or_else(|| panic!("expanded {expanded}"));
+            assert!(expanded > 300);
+            let note = prep.blocks_note(&prep.window).unwrap();
             assert_eq!(note["blocks_truncated"], json!(true));
             assert_eq!(note["blocks_expanded"], json!(300));
-            assert_eq!(note["warning"], json!("block contents past 300 expanded entities were not drawn"));
+            assert_eq!(note["blocks_expanded_total"], json!(2100));
+            assert_eq!(note["blocks_not_drawn"], json!(1800));
+            let warning = note["warning"].as_str().unwrap();
+            assert!(warning.starts_with("block contents past 300 expanded entities were not drawn"), "{warning}");
+            let ways = note["ways_through"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect::<Vec<_>>().join("\n");
+            assert!(ways.contains("tiles {cols, rows}") && ways.contains("window [[x0, y0], [x1, y1]]") && ways.contains("layers_off"), "{ways}");
+            assert!(ways.contains("at least 7 windows") && ways.contains("2100"), "{ways}");
             let svg = String::from_utf8(out).unwrap();
             assert!(first.get_or_insert_with(|| svg.clone()) == &svg, "slice of {slice} entities");
         }
-        let mut entry = merged(json!({"path": "a.svg"}), prep.blocks_note(1_000));
+        // The way through: ten tiles each need under the cap and come out whole.
+        let tiles = preview::tiles(&prep.window, &json!({"tiles": {"cols": 10, "rows": 1}})).unwrap();
+        let mut sum = 0;
+        for (_, win) in &tiles {
+            let need = prep.expansions(win);
+            assert!(need <= 300, "{need}");
+            sum += need;
+            let note = prep.blocks_note(win).unwrap();
+            assert!(note.get("blocks_truncated").is_none(), "{note}");
+            let mut out = Vec::new();
+            let (_, expanded) = prep.write_svg(&mut out, win, 1600.0, &c).unwrap_or_else(|_| panic!("tile"));
+            assert_eq!(expanded as u64, need);
+        }
+        assert!(sum >= total);
+        // Another space and a PDF get their own ways.
+        let layout = preview::ways_through(300, 2100, preview::Through::Layout).join(" ");
+        assert!(layout.contains("viewport: <handle>") && layout.contains("does not reduce"), "{layout}");
+        let pdf = preview::pdf_blocks_note(&[
+            cadcraft_io::SheetBlocks { sheet: "Model".into(), total: 5, expanded: 5 },
+            cadcraft_io::SheetBlocks { sheet: "Layout1".into(), total: 2_500_000, expanded: 2_000_001 },
+        ]);
+        assert_eq!(pdf["blocks_truncated"], json!(true));
+        assert_eq!(pdf["blocks_expanded_total"], json!(2_500_000));
+        assert_eq!(pdf["blocks_not_drawn"], json!(500_000));
+        assert_eq!(pdf["blocks_truncated_sheets"], json!(["Layout1"]));
+        assert!(pdf["ways_through"][0].as_str().unwrap().contains("only places the drawing on the page"));
+        let fine = preview::pdf_blocks_note(&[cadcraft_io::SheetBlocks { sheet: "Model".into(), total: 12, expanded: 12 }]);
+        assert_eq!(fine, json!({"blocks_expanded_total": 12}));
+        let entry = merged(json!({"path": "a.svg"}), prep.blocks_note_for(1_000));
         assert_eq!(entry["blocks_truncated"], json!(true));
-        entry = merged(json!({"path": "a.svg"}), prep.blocks_note(300));
-        assert!(entry.get("blocks_truncated").is_none());
+        let entry = merged(json!({"path": "a.svg"}), prep.blocks_note_for(300));
+        assert!(entry.get("blocks_truncated").is_none() && entry["blocks_expanded_total"] == json!(300));
     }
 
     /// An SVG export that is stopped leaves nothing of itself: no file, no temporary file, and an

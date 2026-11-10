@@ -377,14 +377,43 @@ impl Prepared<'_> {
         }
     }
 
-    /// What an answer says when a build of `expanded` block contents passed the cap (and nothing
-    /// when it did not): the contents past the cap were not drawn.
-    pub fn blocks_note(&self, expanded: usize) -> Option<Value> {
+    /// The block expansions a build of `window` asks for (the arithmetic over the block table of
+    /// [`cadcraft_engine::render::count_space`], before anything is built): in model space those of
+    /// the objects that reach into the window, for a layout those of the whole layout.
+    pub fn expansions(&self, window: &Bounds2) -> u64 {
+        let d = self.drawing();
+        match &self.target.space {
+            Space::Model => {
+                let reach = window.expand(window.width().max(window.height()) * 1e-6);
+                cadcraft_engine::render::count_expansions(d, d.model.iter().map(|e| e.as_ref()).filter(|e| self.reaches(e, &reach)), false)
+            }
+            space => cadcraft_engine::render::count_space(d, space, false),
+        }
+    }
+
+    /// What every answer that draws says about block contents: how many expansions the build
+    /// asked for (`blocks_expanded_total`), and when that is past the limit what was not drawn and
+    /// the ways through ([`Prepared::blocks_note_for`]).
+    pub fn blocks_note(&self, window: &Bounds2) -> Option<Value> {
+        self.blocks_note_for(self.expansions(window))
+    }
+
+    /// [`Prepared::blocks_note`] for a build that asked for `total` expansions.
+    pub fn blocks_note_for(&self, total: u64) -> Option<Value> {
         let cap = self.block_cap;
-        (expanded > cap).then(|| {
-            json!({"blocks_truncated": true, "blocks_expanded": cap,
-                "warning": format!("block contents past {cap} expanded entities were not drawn")})
-        })
+        let mut note = json!({"blocks_expanded_total": total});
+        let over = total.saturating_sub(cap as u64);
+        if over > 0 {
+            let layout = !matches!(self.target.space, Space::Model);
+            note["blocks_truncated"] = json!(true);
+            note["blocks_expanded"] = json!(cap);
+            note["blocks_not_drawn"] = json!(over);
+            note["warning"] = json!(format!(
+                "block contents past {cap} expanded entities were not drawn: {over} of the {total} the drawing needs are missing from this picture"
+            ));
+            note["ways_through"] = json!(ways_through(cap, total, if layout { Through::Layout } else { Through::Model }));
+        }
+        Some(note)
     }
 
     /// Whether model-space `e` reaches into `reach` (rays and infinite lines always do).
@@ -500,6 +529,61 @@ impl Prepared<'_> {
         let expanded = self.each_list_sliced(window, width_px, ctx, slice, &mut |list| w.add(list, ctx))?;
         Ok((w.finish()?.2, expanded))
     }
+}
+
+/// Which picture ran past the block-expansion limit, for the ways through it.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Through {
+    /// SVG or PNG of model space (or a viewport's model view).
+    Model,
+    /// SVG or PNG of a layout.
+    Layout,
+    /// A PDF sheet.
+    Pdf,
+}
+
+/// The ways to get the whole drawing when a build needs `total` block expansions and the limit is
+/// `cap` per build, in words for the agent. Each is something the tools do today.
+pub fn ways_through(cap: usize, total: u64, kind: Through) -> Vec<String> {
+    let windows = total.div_ceil((cap as u64).max(1)).max(2);
+    let mut ways = Vec::new();
+    match kind {
+        Through::Model => ways.push(format!(
+            "draw it in windows: only objects whose extent reaches the window are expanded and the limit is per build, so a window (or tile) that needs {cap} or fewer is drawn whole. This drawing needs {total}, so use at least {windows} windows: render_preview with tiles {{cols, rows}} and output writes every tile to its own file (each tile's answer says its own blocks_expanded_total), or export svg / png with window [[x0, y0], [x1, y1]] once per region"
+        )),
+        Through::Layout => ways.push(format!(
+            "a layout is built whole, so a window does not reduce it. Draw the model space its viewports show instead: render_preview with viewport: <handle> (read_drawing section \"layouts\" lists them) and tiles or a window, one build per tile; each needs {cap} or fewer to be whole. The layout needs {total} in one build"
+        )),
+        Through::Pdf => ways.push(format!(
+            "a PDF sheet is one build of the whole space and its window only places the drawing on the page, it does not leave out the block references outside it. For the regions of the drawing write SVG or PNG: export svg / png with window [[x0, y0], [x1, y1]] per region, or render_preview with tiles and output. The sheet needs {total} in one build; {cap} is the most a build draws"
+        )),
+    }
+    ways.push(
+        "layers_off / layers_on / only_layers leave out the layers you do not need (block references on a switched-off layer are not expanded), e.g. the trees on one pass and the rest on another".to_string(),
+    );
+    ways.push(format!(
+        "one file of the whole drawing needs {total} expansions in one build and {cap} is the most one build draws, so the whole drawing comes as several files (windows or layer passes), not one"
+    ));
+    ways
+}
+
+/// What a PDF export's answer says about block contents: the largest sheet's expansions asked for
+/// and, when any sheet passed the limit, which sheets, how much was not drawn and the ways through.
+pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
+    let cap = cadcraft_engine::render::MAX_BLOCK_EXPANSION;
+    let most = blocks.iter().map(|b| b.total).max().unwrap_or(0);
+    let mut note = json!({"blocks_expanded_total": most});
+    let cut: Vec<&cadcraft_io::SheetBlocks> = blocks.iter().filter(|b| b.truncated()).collect();
+    if !cut.is_empty() {
+        let over: u64 = cut.iter().map(|b| b.total - cap as u64).sum();
+        note["blocks_truncated"] = json!(true);
+        note["blocks_expanded"] = json!(cap);
+        note["blocks_not_drawn"] = json!(over);
+        note["blocks_truncated_sheets"] = json!(cut.iter().map(|b| b.sheet.clone()).collect::<Vec<_>>());
+        note["warning"] = json!(format!("block contents past {cap} expanded entities were not drawn on the sheets listed: {over} expansions are missing"));
+        note["ways_through"] = json!(ways_through(cap, most, Through::Pdf));
+    }
+    note
 }
 
 pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>, ToolError> {

@@ -63,3 +63,52 @@ fn ordinary_nested_and_arrayed_blocks_are_drawn_whole() {
     assert!(matches!(d.model.iter().next().map(|e| &e.kind), Some(EntityKind::Insert(_))));
     assert_eq!(build(&d, &Space::Model, &Options::default()).prims.len(), cadcraft_doc::MAX_BLOCK_DEPTH);
 }
+
+/// A survey of the block expansions real drawings ask for, counted from the block table, and the
+/// bytes their display lists hold per expanded entity when the count is small enough to build:
+/// `BLOCK_SURVEY=/dir1:/dir2 cargo test -p cadcraft-io --test it block_survey -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn block_survey() {
+    use cadcraft_render::{DPrim, count_space};
+    let Ok(dirs) = std::env::var("BLOCK_SURVEY") else { return };
+    let mut files = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = dirs.split(':').map(Into::into).collect();
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            stack.extend(std::fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
+        } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dxf") || e.eq_ignore_ascii_case("dwg")) {
+            files.push(p);
+        }
+    }
+    files.sort();
+    for f in files {
+        let Ok(bytes) = std::fs::read(&f) else { continue };
+        let Ok(Ok(d)) = std::panic::catch_unwind(|| cadcraft_io::read(&bytes, &f)) else { continue };
+        let model = count_space(&d, &Space::Model, false);
+        let layouts: u64 = d.layouts.iter().map(|l| count_space(&d, &Space::Paper(l.name.clone()), false)).max().unwrap_or(0);
+        let mut line = format!("{} entities {} blocks {} model {model} layout {layouts}", f.display(), d.model.len(), d.blocks.len());
+        if model > 0 && model <= 300_000 {
+            let l = build(&d, &Space::Model, &Options::default());
+            let held = l.prims.len() * std::mem::size_of::<DPrim>() + (l.verts.len() + l.tris.len()) * 16;
+            line += &format!(" built {} prims {} bytes {} per_expanded {:.0}", l.expanded, l.prims.len(), held, held as f64 / l.expanded.max(1) as f64);
+        }
+        println!("{line}");
+    }
+}
+
+/// A PDF plot says per sheet how many block expansions it needed (counted before building) and
+/// drew; under the limit nothing is truncated, and the count is the build's.
+#[test]
+fn a_pdf_plot_reports_its_block_expansions() {
+    let d = read(&minsert(3, 2));
+    let plotted = cadcraft_io::plot_with_blocks(&d, &Space::Model, &serde_json::json!({})).unwrap();
+    assert!(plotted.bytes.starts_with(b"%PDF"));
+    // Six copies, each the copy itself and its one line.
+    assert_eq!(plotted.blocks, vec![cadcraft_io::SheetBlocks { sheet: "Model".into(), total: 12, expanded: 12 }]);
+    assert!(!plotted.blocks[0].truncated());
+    assert_eq!(cadcraft_io::plot(&d, &Space::Model, &serde_json::json!({})).unwrap().len(), plotted.bytes.len());
+    // Past the limit: the count says how many were asked for and `truncated` says contents were left out.
+    let big = cadcraft_io::SheetBlocks { sheet: "Model".into(), total: MAX_BLOCK_EXPANSION as u64 + 1, expanded: MAX_BLOCK_EXPANSION + 1 };
+    assert!(big.truncated());
+}
