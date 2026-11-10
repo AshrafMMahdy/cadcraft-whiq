@@ -249,8 +249,12 @@ whole) and does not advise windows. Routes that work today, each proved by a tes
    before, none after). Exploding a MINSERT gives one copy only, so for a MINSERT: erase it, insert the block once and
    run `arrayrect {handles, rows, cols, rowSpacing, colSpacing, axisAngle: rotation, associative: false}`, which makes
    every copy a separate reference (`a_minsert_over_the_limit_is_named_and_the_route_named_works`: 30 x 30, also
-   rotated 30 degrees: same primitives and bounds, tiles complete). Both edits change the open document in memory
-   only until `save_drawing`; the edit op `undo` or `close_drawing` with `discard: true` takes them back.
+   rotated 30 degrees: same primitives and bounds, tiles complete). Both edits change the customer's open document in
+   memory, so the answer says in the same sentence that they are ONLY to draw the picture: do them, draw, then take
+   them back with exactly 1 undo step (explode) or 3 (delete, insert, arrayrect; `edit {ops: [{op: "undo"}, ...]}`),
+   or `close_drawing` with `discard: true`, and never `save_drawing` with them in place unless the user asked for
+   the drawing itself to be changed (the tests undo and compare the drawing with the original). There is no copy
+   route: `open_drawing` of a file already open returns the same handle, so no second handle on the file exists.
 3. *Reading* (`read_drawing`, `search_drawing`, measuring, extents) does not expand blocks, so the information stays
    reachable.
 
