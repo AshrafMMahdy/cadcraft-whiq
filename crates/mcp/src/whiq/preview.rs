@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use cadcraft_engine::doc::{Drawing, Entity, EntityKind, Handle, Space};
 use cadcraft_engine::geom::{Bounds2, Vec2};
-use cadcraft_engine::render::{DisplayList, Kind};
+use cadcraft_engine::render::{BlockCensus, COUNT_SATURATED, DisplayList, Kind};
 use serde_json::{Value, json};
 
 use super::contract::{ToolError, code};
@@ -355,6 +355,9 @@ pub struct Prepared<'a> {
     lineweights: bool,
     /// Block contents expanded before the rest are not drawn (a test lowers it).
     pub block_cap: usize,
+    /// What counting a layout's block expansions found: the whole layout is built for every tile,
+    /// so it is counted once per call.
+    layout_census: std::cell::OnceCell<BlockCensus>,
 }
 
 impl Prepared<'_> {
@@ -377,43 +380,64 @@ impl Prepared<'_> {
         }
     }
 
-    /// The block expansions a build of `window` asks for (the arithmetic over the block table of
-    /// [`cadcraft_engine::render::count_space`], before anything is built): in model space those of
-    /// the objects that reach into the window, for a layout those of the whole layout.
-    pub fn expansions(&self, window: &Bounds2) -> u64 {
+    /// What a build of `window` asks for of block contents, counted from the block table (the
+    /// arithmetic of [`cadcraft_engine::render::census_entities`]), with the largest object, the
+    /// layers the references are on and the arrays drawn short: in model space for the objects that
+    /// reach into the window (`picked` when the caller already has them), for a layout the whole
+    /// layout (once per call). Stops with an error when the call is cancelled.
+    pub fn census(&self, window: &Bounds2, picked: Option<&[&Entity]>, ctx: &Ctx) -> Result<BlockCensus, ToolError> {
         let d = self.drawing();
-        match &self.target.space {
-            Space::Model => {
-                let reach = window.expand(window.width().max(window.height()) * 1e-6);
-                cadcraft_engine::render::count_expansions(d, d.model.iter().map(|e| e.as_ref()).filter(|e| self.reaches(e, &reach)), false)
-            }
-            space => cadcraft_engine::render::count_space(d, space, false),
-        }
+        let opts = self.options(window, 1600.0, ctx);
+        let c = match &self.target.space {
+            Space::Model => match picked {
+                Some(p) => cadcraft_engine::render::census_entities(d, p, false, &opts),
+                None => cadcraft_engine::render::census_entities(d, &self.pick(window, ctx)?, false, &opts),
+            },
+            space => self.layout_census.get_or_init(|| cadcraft_engine::render::census_space(d, space, false, &opts)).clone(),
+        };
+        ctx.check()?;
+        Ok(c)
     }
 
-    /// What every answer that draws says about block contents: how many expansions the build
-    /// asked for (`blocks_expanded_total`), and when that is past the limit what was not drawn and
-    /// the ways through ([`Prepared::blocks_note_for`]).
-    pub fn blocks_note(&self, window: &Bounds2) -> Option<Value> {
-        self.blocks_note_for(self.expansions(window))
+    /// The block expansions a build of `window` asks for (the number of [`Prepared::census`]).
+    pub fn expansions(&self, window: &Bounds2, ctx: &Ctx) -> Result<u64, ToolError> {
+        Ok(self.census(window, None, ctx)?.total)
     }
 
-    /// [`Prepared::blocks_note`] for a build that asked for `total` expansions.
-    pub fn blocks_note_for(&self, total: u64) -> Option<Value> {
+    /// What every answer that draws says about block contents: the expansions the build took
+    /// (`built`, the build's own count: `DisplayList::expanded`), and when that is past the limit
+    /// the count of what the drawing asks for, what was not drawn and the ways through; arrays
+    /// drawn short are named ([`Prepared::blocks_note_for`]).
+    pub fn blocks_note(&self, window: &Bounds2, built: usize, picked: Option<&[&Entity]>, ctx: &Ctx) -> Result<Option<Value>, ToolError> {
+        let census = self.census(window, picked, ctx)?;
+        Ok(Some(self.blocks_note_for(built, &census)))
+    }
+
+    /// [`Prepared::blocks_note`] for a build that took `built` expansions and a count `census`.
+    /// The build is the ground truth: `blocks_truncated` is true only when its own count went past
+    /// the limit, and a build that drew everything gives its own figure as the total. Past the
+    /// limit the build stops, so the total is the count (never below what the build took).
+    pub fn blocks_note_for(&self, built: usize, census: &BlockCensus) -> Value {
         let cap = self.block_cap;
-        let mut note = json!({"blocks_expanded_total": total});
-        let over = total.saturating_sub(cap as u64);
-        if over > 0 {
-            let layout = !matches!(self.target.space, Space::Model);
+        let truncated = built > cap;
+        let total = if truncated { census.total.max(built as u64) } else { built as u64 };
+        let mut note = json!({"blocks_expanded_total": count_value(total)});
+        if truncated {
+            let not_drawn = if total == COUNT_SATURATED { total } else { total.saturating_sub(cap as u64) };
             note["blocks_truncated"] = json!(true);
             note["blocks_expanded"] = json!(cap);
-            note["blocks_not_drawn"] = json!(over);
-            note["warning"] = json!(format!(
-                "block contents past {cap} expanded entities were not drawn: {over} of the {total} the drawing needs are missing from this picture"
-            ));
-            note["ways_through"] = json!(ways_through(cap, total, if layout { Through::Layout } else { Through::Model }));
+            note["blocks_not_drawn"] = count_value(not_drawn);
+            note["warning"] = json!(if total == COUNT_SATURATED {
+                format!("block contents past {cap} expanded entities were not drawn: the drawing needs {UNCOUNTABLE}")
+            } else {
+                format!("block contents past {cap} expanded entities were not drawn: {not_drawn} of the {total} the drawing needs are missing from this picture")
+            });
+            let kind = if matches!(self.target.space, Space::Model) { Through::Model } else { Through::Layout };
+            note["ways_through"] = json!(ways_through(cap, total, kind, census));
+            truncated_fields(&mut note, cap, census);
         }
-        Some(note)
+        clamped_fields(&mut note, census);
+        note
     }
 
     /// Whether model-space `e` reaches into `reach` (rays and infinite lines always do).
@@ -424,33 +448,41 @@ impl Prepared<'_> {
         }
     }
 
+    /// The model-space objects a build of `window` takes: those that reach into it (infinite lines
+    /// always). Empty for a layout, which is built whole.
+    pub fn pick(&self, window: &Bounds2, ctx: &Ctx) -> Result<Vec<&Entity>, ToolError> {
+        let mut picked = Vec::new();
+        if !matches!(self.target.space, Space::Model) {
+            return Ok(picked);
+        }
+        let reach = window.expand(window.width().max(window.height()) * 1e-6);
+        for (k, e) in self.drawing().model.iter().enumerate() {
+            if k % 65_536 == 0 {
+                ctx.check()?;
+            }
+            if self.reaches(e, &reach) {
+                picked.push(e.as_ref());
+            }
+        }
+        Ok(picked)
+    }
+
     /// The display list of `window` drawn `width_px` wide: curves as fine as an eighth of a pixel
     /// (room to zoom in on the SVG), and in model space only the objects that reach into the
     /// window (infinite lines always).
     pub fn list_for(&self, window: &Bounds2, width_px: f64, ctx: &Ctx) -> Result<DisplayList, ToolError> {
+        let picked = self.pick(window, ctx)?;
+        self.list_of(&picked, window, width_px, ctx)
+    }
+
+    /// [`Prepared::list_for`] of the objects `picked` already took ([`Prepared::pick`]).
+    pub fn list_of(&self, picked: &[&Entity], window: &Bounds2, width_px: f64, ctx: &Ctx) -> Result<DisplayList, ToolError> {
         let d = self.drawing();
-        let size = window.width().max(window.height());
         let opts = self.options(window, width_px, ctx);
         ctx.stage("building the display list", 0);
         let list = match &self.target.space {
-            Space::Model => {
-                let store = &d.model;
-                let reach = window.expand(size * 1e-6);
-                let mut picked = Vec::new();
-                for (k, e) in store.iter().enumerate() {
-                    if k % 65_536 == 0 {
-                        ctx.check()?;
-                    }
-                    if self.reaches(e, &reach) {
-                        picked.push(e.as_ref());
-                    }
-                }
-                if picked.len() == store.len() {
-                    cadcraft_engine::render::build(d, &Space::Model, &opts)
-                } else {
-                    cadcraft_engine::render::build_entities(d, picked, &opts)
-                }
-            }
+            Space::Model if picked.len() == d.model.len() => cadcraft_engine::render::build(d, &Space::Model, &opts),
+            Space::Model => cadcraft_engine::render::build_entities(d, picked.iter().copied(), &opts),
             space => cadcraft_engine::render::build(d, space, &opts),
         };
         ctx.check()?;
@@ -551,47 +583,208 @@ pub enum Through {
     Pdf,
 }
 
-/// The ways to get the whole drawing when a build needs `total` block expansions and the limit is
-/// `cap` per build, in words for the agent. Each is something the tools do today.
-pub fn ways_through(cap: usize, total: u64, kind: Through) -> Vec<String> {
-    let windows = total.div_ceil((cap as u64).max(1)).max(2);
+/// What the count says when it overflowed (never a number: `u64::MAX` is not a count).
+const UNCOUNTABLE: &str = "more than can be counted (nested references multiply past 1.8e19)";
+
+/// The largest whole number a JSON client reads exactly (2^53).
+const JSON_EXACT: u64 = 1 << 53;
+
+/// A count as it goes in an answer: a number up to 2^53, a decimal string above it (JSON clients
+/// lose precision there) and, when the count overflowed, the words [`UNCOUNTABLE`].
+fn count_value(n: u64) -> Value {
+    if n == COUNT_SATURATED {
+        json!(UNCOUNTABLE)
+    } else if n > JSON_EXACT {
+        json!(n.to_string())
+    } else {
+        json!(n)
+    }
+}
+
+/// A count in a sentence.
+fn count_text(n: u64) -> String {
+    if n == COUNT_SATURATED { UNCOUNTABLE.to_string() } else { n.to_string() }
+}
+
+/// The structured fields of a truncated answer: the one object that needs the most and the
+/// reference layers that reduce the count.
+fn truncated_fields(note: &mut Value, cap: usize, census: &BlockCensus) {
+    if let Some(l) = &census.largest {
+        note["largest_object"] = json!({
+            "handle": l.handle.hex(),
+            "kind": l.kind,
+            "block": l.block,
+            "blocks_expanded": count_value(l.count),
+            "fits_one_build": l.count <= cap as u64,
+        });
+    }
+    note["reference_layers"] = json!(census.reference_layers);
+    if !census.layers_off.is_empty() {
+        note["layers_that_reduce"] = json!(census
+            .layers_off
+            .iter()
+            .map(|l| json!({"layer": l.layer, "blocks_expanded_total_if_off": count_value(l.total_if_off), "fits_one_build": l.total_if_off <= cap as u64}))
+            .collect::<Vec<_>>());
+    }
+}
+
+/// Arrays drawn short by the 10,000 columns / rows the build draws of a MINSERT (said in every
+/// answer that draws, truncated or not).
+fn clamped_fields(note: &mut Value, census: &BlockCensus) {
+    if census.clamped.is_empty() {
+        return;
+    }
+    note["arrays_clamped"] = json!(census
+        .clamped
+        .iter()
+        .map(|a| json!({
+            "handle": a.handle.hex(),
+            "block": a.block,
+            "cols": a.cols,
+            "rows": a.rows,
+            "drawn_cols": a.drawn_cols,
+            "drawn_rows": a.drawn_rows,
+        }))
+        .collect::<Vec<_>>());
+    note["arrays_clamped_note"] = json!(format!(
+        "{} block array{} drawn short: a block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows and the rest of its copies are not in this picture (arrays_clamped lists them; reading, measuring and extents still see the whole array). {SEPARATE_REFERENCES}",
+        census.clamped.len(),
+        if census.clamped.len() == 1 { " is" } else { "s are" }
+    ));
+}
+
+/// How to turn an array into separate references the build draws all of (and windows can split);
+/// proved in the tests (`the_ways_the_answer_names_work`).
+const SEPARATE_REFERENCES: &str = "To draw all of an array, make its copies separate references with edit: erase the array (op \"delete\", handles), insert the block once at the array's insertion point with its rotation (op \"block\", action \"insert\", name, at, rotation) and run arrayrect {handles: [that reference], rows, cols, rowSpacing, colSpacing, axisAngle: the array's rotation in degrees, associative: false}; each copy is then an object of its own. This changes the open drawing in memory only until save_drawing (the edit op \"undo\", or close_drawing with discard: true, takes it back)";
+
+/// How to open up one block reference, proved in the tests.
+const EXPLODE_ONE: &str = "edit {op: \"command\", command: \"explode\", params: {handles: [\"HANDLE\"]}} replaces a block reference by the block's own entities, so the references nested inside it become objects of the drawing that windows can split (explode again for one that is still too big); it changes the open drawing in memory only until save_drawing (the edit op \"undo\", or close_drawing with discard: true, takes it back). Exploding a MINSERT gives one copy only, so for a MINSERT use the separate-references route";
+
+/// The ways to a complete picture when a build needs `total` block expansions and the limit is
+/// `cap` per build, in words for the agent. Each is something the tools do today, and what does
+/// not work is said. Windows are advised only when the largest single object fits the limit: a
+/// build expands an object whole in every window that touches it.
+pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus) -> Vec<String> {
     let mut ways = Vec::new();
-    match kind {
-        Through::Model => ways.push(format!(
-            "draw it in windows: only objects whose extent reaches the window are expanded and the limit is per build, so a window (or tile) that needs {cap} or fewer is drawn whole. This drawing needs {total}, so use at least {windows} windows: render_preview with tiles {{cols, rows}} and output writes every tile to its own file (each tile's answer says its own blocks_expanded_total), or export svg / png with window [[x0, y0], [x1, y1]] once per region"
-        )),
-        Through::Layout => ways.push(format!(
-            "a layout is built whole, so a window does not reduce it. Draw the model space its viewports show instead: render_preview with viewport: <handle> (read_drawing section \"layouts\" lists them) and tiles or a window, one build per tile; each needs {cap} or fewer to be whole. The layout needs {total} in one build"
-        )),
-        Through::Pdf => ways.push(format!(
-            "a PDF sheet is one build of the whole space and its window only places the drawing on the page, it does not leave out the block references outside it. For the regions of the drawing write SVG or PNG: export svg / png with window [[x0, y0], [x1, y1]] per region, or render_preview with tiles and output. The sheet needs {total} in one build; {cap} is the most a build draws"
-        )),
+    let largest = census.largest.as_ref();
+    let too_big = largest.filter(|l| l.count > cap as u64);
+    if let Some(l) = too_big {
+        let (kind_text, h) = (l.kind, l.handle.hex());
+        ways.push(format!(
+            "windows and tiles cannot complete this: the {kind_text} {h} (block {}) alone needs {} expansions, more than the {cap} one build draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again",
+            l.block,
+            count_text(l.count)
+        ));
+        if l.count == COUNT_SATURATED {
+            ways.push(
+                "this reference nests blocks so deeply that it multiplies past what can be counted: opening it one level (explode) leaves references that still multiply past it, so no route draws all of it today. Reading is unaffected (below)".to_string(),
+            );
+        } else if l.kind.starts_with("array") {
+            ways.push(format!(
+                "make the copies separate references so windows can split them: {}",
+                SEPARATE_REFERENCES.replace("To draw all of an array, make", "make")
+            ));
+        } else {
+            ways.push(format!("open the reference so its parts can be split by windows: {}", EXPLODE_ONE.replace("HANDLE", &h)));
+        }
+        ways.push(
+            "render_preview and export take only model space, a layout or a layout viewport as the space to draw: a block's own definition cannot be drawn as a space of its own".to_string(),
+        );
+    } else {
+        let windows = total.div_ceil((cap as u64).max(1)).max(2);
+        let how_many = if total == COUNT_SATURATED {
+            "this drawing needs more than can be counted, so no number of windows is given".to_string()
+        } else {
+            format!("this drawing needs {total}, so use at least {windows} windows")
+        };
+        match kind {
+            Through::Model => ways.push(format!(
+                "draw it in windows: only objects whose extent reaches the window are expanded and the limit is per build, so a window (or tile) that needs {cap} or fewer is drawn whole. No single object needs more than {cap}, and {how_many}: render_preview with tiles {{cols, rows}} and output writes every tile to its own file (each tile's answer says its own blocks_expanded_total), or export svg / png with window [[x0, y0], [x1, y1]] once per region"
+            )),
+            Through::Layout => ways.push(format!(
+                "a layout is built whole, so a window does not reduce it. Draw the model space its viewports show instead: render_preview with viewport: <handle> (read_drawing section \"layouts\" lists them) and tiles or a window, one build per tile; each needs {cap} or fewer to be whole. The layout needs {} in one build",
+                count_text(total)
+            )),
+            Through::Pdf => ways.push(format!(
+                "a PDF sheet is one build of the whole space and its window only places the drawing on the page, it does not leave out the block references outside it. For the regions of the drawing write SVG or PNG: export svg / png with window [[x0, y0], [x1, y1]] per region, or render_preview with tiles and output. {how_many}; the sheet needs {} in one build and {cap} is the most a build draws",
+                count_text(total)
+            )),
+        }
+    }
+    if census.layers_off.is_empty() {
+        if census.reference_layers.len() == 1 {
+            ways.push(format!(
+                "every block reference is on one layer ({}), so layers_off / only_layers cannot split the drawing into passes: switching that layer off leaves none of them",
+                census.reference_layers.first().map_or("", String::as_str)
+            ));
+        }
+    } else {
+        let list = census
+            .layers_off
+            .iter()
+            .map(|l| {
+                let fits = if l.total_if_off <= cap as u64 { ", which fits one build" } else { "" };
+                format!("{} leaves {}{fits}", l.layer, count_text(l.total_if_off))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        ways.push(format!(
+            "switch off the layer the block references are on (layers_off / only_layers): with it off the count is {list}. Switching off the layers of the references' contents does not reduce the count (the build takes one expansion for each entity of a block before it looks at the entity's layer)"
+        ));
+        if census.reference_layers.len() == 1 {
+            ways.push(format!(
+                "every block reference is on one layer ({}), so layers cannot split the drawing into passes: switching it off leaves none of them",
+                census.reference_layers.first().map_or("", String::as_str)
+            ));
+        }
     }
     ways.push(
-        "layers_off / layers_on / only_layers leave out the layers you do not need (block references on a switched-off layer are not expanded), e.g. the trees on one pass and the rest on another".to_string(),
+        "reading is not affected by the limit: read_drawing (entities with expand_blocks, takeoff, text, dimensions), search_drawing, measuring and the extents do not expand blocks into a picture, so everything in the drawing can still be read, searched and measured".to_string(),
     );
     ways.push(format!(
-        "one file of the whole drawing needs {total} expansions in one build and {cap} is the most one build draws, so the whole drawing comes as several files (windows or layer passes), not one"
+        "one file of the whole drawing needs {} expansions in one build and {cap} is the most one build draws, so a complete picture comes as several files (windows, layer passes or opened-up references as above), not one",
+        count_text(total)
     ));
     ways
 }
 
-/// What a PDF export's answer says about block contents: the largest sheet's expansions asked for
-/// and, when any sheet passed the limit, which sheets, how much was not drawn and the ways through.
+/// What a PDF export's answer says about block contents, sheet by sheet: each sheet's expansions
+/// asked for and not drawn (`sheets`), the sums of them, and when a sheet passed the limit which
+/// sheets, the largest object and the ways through. The totals add up: `blocks_not_drawn` is the
+/// sum of the sheets' (a sheet's total is the build's own count, or past the limit the count).
 pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
-    let cap = cadcraft_engine::render::MAX_BLOCK_EXPANSION;
-    let most = blocks.iter().map(|b| b.total).max().unwrap_or(0);
-    let mut note = json!({"blocks_expanded_total": most});
+    let sum = |f: &dyn Fn(&cadcraft_io::SheetBlocks) -> u64| blocks.iter().map(f).fold(0u64, |a, n| if a == COUNT_SATURATED || n == COUNT_SATURATED { COUNT_SATURATED } else { a.saturating_add(n) });
+    let mut note = json!({"blocks_expanded_total": count_value(sum(&|b| b.total))});
+    note["sheets"] = json!(blocks
+        .iter()
+        .map(|b| {
+            let mut e = json!({"sheet": b.sheet, "blocks_expanded_total": count_value(b.total), "blocks_not_drawn": count_value(b.not_drawn())});
+            if b.truncated() {
+                e["blocks_truncated"] = json!(true);
+                truncated_fields(&mut e, b.limit, &b.census);
+            }
+            clamped_fields(&mut e, &b.census);
+            e
+        })
+        .collect::<Vec<_>>());
     let cut: Vec<&cadcraft_io::SheetBlocks> = blocks.iter().filter(|b| b.truncated()).collect();
-    if !cut.is_empty() {
-        let over: u64 = cut.iter().map(|b| b.total - cap as u64).sum();
+    if let Some(worst) = cut.iter().max_by_key(|b| b.total) {
+        let cap = worst.limit;
+        let over = sum(&|b| b.not_drawn());
         note["blocks_truncated"] = json!(true);
         note["blocks_expanded"] = json!(cap);
-        note["blocks_not_drawn"] = json!(over);
+        note["blocks_not_drawn"] = count_value(over);
         note["blocks_truncated_sheets"] = json!(cut.iter().map(|b| b.sheet.clone()).collect::<Vec<_>>());
-        note["warning"] = json!(format!("block contents past {cap} expanded entities were not drawn on the sheets listed: {over} expansions are missing"));
-        note["ways_through"] = json!(ways_through(cap, most, Through::Pdf));
+        note["warning"] = json!(format!(
+            "block contents past {cap} expanded entities were not drawn on the sheets listed: {} expansions are missing (sheets gives each sheet's own figures)",
+            count_text(over)
+        ));
+        note["ways_through"] = json!(ways_through(cap, worst.total, Through::Pdf, &worst.census));
     }
+    // Arrays drawn short on any sheet.
+    let mut seen = std::collections::BTreeSet::new();
+    let clamped: Vec<_> = blocks.iter().flat_map(|b| b.census.clamped.iter()).filter(|a| seen.insert(a.handle.0)).cloned().collect();
+    clamped_fields(&mut note, &BlockCensus { clamped, ..BlockCensus::default() });
     note
 }
 
@@ -634,6 +827,7 @@ pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>,
         layer_states,
         lineweights,
         block_cap: cadcraft_engine::render::MAX_BLOCK_EXPANSION,
+        layout_census: std::cell::OnceCell::new(),
     })
 }
 
@@ -692,8 +886,15 @@ pub fn win_value(w: &Bounds2) -> Value {
 
 /// PNG of the window (a picture for a visual check), as base64.
 /// The PNG of `window` with its size and the block contents expanded ([`Prepared::blocks_note`]).
-pub fn png(
+pub fn png(p: &Prepared<'_>, window: &Bounds2, width: u32, height: Option<u32>, dark: bool, ctx: &Ctx) -> Result<(Vec<u8>, u32, u32, usize), ToolError> {
+    let picked = p.pick(window, ctx)?;
+    png_of(p, &picked, window, width, height, dark, ctx)
+}
+
+/// [`png`] of the objects `picked` already took ([`Prepared::pick`]).
+pub fn png_of(
     p: &Prepared<'_>,
+    picked: &[&Entity],
     window: &Bounds2,
     width: u32,
     height: Option<u32>,
@@ -702,7 +903,7 @@ pub fn png(
 ) -> Result<(Vec<u8>, u32, u32, usize), ToolError> {
     let view = cadcraft_engine::render::raster::View::of_window(window, Some(width), height);
     let (w, h) = (view.width, view.height);
-    let list = p.list_for(window, f64::from(w) / 8.0, ctx)?;
+    let list = p.list_of(picked, window, f64::from(w) / 8.0, ctx)?;
     let mut opts = cadcraft_engine::render::raster::RasterOptions::default();
     if !dark {
         opts.background = cadcraft_engine::doc::color::Rgb(255, 255, 255);

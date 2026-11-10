@@ -1,5 +1,5 @@
 //! `svg::write_list` writes the same bytes as the string writer it replaced, to any writer, in
-//! blocks, header first.
+//! blocks.
 
 use std::io::Write;
 
@@ -169,7 +169,7 @@ fn the_streaming_writer_makes_the_bytes_of_the_string_writer() {
             assert!(sink.bytes == reference.as_bytes(), "{n} polylines, window {window:?}");
             assert!(cadcraft_io::svg::export_list(&list, window) == reference, "{n} polylines, window {window:?}");
             if n == 20_000 {
-                // Sent in blocks, not as one string: the header alone goes first.
+                // Sent in blocks, not as one string; the header opens the first block.
                 assert!(sink.writes.len() > 4 && sink.writes.iter().all(|w| *w < reference.len() / 2), "{:?}", sink.writes.len());
                 assert!(sink.bytes.starts_with(b"<svg xmlns"));
             }

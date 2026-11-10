@@ -44,10 +44,12 @@ pub fn export_list(list: &cadcraft_render::DisplayList, window: Option<Bounds2>)
 /// Text made and not yet sent to the writer.
 const FLUSH: usize = 1 << 16;
 
-/// Write a display list as [`export_list`] makes it, to `out` as it goes: the header first (the
-/// view box and decimal places come from `list.bounds` or `window`, known before any primitive is
-/// written), then the primitives in blocks, so the file is never one string in memory. The bytes
-/// are exactly those of [`export_list`].
+/// Write a display list as [`export_list`] makes it, to `out` as it goes: the text is made primitive
+/// by primitive and sent whenever it reaches 64 KB (the header, whose view box and decimal places
+/// come from `list.bounds` or `window`, opens the first block), so the SVG is never one string in
+/// memory: at most about 64 KB plus one primitive's text waits at a time. The bytes are exactly
+/// those of [`export_list`], which is this function writing into a `Vec`. Nothing in this workspace
+/// writes a file with it today (`write_framed` and the plotter return bytes, as the callers expect).
 pub fn write_list<W: std::io::Write>(mut out: W, list: &cadcraft_render::DisplayList, window: Option<Bounds2>) -> std::io::Result<()> {
     let window = window.filter(|w| !w.is_empty());
     let b = window.unwrap_or(list.bounds);

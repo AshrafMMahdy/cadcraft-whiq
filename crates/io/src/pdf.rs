@@ -101,6 +101,9 @@ pub struct PdfOptions {
     /// Plot objects with their transparency (PDF alpha). `None` = the page setup's "Plot
     /// transparency" (off for model space).
     pub plot_transparency: Option<bool>,
+    /// Block contents one sheet expands before the rest are not drawn:
+    /// [`cadcraft_render::MAX_BLOCK_EXPANSION`]. Not read from JSON (only tests give another value).
+    pub max_block_expansion: usize,
 }
 
 impl Default for PdfOptions {
@@ -125,6 +128,7 @@ impl Default for PdfOptions {
             margins: None,
             hyperlinks: true,
             plot_transparency: None,
+            max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
         }
     }
 }
@@ -161,6 +165,7 @@ impl PdfOptions {
             margins: margins(v.get("margins")),
             hyperlinks: v.get("hyperlinks").and_then(Value::as_bool).unwrap_or(true),
             plot_transparency: v.get("plotTransparency").and_then(Value::as_bool),
+            max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
         }
     }
 }
@@ -225,17 +230,30 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
 pub struct SheetBlocks {
     /// The sheet: `Model` or the layout's name.
     pub sheet: String,
-    /// Block expansions the sheet asks for, counted from the block table before it was built.
+    /// Block expansions the sheet asks for: what its build counted when the sheet was drawn whole,
+    /// else (past the limit, the build stops there) the count made from the block table before the
+    /// build, never below what the build counted. [`COUNT_SATURATED`](cadcraft_render::COUNT_SATURATED)
+    /// when more than can be counted.
     pub total: u64,
-    /// What the build counted of them: above [`cadcraft_render::MAX_BLOCK_EXPANSION`] the contents
-    /// past it were not drawn.
+    /// What the build counted of them: above `limit` the contents past it were not drawn.
     pub expanded: usize,
+    /// The most expansions one build draws.
+    pub limit: usize,
+    /// What the count from the block table found: the largest single object, the layers the
+    /// references are on (and what switching each off leaves, past the limit) and arrays drawn short.
+    pub census: cadcraft_render::BlockCensus,
 }
 
 impl SheetBlocks {
-    /// Whether block contents were left out of the sheet because of the limit.
+    /// Whether block contents were left out of the sheet because of the limit (the build's own
+    /// count went past it).
     pub fn truncated(&self) -> bool {
-        self.total > cadcraft_render::MAX_BLOCK_EXPANSION as u64
+        self.expanded > self.limit
+    }
+
+    /// Expansions asked for and not drawn: what is past the limit (saturated with the total).
+    pub fn not_drawn(&self) -> u64 {
+        if self.total == cadcraft_render::COUNT_SATURATED { self.total } else { self.total.saturating_sub(self.limit as u64) }
     }
 }
 
@@ -272,6 +290,7 @@ pub fn plot_with_blocks(d: &Drawing, space: &Space, opts: &Value) -> Result<Plot
                 po.window = Some(w);
                 po.fit = Some(true);
                 po.compress = o.compress;
+                po.max_block_expansion = o.max_block_expansion;
                 Ok((Space::Model, po))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -392,7 +411,8 @@ pub fn pdf_sheets(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Vec<u
     pdf_sheets_with_blocks(d, spaces, o).map(|p| p.bytes)
 }
 
-fn pdf_sheets_with_blocks(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Plotted> {
+/// [`pdf_sheets`] that also says, per sheet, what it did with block contents.
+pub fn pdf_sheets_with_blocks(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Plotted> {
     let items: Vec<(Space, PdfOptions)> = spaces.iter().take(MAX_PAGES + 1).map(|s| (s.clone(), o.clone())).collect();
     pdf_items_with_blocks(d, &items, o)
 }
@@ -496,7 +516,7 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
         let mut blocks = Vec::new();
         for (s, po) in items {
             let page = sheet(drawn, s, po, &links)?;
-            blocks.push(SheetBlocks { sheet: page.label.clone(), total: page.blocks_total, expanded: page.list.expanded });
+            blocks.push(page.blocks.clone());
             let doc = writer.document_mut();
             // Groups are added to the document, so they must exist before the page starts.
             groups.add(doc, d, &page.layers);
@@ -548,8 +568,8 @@ struct SheetPage {
     links: Vec<(Bounds2, String)>,
     /// Page label: the layout name.
     label: String,
-    /// Block expansions the sheet asks for ([`cadcraft_render::count_space`]).
-    blocks_total: u64,
+    /// What the sheet needed and drew of block contents.
+    blocks: SheetBlocks,
 }
 
 /// Plot one space.
@@ -571,7 +591,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         view: None,
         skip_viewport: None,
         cancel: None,
-        max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
+        max_block_expansion: o.max_block_expansion,
     };
     let k = unit_mm * PT_PER_MM;
     let window = o.window.filter(|w| matches!(space, Space::Model) && !w.is_empty());
@@ -582,8 +602,14 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     let tolerance = if tol.is_finite() && tol > 0.0 { tol } else { ropts.tolerance };
     // Relative point sizes follow the plotted window (else the extents).
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
-    let blocks_total = cadcraft_render::count_space(d, space, true);
+    let census = cadcraft_render::census_space(d, space, true, &ropts);
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
+    let expanded = list.expanded;
+    let limit = o.max_block_expansion;
+    // Drawn whole: the build's count is the figure. Past the limit the build stops there, and the
+    // count from the block table says how much more the sheet asks for.
+    let total = if expanded > limit { census.total.max(expanded as u64) } else { expanded as u64 };
+    let blocks = SheetBlocks { sheet: sheet_name(space), total, expanded, limit, census };
     let b = window.unwrap_or(list.bounds);
     let s = plot_scale(&b, &sheet, fit, o.scale);
     let map = if fit || matches!(space, Space::Model) {
@@ -612,7 +638,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         }
     }
     let links = links(&list, &map, &clip_pt, links_to);
-    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space), blocks_total })
+    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space), blocks })
 }
 
 /// Source and destination origins for the shared model-space PDF/PNG placement behavior.

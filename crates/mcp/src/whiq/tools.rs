@@ -77,7 +77,7 @@ pub fn definitions() -> Vec<Value> {
                 "space": space, "layer": {"type": ["string", "array"]}, "window": window, "expand_blocks": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1}, "format": {"type": "string", "enum": ["json", "markdown"]}},
                 "required": ["query"]},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every answer says blocks_expanded_total, and past the limit blocks_truncated, blocks_not_drawn and ways_through. A window or a tile is a build of its own that expands only the objects reaching it, so a drawing with more block content than that comes whole as tiles (tiles with output, one file each) or as layer passes (layers_off / only_layers); a layout is built whole, so draw the model space its viewports show (viewport: handle) in tiles instead.",
+        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every answer says blocks_expanded_total (what the build took: a number, a decimal string above 2^53, or the words \"more than can be counted\" when nested references multiply past 1.8e19) and, when the build went past the limit, blocks_truncated, blocks_not_drawn, largest_object, reference_layers, layers_that_reduce and ways_through. A window or a tile is a build of its own that expands only the objects reaching it, so a drawing with more block content than that comes whole as tiles (tiles with output, one file each) or as layer passes (layers_off / only_layers: the layer the block references are on, not the layers of their contents) - but one object (a MINSERT, a block holding a whole plan) that alone needs more than the limit is expanded whole in every window touching it: the answer names it (largest_object) and the ways that work (explode it, or make an array's copies separate references, with edit). A layout is built whole, so draw the model space its viewports show (viewport: handle) in tiles instead. Reading, search and measuring never expand blocks. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "path": {"type": "string", "description": "Open this drawing first"},
                 "space": {"type": "string"}, "viewport": {"type": ["string", "integer"]}, "window": window,
                 "tiles": {"type": ["object", "array", "integer"]}, "tile": {"type": "array"},
@@ -86,7 +86,7 @@ pub fn definitions() -> Vec<Value> {
                 "background": {"type": "string", "enum": ["light", "dark"]}, "lineweights": {"type": "boolean"},
                 "output": {"type": "string", "description": "Write the SVG/PNG file(s) here (tiles get -c<col>r<row>) instead of answering them"}}},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG is written to the file in slices as it is made: model space in slices of objects in draw order, and a paper-space layout the same (its own objects and each viewport's model-space contents in draw order, each viewport's clip applied), so a big layout is not held whole in memory. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every svg / png / pdf answer says blocks_expanded_total, and past the limit blocks_truncated, blocks_not_drawn and ways_through (a PDF sheet is one build of the whole space, its window only places it on the page). Ways through: export svg / png once per window (a window expands only the objects reaching it, each export is its own build), or layers_off / only_layers for a pass per layer set.",
+        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG is written to the file in slices as it is made: model space in slices of objects in draw order, and a paper-space layout the same (its own objects and each viewport's model-space contents in draw order, each viewport's clip applied), so a big layout is not held whole in memory. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every svg / png / pdf answer says blocks_expanded_total (a number, a decimal string above 2^53, or the words \"more than can be counted\" when nested references multiply past 1.8e19) and, past the limit, blocks_truncated, blocks_not_drawn, largest_object, reference_layers, layers_that_reduce and ways_through (a PDF sheet is one build of the whole space, its window only places it on the page; the PDF answer gives each sheet's own figures in sheets). Ways through: export svg / png once per window (a window expands only the objects reaching it, each export is its own build), or layers_off / only_layers for a pass per layer set (the layer the block references are on); one object that alone needs more than the limit is not split by windows, the answer names it and the ways that work. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "source": {"type": "string", "description": "Open this drawing first"}, "path": {"type": "string", "description": "The file to write (its extension picks the format)"},
                 "format": {"type": "string", "enum": ["dxf", "dwg", "pdf", "svg", "png"]}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"},
                 "space": {"type": ["string", "array"], "description": "model (default), a layout, a list, or all"}, "window": window,
@@ -461,13 +461,15 @@ impl Engine {
             for (k, (cr, win)) in tiles.iter().enumerate().skip(from) {
                 ctx.check()?;
                 let mut t = json!({"tile": cr, "window": preview::win_value(win)});
+                // The objects the tile takes are picked once: the build and the count both use them.
+                let picked = prep.pick(win, ctx)?;
                 let (bytes, mime, ext, info): (Vec<u8>, &str, &str, Value) = if png {
-                    let (b, w, h, _) = preview::png(&prep, win, width, height, dark, ctx)?;
-                    (b, "image/png", "png", merged(json!({"width": w, "height": h}), prep.blocks_note(win)))
+                    let (b, w, h, built) = preview::png_of(&prep, &picked, win, width, height, dark, ctx)?;
+                    (b, "image/png", "png", merged(json!({"width": w, "height": h}), prep.blocks_note(win, built, Some(&picked), ctx)?))
                 } else {
-                    let list = prep.list_for(win, f64::from(width), ctx)?;
+                    let list = prep.list_of(&picked, win, f64::from(width), ctx)?;
                     let (svg, n) = preview::svg_tile(&list, &prep.layers, win, f64::from(width), dark, ctx)?;
-                    (svg.into_bytes(), "image/svg+xml", "svg", merged(json!({"primitives": n}), prep.blocks_note(win)))
+                    (svg.into_bytes(), "image/svg+xml", "svg", merged(json!({"primitives": n}), prep.blocks_note(win, list.expanded, Some(&picked), ctx)?))
                 };
                 if let Value::Object(o) = info {
                     for (kk, vv) in o {
@@ -645,11 +647,11 @@ impl Engine {
                             // Written as it is made (display list slice by slice) through the same
                             // atomic file write: a call that stops part way leaves nothing of it.
                             let wpx = f64::from(a.get("width").and_then(Value::as_u64).map_or(1600, |w| u32::try_from(w).unwrap_or(1600)));
-                            let (kept, (size, _)) = write_file_with(&p, policy, |w| prep.write_svg(w, &prep.window, wpx, ctx))?;
-                            (kept, size, prep.blocks_note(&prep.window))
+                            let (kept, (size, built)) = write_file_with(&p, policy, |w| prep.write_svg(w, &prep.window, wpx, ctx))?;
+                            (kept, size, prep.blocks_note(&prep.window, built, None, ctx)?)
                         } else {
                             let w = a.get("width").and_then(Value::as_u64).map_or(2400, |w| u32::try_from(w).unwrap_or(2400));
-                            let (bytes, _, _, _) = preview::png(
+                            let (bytes, _, _, built) = preview::png(
                                 &prep,
                                 &prep.window,
                                 w,
@@ -657,7 +659,7 @@ impl Engine {
                                 false,
                                 ctx,
                             )?;
-                            (write_file(&p, &bytes, policy)?, bytes.len(), prep.blocks_note(&prep.window))
+                            (write_file(&p, &bytes, policy)?, bytes.len(), prep.blocks_note(&prep.window, built, None, ctx)?)
                         };
                         let mut e = merged(saved_entry(ctx.roots(), &p, size, &fmt, kept.as_ref()), note);
                         e["space"] = json!(name);
@@ -1605,7 +1607,7 @@ mod tests {
             let mut out = Vec::new();
             let (n, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
             assert_eq!(n, out.len());
-            let note = prep.blocks_note(&prep.window).unwrap();
+            let note = prep.blocks_note(&prep.window, expanded, None, &c).unwrap().unwrap();
             assert!(expanded > 0 && note["blocks_expanded_total"] == json!(expanded), "{note}");
             assert!(note.get("blocks_truncated").is_none() && note.get("ways_through").is_none());
             assert!(String::from_utf8(out).unwrap() == whole, "slice of {slice} entities");
@@ -1683,92 +1685,270 @@ mod tests {
 
     /// A paper-space layout written in slices (its own objects and each viewport's model-space
     /// contents, clipped as in the whole build) is byte for byte the SVG of the whole display list,
-    /// for slices of 1, 512 and 16,384.
+    /// for slices of 1, 512 and 16,384, under the block-expansion limit and past it (lowered for
+    /// the test: the objects left out are the same ones).
     #[test]
     fn a_layout_svg_written_in_slices_is_byte_identical_to_the_whole_list_one() {
         let c = ctx(None, true);
         let d = layout_drawing();
         assert!(d.model.len() >= 2_000);
-        let prep = preview::prepare(&d, &json!({"space": "Layout1"}), &c).unwrap();
-        let list = prep.list_for(&prep.window, 1600.0, &c).unwrap();
-        assert!(list.prims.len() > 2_000, "{}", list.prims.len());
-        let whole = preview::svg_tile(&list, &prep.layers, &prep.window, 1600.0, false, &c).unwrap().0;
-        assert!(whole.contains("<polyline") && whole.contains("<path") && whole.contains(r#"data-layer="""#));
-        for slice in [1, 512, preview::SLICE_ENTITIES] {
-            let mut out = Vec::new();
-            let (n, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
-            assert_eq!(n, out.len());
-            assert_eq!(expanded, list.expanded, "slice {slice}");
-            assert!(String::from_utf8(out).unwrap() == whole, "slice of {slice} objects");
+        let mut prep = preview::prepare(&d, &json!({"space": "Layout1"}), &c).unwrap();
+        let need = prep.list_for(&prep.window, 1600.0, &c).unwrap().expanded;
+        assert!(need > 300, "{need}");
+        for cap in [prep.block_cap, need / 3] {
+            prep.block_cap = cap;
+            let list = prep.list_for(&prep.window, 1600.0, &c).unwrap();
+            assert!(list.prims.len() > 2_000 || cap < need, "{}", list.prims.len());
+            assert_eq!(list.expanded > cap, cap < need, "cap {cap}");
+            let whole = preview::svg_tile(&list, &prep.layers, &prep.window, 1600.0, false, &c).unwrap().0;
+            assert!(whole.contains("<polyline") && whole.contains("<path") && whole.contains(r#"data-layer="""#));
+            for slice in [1, 512, preview::SLICE_ENTITIES] {
+                let mut out = Vec::new();
+                let (n, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
+                assert_eq!(n, out.len());
+                assert_eq!(expanded, list.expanded, "cap {cap}, slice {slice}");
+                assert!(String::from_utf8(out).unwrap() == whole, "cap {cap}, slice of {slice} objects");
+            }
         }
         // A stop between slices leaves the writer with an error, not a short file.
         c.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(prep.write_svg_sliced(Vec::new(), &prep.window, 1600.0, &c, 512).is_err());
     }
 
-    /// Past the block-expansion cap the answer says so in words: how many expansions the drawing
-    /// needs (counted up front), how many were not drawn and the ways through, and those ways work:
-    /// a window that needs fewer than the cap is drawn whole. Under the cap the answer only gives
-    /// the count. The same SVG comes out of every slice size.
+    /// Which layer to switch off: the build takes one expansion for every entity of a block before
+    /// it looks at the entity's layer, so switching off the layer of a block's CONTENTS reduces
+    /// nothing and only the layer the REFERENCES are on does. The answer says so, lists the
+    /// reference layers with what each leaves, and the advised route really reduces the build's
+    /// count; when every reference is on one layer it says there is no split into passes.
     #[test]
-    fn passing_the_block_cap_is_reported_with_the_ways_through() {
-        let (e, c) = many_entities();
-        let d = e.docs.list[0].drawing().unwrap();
-        let mut prep = preview::prepare(d, &json!({"space": "Model"}), &c).unwrap();
-        // 700 references to a block of two entities: each is the copy and its two entities.
-        let total = prep.expansions(&prep.window);
-        assert_eq!(total, 700 * 3);
-        prep.block_cap = 300;
-        let mut first = None;
-        for slice in [1, 512, preview::SLICE_ENTITIES] {
-            let mut out = Vec::new();
-            let (_, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
-            assert!(expanded > 300);
-            let note = prep.blocks_note(&prep.window).unwrap();
-            assert_eq!(note["blocks_truncated"], json!(true));
-            assert_eq!(note["blocks_expanded"], json!(300));
-            assert_eq!(note["blocks_expanded_total"], json!(2100));
-            assert_eq!(note["blocks_not_drawn"], json!(1800));
-            let warning = note["warning"].as_str().unwrap();
-            assert!(warning.starts_with("block contents past 300 expanded entities were not drawn"), "{warning}");
-            let ways = note["ways_through"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect::<Vec<_>>().join("\n");
-            assert!(ways.contains("tiles {cols, rows}") && ways.contains("window [[x0, y0], [x1, y1]]") && ways.contains("layers_off"), "{ways}");
-            assert!(ways.contains("at least 7 windows") && ways.contains("2100"), "{ways}");
-            let svg = String::from_utf8(out).unwrap();
-            assert!(first.get_or_insert_with(|| svg.clone()) == &svg, "slice of {slice} entities");
+    fn the_layer_advice_names_the_reference_layers_and_it_reduces_the_build() {
+        use cadcraft_engine::doc::{Block, Common, Entity, Handle, Insert, Layer, Line};
+        use cadcraft_engine::geom::Vec3;
+        let c = ctx(None, true);
+        let mut d = Drawing::new_metric();
+        for n in ["Trees", "Bark", "Shrubs"] {
+            d.layers.push(Layer { name: n.into(), on: true, ..Default::default() });
         }
-        // The way through: ten tiles each need under the cap and come out whole.
-        let tiles = preview::tiles(&prep.window, &json!({"tiles": {"cols": 10, "rows": 1}})).unwrap();
-        let mut sum = 0;
+        let mut b = Block::new("Tree");
+        for k in 0..4u64 {
+            let mut e = Entity::new(Handle(900 + k), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(3.0, 4.0, 0.0) }));
+            e.common = Common { layer: "Bark".into(), ..Common::default() };
+            b.entities.push(e);
+        }
+        d.blocks.insert("Tree".into(), std::sync::Arc::new(b));
+        let tree = |x: f64| {
+            EntityKind::Insert(Insert {
+                block: "Tree".into(),
+                insert: Vec3::new(x, 0.0, 0.0),
+                scale: Vec3::new(1.0, 1.0, 1.0),
+                rotation: 0.0,
+                attribs: vec![],
+                cols: 1,
+                rows: 1,
+                col_spacing: 0.0,
+                row_spacing: 0.0,
+            })
+        };
+        for k in 0..60 {
+            let layer = if k % 3 == 0 { "Shrubs" } else { "Trees" };
+            d.add(&Space::Model, Common { layer: layer.into(), ..Common::default() }, tree(f64::from(k) * 10.0)).unwrap();
+        }
+        let mut prep = preview::prepare(&d, &json!({"space": "Model"}), &c).unwrap();
+        prep.block_cap = 100;
+        let list = prep.list_for(&prep.window, 800.0, &c).unwrap();
+        let note = prep.blocks_note(&prep.window, list.expanded, None, &c).unwrap().unwrap();
+        // 60 references, each its copy and 4 entities.
+        assert_eq!(note["blocks_expanded_total"], json!(300));
+        assert_eq!(note["reference_layers"], json!(["Shrubs", "Trees"]));
+        assert_eq!(
+            note["layers_that_reduce"],
+            json!([
+                {"layer": "Trees", "blocks_expanded_total_if_off": 100, "fits_one_build": true},
+                {"layer": "Shrubs", "blocks_expanded_total_if_off": 200, "fits_one_build": false}
+            ])
+        );
+        let ways = note["ways_through"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect::<Vec<_>>().join("\n");
+        assert!(ways.contains("switch off the layer the block references are on"), "{ways}");
+        assert!(ways.contains("Switching off the layers of the references' contents does not reduce the count"), "{ways}");
+        assert!(ways.contains("Trees leaves 100, which fits one build; Shrubs leaves 200"), "{ways}");
+        assert!(!ways.contains("Bark"), "the contents' layer is not advised: {ways}");
+        // The advice is right: the references' layer off cuts the build's count to what is said, the
+        // contents' layer off changes nothing.
+        let built = |args: Value| {
+            let mut a = json!({"space": "Model"});
+            a.as_object_mut().unwrap().extend(args.as_object().unwrap().clone());
+            let mut p = preview::prepare(&d, &a, &c).unwrap();
+            p.block_cap = usize::MAX;
+            p.list_for(&p.window, 800.0, &c).unwrap().expanded
+        };
+        assert_eq!(built(json!({})), 300);
+        assert_eq!(built(json!({"layers_off": ["Bark"]})), 300);
+        assert_eq!(built(json!({"layers_off": ["Trees"]})), 100);
+        assert_eq!(built(json!({"layers_off": ["Shrubs"]})), 200);
+        assert_eq!(built(json!({"layers_off": ["Trees", "Shrubs"]})), 0);
+        // Every reference on one layer: said so, and no list of layers that split anything.
+        let mut one = Drawing::new_metric();
+        one.layers.push(Layer { name: "Trees".into(), on: true, ..Default::default() });
+        one.blocks.insert("Tree".into(), d.blocks["Tree"].clone());
+        for k in 0..60 {
+            one.add(&Space::Model, Common { layer: "Trees".into(), ..Common::default() }, tree(f64::from(k) * 10.0)).unwrap();
+        }
+        let mut prep = preview::prepare(&one, &json!({"space": "Model"}), &c).unwrap();
+        prep.block_cap = 100;
+        let list = prep.list_for(&prep.window, 800.0, &c).unwrap();
+        let note = prep.blocks_note(&prep.window, list.expanded, None, &c).unwrap().unwrap();
+        let ways = note["ways_through"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect::<Vec<_>>().join("\n");
+        assert!(ways.contains("every block reference is on one layer (Trees)") && ways.contains("cannot split the drawing into passes"), "{ways}");
+    }
+
+    /// An array of more than 10,000 columns is drawn short; every answer that draws says so
+    /// (also when nothing is truncated) and names the way to draw all of it.
+    #[test]
+    fn an_array_drawn_short_is_reported() {
+        use cadcraft_engine::doc::{Block, Common, Entity, Handle, Insert, Line};
+        use cadcraft_engine::geom::Vec3;
+        let c = ctx(None, true);
+        let mut d = Drawing::new_metric();
+        let mut b = Block::new("Pole");
+        b.entities.push(Entity::new(Handle(900), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(0.0, 4.0, 0.0) })));
+        d.blocks.insert("Pole".into(), std::sync::Arc::new(b));
+        let array = |cols: u32| {
+            EntityKind::Insert(Insert {
+                block: "Pole".into(),
+                insert: Vec3::ZERO,
+                scale: Vec3::new(1.0, 1.0, 1.0),
+                rotation: 0.0,
+                attribs: vec![],
+                cols,
+                rows: 1,
+                col_spacing: 2.0,
+                row_spacing: 0.0,
+            })
+        };
+        let h = d.add(&Space::Model, Common::default(), array(12_000)).unwrap();
+        let prep = preview::prepare(&d, &json!({"space": "Model"}), &c).unwrap();
+        let list = prep.list_for(&prep.window, 800.0, &c).unwrap();
+        assert_eq!(list.prims.len(), 10_000);
+        let note = prep.blocks_note(&prep.window, list.expanded, None, &c).unwrap().unwrap();
+        assert!(note.get("blocks_truncated").is_none(), "{note}");
+        assert_eq!(note["arrays_clamped"], json!([{"handle": h.hex(), "block": "Pole", "cols": 12_000, "rows": 1, "drawn_cols": 10_000, "drawn_rows": 1}]));
+        let text = note["arrays_clamped_note"].as_str().unwrap();
+        assert!(text.contains("drawn short") && text.contains("10,000 columns and 10,000 rows") && text.contains("arrayrect"), "{text}");
+        // An array within the limit says nothing.
+        let mut ok = d.clone();
+        ok.remove_entity(h);
+        ok.add(&Space::Model, Common::default(), array(9_000)).unwrap();
+        let prep = preview::prepare(&ok, &json!({"space": "Model"}), &c).unwrap();
+        let list = prep.list_for(&prep.window, 800.0, &c).unwrap();
+        let note = prep.blocks_note(&prep.window, list.expanded, None, &c).unwrap().unwrap();
+        assert!(note.get("arrays_clamped").is_none() && note["blocks_expanded_total"] == json!(18_000), "{note}");
+    }
+
+    /// A PDF answer gives each sheet's figures and totals that add up: a sheet's "not drawn" is
+    /// never more than its total, and the sum of the sheets' is the answer's.
+    #[test]
+    fn a_pdf_note_gives_the_sheets_figures_and_they_add_up() {
+        use cadcraft_engine::doc::{Block, Common, Entity, Handle, Insert, Line};
+        use cadcraft_engine::geom::Vec3;
+        let mut d = Drawing::new_metric();
+        let mut b = Block::new("A");
+        b.entities.push(Entity::new(Handle(900), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(1.0, 1.0, 0.0) })));
+        d.blocks.insert("A".into(), std::sync::Arc::new(b));
+        let array = |cols: u32, rows: u32| {
+            EntityKind::Insert(Insert {
+                block: "A".into(),
+                insert: Vec3::ZERO,
+                scale: Vec3::new(1.0, 1.0, 1.0),
+                rotation: 0.0,
+                attribs: vec![],
+                cols,
+                rows,
+                col_spacing: 2.0,
+                row_spacing: 2.0,
+            })
+        };
+        // The model needs 2 x 100 = 200 and the layout's own reference 2 x 20 = 40, with a limit of 50.
+        d.add(&Space::Model, Common::default(), array(10, 10)).unwrap();
+        d.add(&Space::Paper("Layout1".into()), Common::default(), array(5, 4)).unwrap();
+        let o = cadcraft_io::PdfOptions { max_block_expansion: 50, ..Default::default() };
+        let plotted = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[Space::Model, Space::Paper("Layout1".into())], &o).unwrap();
+        let note = preview::pdf_blocks_note(&plotted.blocks);
+        let sheets = note["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 2);
+        assert_eq!((&sheets[0]["sheet"], &sheets[0]["blocks_expanded_total"], &sheets[0]["blocks_not_drawn"]), (&json!("Model"), &json!(200), &json!(150)));
+        // The layout's sheet is under the limit: drawn whole, nothing not drawn.
+        assert_eq!((&sheets[1]["sheet"], &sheets[1]["blocks_expanded_total"], &sheets[1]["blocks_not_drawn"]), (&json!("Layout1"), &json!(40), &json!(0)));
+        assert!(sheets[1].get("blocks_truncated").is_none());
+        let sum = |k: &str| sheets.iter().map(|s| s[k].as_u64().unwrap()).sum::<u64>();
+        assert_eq!(note["blocks_expanded_total"], json!(sum("blocks_expanded_total")));
+        assert_eq!(note["blocks_not_drawn"], json!(sum("blocks_not_drawn")));
+        assert!(sheets.iter().all(|s| s["blocks_not_drawn"].as_u64() <= s["blocks_expanded_total"].as_u64()));
+        assert_eq!(note["blocks_truncated_sheets"], json!(["Model"]));
+        assert_eq!(note["largest_object"], serde_json::Value::Null);
+        assert_eq!(sheets[0]["largest_object"]["kind"], json!("array of block references (MINSERT)"));
+        let ways = note["ways_through"][0].as_str().unwrap();
+        assert!(ways.starts_with("windows and tiles cannot complete this"), "{ways}");
+        // Nothing past the limit: the figures only.
+        let fine = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[Space::Model], &cadcraft_io::PdfOptions::default()).unwrap();
+        let note = preview::pdf_blocks_note(&fine.blocks);
+        assert_eq!(note, json!({"blocks_expanded_total": 200, "sheets": [{"sheet": "Model", "blocks_expanded_total": 200, "blocks_not_drawn": 0}]}));
+    }
+
+    /// What counting costs per tile of a tiled preview (L2): the objects a tile takes were picked
+    /// twice (once to build, once to count), now once. Prints both for 4 x 4 tiles of 400,000
+    /// objects (`cargo test -p cadcraft-mcp counting_cost -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn counting_cost_per_tile() {
+        use cadcraft_engine::doc::{Block, Common, Entity, Handle, Insert, Line};
+        use cadcraft_engine::geom::Vec3;
+        let c = ctx(None, true);
+        let mut d = Drawing::new_metric();
+        let mut b = Block::new("Tree");
+        for k in 0..4u64 {
+            b.entities.push(Entity::new(Handle(900 + k), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(3.0, 1.0 + k as f64, 0.0) })));
+        }
+        d.blocks.insert("Tree".into(), std::sync::Arc::new(b));
+        for k in 0..400_000u32 {
+            let at = Vec3::new(f64::from(k % 800) * 10.0, f64::from(k / 800) * 10.0, 0.0);
+            let kind = if k % 4 == 0 {
+                EntityKind::Insert(Insert {
+                    block: "Tree".into(),
+                    insert: at,
+                    scale: Vec3::new(1.0, 1.0, 1.0),
+                    rotation: 0.0,
+                    attribs: vec![],
+                    cols: 1,
+                    rows: 1,
+                    col_spacing: 0.0,
+                    row_spacing: 0.0,
+                })
+            } else {
+                EntityKind::Line(Line { a: at, b: at + Vec3::new(6.0, 4.0, 0.0) })
+            };
+            d.add(&Space::Model, Common::default(), kind).unwrap();
+        }
+        let prep = preview::prepare(&d, &json!({"space": "Model"}), &c).unwrap();
+        let tiles = preview::tiles(&prep.window, &json!({"tiles": {"cols": 4, "rows": 4}})).unwrap();
+        let t = std::time::Instant::now();
         for (_, win) in &tiles {
-            let need = prep.expansions(win);
-            assert!(need <= 300, "{need}");
-            sum += need;
-            let note = prep.blocks_note(win).unwrap();
-            assert!(note.get("blocks_truncated").is_none(), "{note}");
-            let mut out = Vec::new();
-            let (_, expanded) = prep.write_svg(&mut out, win, 1600.0, &c).unwrap_or_else(|_| panic!("tile"));
-            assert_eq!(expanded as u64, need);
+            let picked = prep.pick(win, &c).unwrap(); // the build's pick
+            let again = prep.pick(win, &c).unwrap(); // the count's own pick (before)
+            prep.census(win, Some(&again), &c).unwrap();
+            assert_eq!(picked.len(), again.len());
         }
-        assert!(sum >= total);
-        // Another space and a PDF get their own ways.
-        let layout = preview::ways_through(300, 2100, preview::Through::Layout).join(" ");
-        assert!(layout.contains("viewport: <handle>") && layout.contains("does not reduce"), "{layout}");
-        let pdf = preview::pdf_blocks_note(&[
-            cadcraft_io::SheetBlocks { sheet: "Model".into(), total: 5, expanded: 5 },
-            cadcraft_io::SheetBlocks { sheet: "Layout1".into(), total: 2_500_000, expanded: 2_000_001 },
-        ]);
-        assert_eq!(pdf["blocks_truncated"], json!(true));
-        assert_eq!(pdf["blocks_expanded_total"], json!(2_500_000));
-        assert_eq!(pdf["blocks_not_drawn"], json!(500_000));
-        assert_eq!(pdf["blocks_truncated_sheets"], json!(["Layout1"]));
-        assert!(pdf["ways_through"][0].as_str().unwrap().contains("only places the drawing on the page"));
-        let fine = preview::pdf_blocks_note(&[cadcraft_io::SheetBlocks { sheet: "Model".into(), total: 12, expanded: 12 }]);
-        assert_eq!(fine, json!({"blocks_expanded_total": 12}));
-        let entry = merged(json!({"path": "a.svg"}), prep.blocks_note_for(1_000));
-        assert_eq!(entry["blocks_truncated"], json!(true));
-        let entry = merged(json!({"path": "a.svg"}), prep.blocks_note_for(300));
-        assert!(entry.get("blocks_truncated").is_none() && entry["blocks_expanded_total"] == json!(300));
+        let before = t.elapsed();
+        let t = std::time::Instant::now();
+        for (_, win) in &tiles {
+            let picked = prep.pick(win, &c).unwrap();
+            prep.census(win, Some(&picked), &c).unwrap();
+        }
+        let after = t.elapsed();
+        let t = std::time::Instant::now();
+        for (_, win) in &tiles {
+            prep.pick(win, &c).unwrap();
+        }
+        println!("16 tiles of 400,000 objects: pick + count again {before:?}; pick once, count from it {after:?}; the pick alone {:?}", t.elapsed());
     }
 
     /// An SVG export that is stopped leaves nothing of itself: no file, no temporary file, and an

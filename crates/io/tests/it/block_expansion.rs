@@ -97,18 +97,40 @@ fn block_survey() {
     }
 }
 
-/// A PDF plot says per sheet how many block expansions it needed (counted before building) and
-/// drew; under the limit nothing is truncated, and the count is the build's.
+/// A PDF plot says per sheet how many block expansions it needed and drew; under the limit
+/// nothing is truncated, and the figure is the build's count.
 #[test]
 fn a_pdf_plot_reports_its_block_expansions() {
     let d = read(&minsert(3, 2));
     let plotted = cadcraft_io::plot_with_blocks(&d, &Space::Model, &serde_json::json!({})).unwrap();
     assert!(plotted.bytes.starts_with(b"%PDF"));
     // Six copies, each the copy itself and its one line.
-    assert_eq!(plotted.blocks, vec![cadcraft_io::SheetBlocks { sheet: "Model".into(), total: 12, expanded: 12 }]);
-    assert!(!plotted.blocks[0].truncated());
+    let [sheet] = &plotted.blocks[..] else { panic!("{:?}", plotted.blocks) };
+    assert_eq!((sheet.sheet.as_str(), sheet.total, sheet.expanded, sheet.limit), ("Model", 12, 12, MAX_BLOCK_EXPANSION));
+    assert!(!sheet.truncated() && sheet.not_drawn() == 0);
+    assert_eq!(sheet.census.total, 12);
     assert_eq!(cadcraft_io::plot(&d, &Space::Model, &serde_json::json!({})).unwrap().len(), plotted.bytes.len());
-    // Past the limit: the count says how many were asked for and `truncated` says contents were left out.
-    let big = cadcraft_io::SheetBlocks { sheet: "Model".into(), total: MAX_BLOCK_EXPANSION as u64 + 1, expanded: MAX_BLOCK_EXPANSION + 1 };
-    assert!(big.truncated());
+}
+
+/// A real plot past the limit (lowered through `PdfOptions`, the way the render tests lower
+/// `Options::max_block_expansion`): the sheet is truncated, says what the block table asks for and
+/// what was not drawn, and names the one object that needs it all.
+#[test]
+fn a_pdf_plot_past_the_limit_says_how_much_was_not_drawn() {
+    let d = read(&minsert(10, 10));
+    let o = cadcraft_io::PdfOptions { max_block_expansion: 50, ..Default::default() };
+    let plotted = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[Space::Model], &o).unwrap();
+    assert!(plotted.bytes.starts_with(b"%PDF"));
+    let [sheet] = &plotted.blocks[..] else { panic!("{:?}", plotted.blocks) };
+    // 100 copies, each the copy and its line: 200 asked for; the build stopped past 50.
+    assert!(sheet.truncated());
+    assert_eq!((sheet.total, sheet.limit, sheet.not_drawn()), (200, 50, 150));
+    assert!(sheet.expanded > 50 && sheet.expanded < 200, "{}", sheet.expanded);
+    let largest = sheet.census.largest.as_ref().unwrap();
+    assert_eq!((largest.kind, largest.block.as_str(), largest.count), ("array of block references (MINSERT)", "A", 200));
+    // The same plot with the real limit draws it whole.
+    let whole = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[Space::Model], &cadcraft_io::PdfOptions::default()).unwrap();
+    assert!(!whole.blocks[0].truncated());
+    assert_eq!(whole.blocks[0].total, 200);
+    assert!(whole.bytes.len() > plotted.bytes.len());
 }
