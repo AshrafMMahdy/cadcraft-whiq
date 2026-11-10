@@ -33,8 +33,22 @@ fn opacity(p: &cadcraft_render::DPrim) -> String {
     format!(r#" opacity="{:.2}""#, f64::from(p.alpha()) / 255.0)
 }
 
-/// Write a display list (as [`export_window`] does for a space's own).
+/// Write a display list (as [`export_window`] does for a space's own) as a string.
 pub fn export_list(list: &cadcraft_render::DisplayList, window: Option<Bounds2>) -> String {
+    let mut bytes = Vec::new();
+    // A `Vec` takes every write; the text is made of `str`s, so it is valid UTF-8 throughout.
+    let _ = write_list(&mut bytes, list, window);
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Text made and not yet sent to the writer.
+const FLUSH: usize = 1 << 16;
+
+/// Write a display list as [`export_list`] makes it, to `out` as it goes: the header first (the
+/// view box and decimal places come from `list.bounds` or `window`, known before any primitive is
+/// written), then the primitives in blocks, so the file is never one string in memory. The bytes
+/// are exactly those of [`export_list`].
+pub fn write_list<W: std::io::Write>(mut out: W, list: &cadcraft_render::DisplayList, window: Option<Bounds2>) -> std::io::Result<()> {
     let window = window.filter(|w| !w.is_empty());
     let b = window.unwrap_or(list.bounds);
     // A single point (or a zero-size window) has no extent: show a unit box centred on it.
@@ -118,7 +132,12 @@ pub fn export_list(list: &cadcraft_render::DisplayList, window: Option<Bounds2>)
                 }
             }
         }
+        if s.len() >= FLUSH {
+            out.write_all(s.as_bytes())?;
+            s.clear();
+        }
     }
     s.push_str("</svg>");
-    s
+    out.write_all(s.as_bytes())?;
+    out.flush()
 }

@@ -188,3 +188,24 @@ under the limit, past it, and with a plot-style table with wide lines, ends, joi
 different picture: viewports have no twist angle in this code (no rotated views), so every viewport kind the code has
 is covered. Plots (PDF, plot-style layers, text glyph notes) are still built whole: slicing is for the screen build.
 Not sliced: `render_preview` of a layout still builds the whole layout per tile (it returns the SVG inline).
+
+## 9. The older SVG writer (part C)
+
+`io::svg::write_list(out, list, window)` writes the SVG of a built display list to a writer as it goes: the header
+first (the view box and decimals come from `list.bounds` or the window, known before any primitive), then the
+primitives sent in blocks of 64 KB; a write error (disk full) comes back as an error. `export_list` keeps its String
+signature and is now `write_list` into a `Vec` (callers that need bytes or a string are unchanged); test
+`the_streaming_writer_makes_the_bytes_of_the_string_writer` compares with a verbatim copy of the old writer for
+every primitive kind (opaque and transparent polylines, triangles, a wipeout mask, points, a ray and an infinite
+line), with and without a window, a zero-size window, an empty list and 20,000 primitives. No caller in this
+workspace writes a file with it (`write_framed` and the plotter's svg return bytes; the MCP uses its own `SvgWriter`),
+so none was changed.
+
+What it would take for those callers to also *build* the list in slices: `write_framed` svg and the plotter's
+model-space svg call `build_plot` and then `pen::apply` with a scale that depends on the whole list's bounds
+(`fit_scale(window or list.bounds)`), and the header's view box depends on `list.bounds` when no window is given: the
+bounds are only known after the build. With a window (`write_framed`'s framed case, the plotter's paper bounds) they
+are known before, so the build can be sliced exactly like `build_slice`; without one, either the bounds come from the
+extents (`d.extents`, which is not the list's bounds: text and wide lines differ, so the picture would not be
+byte-identical) or the build runs twice (once for the bounds). `build_plot` also needs a plot variant of `build_slice`
+(the layers and text glyph notes the plot keeps). Not a small change; not built.
