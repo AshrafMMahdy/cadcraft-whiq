@@ -69,11 +69,18 @@ const ROUND_STEPS: usize = 12;
 /// fills become the pattern's pieces. Each primitive stays one primitive (same order, handle and
 /// colour) and the pens are used up, so applying twice changes nothing.
 pub fn apply(list: &mut DisplayList, mm_per_unit: f64) {
+    let mut budget = MAX_PATTERN_CELLS;
+    apply_budgeted(list, mm_per_unit, &mut budget);
+}
+
+/// [`apply`] for a list that is one piece of a bigger one drawn in pieces: `budget` (start it at
+/// [`MAX_PATTERN_CELLS`]) is the pattern cells left, carried from one piece to the next, so the
+/// pieces together turn out what [`apply`] of the whole list does.
+pub fn apply_budgeted(list: &mut DisplayList, mm_per_unit: f64, budget: &mut usize) {
     let pens = std::mem::take(&mut list.pens);
     if !(mm_per_unit.is_finite() && mm_per_unit > 0.0) {
         return;
     }
-    let mut budget = MAX_PATTERN_CELLS;
     for (i, pen) in pens.iter().enumerate() {
         let Some(p) = list.prims.get(i).copied() else { break };
         let out = match p.kind {
@@ -81,7 +88,7 @@ pub fn apply(list: &mut DisplayList, mm_per_unit: f64) {
                 let hw = f64::from(p.lw) / 2.0 / mm_per_unit;
                 Some(stroke(list.points(&p), hw, pen.end, pen.join))
             }
-            Kind::Tris if pen.patterned() => pattern(list.points(&p), pen.fill, PATTERN_MM / mm_per_unit, &mut budget),
+            Kind::Tris if pen.patterned() => pattern(list.points(&p), pen.fill, PATTERN_MM / mm_per_unit, budget),
             _ => None,
         };
         let Some(tris) = out else { continue };

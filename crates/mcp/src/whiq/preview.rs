@@ -460,8 +460,9 @@ impl Prepared<'_> {
     /// What [`Prepared::list_for`] returns, handed to `each` in pieces drawn one after the other:
     /// model space in slices of [`SLICE_ENTITIES`] entities in their stored draw order (so
     /// overlaps and wipeouts draw as in the whole list), each built, handed over and dropped
-    /// before the next; a layout, whose viewports and sheet need the whole build, in one piece.
-    /// For a drawing too big to hold the display list of at once.
+    /// before the next; a layout the same: its own objects and each viewport's model-space
+    /// contents in slices in draw order (`render::build_layout_slices`). For a drawing too big to
+    /// hold the display list of at once.
     pub fn each_list(
         &self,
         window: &Bounds2,
@@ -480,10 +481,18 @@ impl Prepared<'_> {
         slice: usize,
         each: &mut dyn FnMut(&DisplayList) -> Result<(), WriteErr>,
     ) -> Result<usize, WriteErr> {
-        if !matches!(self.target.space, Space::Model) {
-            let list = self.list_for(window, width_px, ctx)?;
-            each(&list)?;
-            return Ok(list.expanded);
+        if let Space::Paper(name) = &self.target.space {
+            // A layout: the sheet's own objects and each viewport's model-space contents in slices
+            // in draw order, each viewport's clip applied as the whole build does.
+            let opts = self.options(window, width_px, ctx);
+            ctx.stage("building the display list", 0);
+            ctx.check()?;
+            let expanded = cadcraft_engine::render::build_layout_slices(self.drawing(), name, &opts, slice, &mut |list: &DisplayList| {
+                ctx.check()?;
+                each(list)
+            })?;
+            ctx.check()?;
+            return Ok(expanded);
         }
         let d = self.drawing();
         let opts = self.options(window, width_px, ctx);

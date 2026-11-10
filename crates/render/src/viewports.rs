@@ -39,12 +39,12 @@ pub(crate) fn viewport(b: &mut Builder, d: &Drawing, e: &Entity, vp: &cadcraft_d
 
 /// Whether a viewport draws anything: id 1 is the paper-space view itself, and a hidden viewport
 /// or one on a frozen layer shows neither its border nor its contents.
-fn viewport_shown(d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewport) -> bool {
+pub(crate) fn viewport_shown(d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewport) -> bool {
     vp.id != 1 && e.common.visible && !d.is_hidden_object(e.handle) && !d.layer(&e.common.layer).is_some_and(|l| l.frozen)
 }
 
 /// A viewport's rectangle on paper; `None` for an unusable size or centre.
-fn viewport_rect(vp: &cadcraft_doc::Viewport) -> Option<Bounds2> {
+pub(crate) fn viewport_rect(vp: &cadcraft_doc::Viewport) -> Option<Bounds2> {
     let center = vp.center.xy();
     let ok = |v: f64| v.is_finite() && v > 0.0;
     (ok(vp.width) && ok(vp.height) && center.is_finite()).then(|| {
@@ -128,8 +128,21 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
                     part.list
                 })
                 .collect();
-            for part in parts {
-                append(&mut sub.list, part);
+            // As `build_parallel`: chunks racing for the budget drop block contents by thread
+            // timing once it runs out, so past the limit the parts are thrown away and the
+            // objects are built in draw order on this thread, where the first contents in draw
+            // order take the budget: the same picture every run. Below it nothing is dropped.
+            if budget.load(std::sync::atomic::Ordering::Relaxed) > opts.max_block_expansion {
+                drop(parts);
+                budget.store(b.list.expanded, std::sync::atomic::Ordering::Relaxed);
+                let c = ctx();
+                for me in d.model.iter().filter(|me| seen(me)) {
+                    entity(&mut sub, &c, me);
+                }
+            } else {
+                for part in parts {
+                    append(&mut sub.list, part);
+                }
             }
         }
     } else {
@@ -158,14 +171,14 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
 /// A viewport's scale, model-to-paper transform and the model window it shows (with slack: entity
 /// bounds are approximate, text and dimensions especially), for the part `area` of it (paper
 /// units). `None` for an unusable size, centre or scale.
-struct View {
-    s: f64,
-    xf: Mat3,
-    win: Bounds2,
+pub(crate) struct View {
+    pub(crate) s: f64,
+    pub(crate) xf: Mat3,
+    pub(crate) win: Bounds2,
 }
 
 impl View {
-    fn of(vp: &cadcraft_doc::Viewport, area: Bounds2) -> Option<View> {
+    pub(crate) fn of(vp: &cadcraft_doc::Viewport, area: Bounds2) -> Option<View> {
         let center = vp.center.xy();
         let ok = |v: f64| v.is_finite() && v > 0.0;
         if !(ok(vp.width) && ok(vp.height) && ok(vp.view_height) && center.is_finite() && vp.view_center.is_finite()) {
@@ -185,7 +198,7 @@ impl View {
 
 /// Whether model-space `me` is built for a viewport showing `win`: rays and infinite lines always,
 /// other objects when their bounds reach into it (and no viewports).
-fn model_seen(d: &Drawing, win: &Bounds2, me: &Entity) -> bool {
+pub(crate) fn model_seen(d: &Drawing, win: &Bounds2, me: &Entity) -> bool {
     if matches!(me.kind, EntityKind::Viewport(_)) {
         return false;
     }
@@ -231,7 +244,7 @@ pub fn viewport_clip(d: &Drawing, handle: Handle, vp: &cadcraft_doc::Viewport) -
 }
 
 /// What viewport contents are clipped to.
-enum Clip<'a> {
+pub(crate) enum Clip<'a> {
     /// The viewport rectangle (the fast path).
     Rect(Bounds2),
     /// A clip boundary's outline.
@@ -239,7 +252,7 @@ enum Clip<'a> {
 }
 
 /// Append `src` to `dst`, clipped to `clip`.
-fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
+pub(crate) fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
     for p in &src.prims {
         let pts = src.points(p);
         match (p.kind, clip) {

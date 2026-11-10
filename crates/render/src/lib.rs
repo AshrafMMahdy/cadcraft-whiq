@@ -308,11 +308,13 @@ mod display;
 mod draw;
 mod pipeline;
 mod props;
+mod slices;
 mod text_entity;
 mod viewports;
 
 pub use dim_draw::{dim_text, dimension_in};
 pub use display::{DPrim, DisplayList, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
+pub use slices::build_layout_slices;
 pub use pipeline::{Options, build, build_entities, build_plot, build_slice, count_expansions, count_space};
 use props::{default_lineweight, resolve_common};
 use text_entity::text_style;

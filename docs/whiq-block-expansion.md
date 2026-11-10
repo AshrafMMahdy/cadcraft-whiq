@@ -35,7 +35,7 @@ What it protects, measured:
 | `render_preview` svg (preview.rs `list_for`, `svg_tile`) | the whole display list of the tile, then the whole SVG `String` of the tile (and the JSON answer when it is returned inline) | one tile | `blocks_truncated` (since the last release) |
 | `render_preview` png (`preview::png`) | the display list of the tile plus the pixmap | one tile | `blocks_truncated` |
 | `export` svg model space (`write_svg_sliced`) | one slice of 16,384 top-level entities (`SLICE_ENTITIES`) as a display list, dropped before the next; the file is written as it goes | one slice (but a slice whose entities expand a lot is up to the whole limit: slicing is by top-level entity, not by expansion) | `blocks_truncated` |
-| `export` svg of a layout | the whole layout list (sheet, pens, viewports) then written | whole export | `blocks_truncated` |
+| `export` svg of a layout | one slice at a time since this round (`build_layout_slices`: the sheet's objects and each viewport's contents in draw order); before it the whole layout list | one slice | `blocks_truncated` |
 | `export` png | as `render_preview` png | the export | `blocks_truncated` |
 | `export` pdf (`io::pdf::plot` -> `sheet`) | one `DisplayList` per sheet (`build_plot` of the whole space; the plot window only places the drawing on the page, it does **not** leave out block references outside it), then the PDF writer's own document in memory, then the `Vec<u8>` | per sheet; the document until the file is written | **nothing before this round** (the answer never said); now `blocks_truncated` too |
 | the UI canvas (`ui-egui` `canvas/list.rs`, `rebuild.rs`) | the whole list of the open space, rebuilt at every 2x zoom step and edit, kept while the view is open | while the view is open | silent: no message to the user (a gap, not changed here) |
@@ -104,7 +104,7 @@ entry points per slice, and the up-front count to show progress and say "this wi
   top-level objects whose extent reaches the window (`reaches`, rays and infinite lines always), and the limit is per
   build, so a window, or each tile of `tiles: {cols, rows}` with `output`, is a build of its own: a window that needs
   fewer expansions than the limit is drawn whole. Not so: (1) inside a block the whole block is expanded, even the
-  copies of an array outside the window; (2) a layout is built whole and its window only clips the writer (the way to
+  copies of an array outside the window; (2) a layout's window only clips the writer (the layout is still all expanded) (the way to
   window a layout is `viewport: handle`, which renders that viewport's model view as a window; inside a layout build a
   viewport expands only the model objects reaching it); (3) **PDF does not cull by window**: `sheet()` calls
   `build_plot` of the whole space and the window only sets scale and placement, so `pages: [{window}]` (a book of
@@ -164,3 +164,27 @@ and it composes with (b).
 3. If streaming makes SVG/PNG complete at any size, what should stop a hostile bomb: keep a limit for it, and at what
    value, or the cancel alone? (No limit, timeout or fallback has been added.)
 4. The UI shows no message when the canvas truncates; should it say so (a status-bar line from `count_space`)?
+
+## 8. Layouts written in slices (part B)
+
+`render::build_layout_slices(d, name, opts, slice, each)` hands over display lists that drawn in turn are the list
+`build` makes of the layout: the sheet's own objects in slices of `slice`, and for each viewport, in stored order, its
+border (as a sheet object) and its model-space contents in slices of `slice` objects, each clipped to the viewport
+(rectangle or the clip boundary's outline) as the whole build clips them. What is carried from piece to piece: the
+block-expansion count (the limit is the layout's, taken in draw order) and the pattern cells left for plot-style fills
+(`pen::apply_budgeted`, the sheet's objects share one, each viewport's contents their own, as in the whole build).
+The model-space slices are built on all cores when big, like `build_slice`. `Prepared::each_list_sliced` uses it for
+a layout, so `export` svg of a layout is written slice by slice through the same atomic file write.
+
+Fix found on the way: `viewports::contents` built a viewport's contents on all cores for a model of 512 or more
+objects with no draw-order fallback, so past the limit the objects left out depended on thread timing; it now throws
+the parts away and builds in draw order like `build_parallel` (the test fails without the fix).
+
+Identical to today's: tests `a_layout_built_in_slices_is_the_whole_list` (render: the same primitives in the same
+order and the same expansion count, 2,400 model objects with block references, a sheet with objects below and over a
+rectangular viewport, a viewport clipped to a triangle and a viewport that is off, slices of 1, 7, 512 and 16,384,
+under the limit, past it, and with a plot-style table with wide lines, ends, joins and a patterned fill) and
+`a_layout_svg_written_in_slices_is_byte_identical_to_the_whole_list_one` (mcp: the SVG bytes). Not covered by a
+different picture: viewports have no twist angle in this code (no rotated views), so every viewport kind the code has
+is covered. Plots (PDF, plot-style layers, text glyph notes) are still built whole: slicing is for the screen build.
+Not sliced: `render_preview` of a layout still builds the whole layout per tile (it returns the SVG inline).

@@ -1331,3 +1331,110 @@ fn nested_count_vs_build() {
     let l = build(&d, &Space::Model, &Options::default());
     println!("built at the limit: expanded {} (limit {}) prims {} in {:?}", l.expanded, MAX_BLOCK_EXPANSION, l.prims.len(), t.elapsed());
 }
+
+/// A metric drawing with 2,400 model objects (a third of them block references) and a layout:
+/// lines below the viewports, a rectangular viewport, a viewport clipped to a triangle, a
+/// viewport that is off, lines, a circle and a block reference over them.
+fn layout_fixture() -> (Drawing, Space) {
+    let mut d = Drawing::new_metric();
+    let mut b = cadcraft_doc::Block::new("B");
+    for k in 0..2u64 {
+        let (c, kind) = line_common(Common { color: cadcraft_geom_red(), ..Default::default() });
+        b.entities.push(block_entity(1 + k, c, kind));
+    }
+    b.entities.push(block_entity(5, Common::default(), EntityKind::Circle(cadcraft_doc::Circle { center: Vec3::new(5.0, 5.0, 0.0), radius: 3.0 })));
+    d.blocks.insert("B".into(), std::sync::Arc::new(b));
+    for k in 0..2_400u32 {
+        let at = Vec3::new(f64::from(k % 80) * 10.0, f64::from(k / 80) * 10.0, 0.0);
+        let kind = match k % 3 {
+            0 => {
+                let EntityKind::Insert(mut i) = insert_of("B") else { unreachable!() };
+                i.insert = at;
+                EntityKind::Insert(i)
+            }
+            1 => EntityKind::Line(cadcraft_doc::Line { a: at, b: at + Vec3::new(6.0, 4.0, 0.0) }),
+            _ => EntityKind::Circle(cadcraft_doc::Circle { center: at, radius: 2.0 }),
+        };
+        d.add(&Space::Model, Common { color: cadcraft_geom_red(), lineweight: cadcraft_doc::Lineweight::Mm100(if k % 5 == 0 { 100 } else { 25 }), ..Default::default() }, kind)
+            .unwrap();
+    }
+    let paper = Space::Paper("Layout1".into());
+    let line = |x: f64, y: f64| EntityKind::Line(cadcraft_doc::Line { a: Vec3::new(x, y, 0.0), b: Vec3::new(x + 120.0, y + 30.0, 0.0) });
+    let wide = Common { color: cadcraft_geom_red(), lineweight: cadcraft_doc::Lineweight::Mm100(100), ..Default::default() };
+    d.add(&paper, Common::default(), line(0.0, 10.0)).unwrap();
+    d.add(&paper, wide.clone(), line(0.0, 40.0)).unwrap();
+    d.add(&paper, Common::default(), EntityKind::Viewport(vp(Vec2::new(60.0, 60.0), 100.0, 80.0, Vec2::new(300.0, 150.0), 320.0, 2))).unwrap();
+    let tri = [(150.0, 20.0), (250.0, 20.0), (200.0, 100.0)].map(|(x, y)| PolyVertex::new(Vec2::new(x, y))).to_vec();
+    let boundary = d
+        .add(&paper, Common::default(), EntityKind::LwPolyline(cadcraft_doc::LwPolyline { vertices: tri, closed: true, const_width: 0.0, elevation: 0.0, plinegen: false }))
+        .unwrap();
+    let mut clipped = vp(Vec2::new(200.0, 60.0), 100.0, 80.0, Vec2::new(500.0, 150.0), 340.0, 3);
+    clipped.clip = Some(boundary);
+    d.add(&paper, Common::default(), EntityKind::Viewport(clipped)).unwrap();
+    let mut off = vp(Vec2::new(300.0, 60.0), 40.0, 40.0, Vec2::new(100.0, 100.0), 80.0, 4);
+    off.on = false;
+    d.add(&paper, Common::default(), EntityKind::Viewport(off)).unwrap();
+    d.add(&paper, wide, line(20.0, 80.0)).unwrap();
+    d.add(&paper, Common::default(), EntityKind::Circle(cadcraft_doc::Circle { center: Vec3::new(100.0, 60.0, 0.0), radius: 30.0 })).unwrap();
+    let EntityKind::Insert(mut i) = insert_of("B") else { unreachable!() };
+    i.insert = Vec3::new(90.0, 50.0, 0.0);
+    d.add(&paper, Common::default(), EntityKind::Insert(i)).unwrap();
+    (d, paper)
+}
+
+fn cadcraft_geom_red() -> cadcraft_color::Color {
+    cadcraft_color::Color::Index(1)
+}
+
+/// The primitives of `lists` in order, each with its points (the arrays they index differ).
+fn flat(lists: &[DisplayList]) -> Vec<(DPrim, Vec<Vec2>)> {
+    lists.iter().flat_map(|l| l.prims.iter().map(|p| (DPrim { start: 0, ..*p }, l.points(p).to_vec()))).collect()
+}
+
+/// A layout built in pieces is the whole build's list: the same primitives in the same order, for
+/// slices of 1, 7, 512 and 16,384 objects, under the block-expansion limit and past it (the budget
+/// is taken in draw order, so the same ones are left out), and with a plot style table (pens, the
+/// pattern budget carried from piece to piece).
+#[test]
+fn a_layout_built_in_slices_is_the_whole_list() {
+    let (d, paper) = layout_fixture();
+    let Space::Paper(name) = &paper else { unreachable!() };
+    let table = {
+        let t = cadcraft_doc::PlotStyleTable::color_dependent("pens.ctb", "", |i| {
+            (i == 1).then(|| cadcraft_doc::PlotStyle {
+                lineweight: Some(100),
+                end: cadcraft_doc::EndStyle::Square,
+                join: cadcraft_doc::JoinStyle::Diamond,
+                fill: cadcraft_doc::FillStyle::Checkerboard,
+                ..Default::default()
+            })
+        });
+        Some(std::sync::Arc::new(t))
+    };
+    let full = build(&d, &paper, &Options { lineweights: true, ..Default::default() });
+    let need = full.expanded;
+    assert!(need > 3_000 && full.prims.len() > 3_000, "{need} {}", full.prims.len());
+    for (what, opts) in [
+        ("under the limit", Options { lineweights: true, ..Default::default() }),
+        ("past the limit", Options { lineweights: true, max_block_expansion: need / 3, ..Default::default() }),
+        ("plot styles", Options { lineweights: true, plot_style_table: table, ..Default::default() }),
+    ] {
+        let whole = build(&d, &paper, &opts);
+        if what == "past the limit" {
+            assert!(opts.blocks_truncated(whole.expanded), "{what}");
+        }
+        for _ in 0..3 {
+            assert!(flat(&[build(&d, &paper, &opts)]) == flat(std::slice::from_ref(&whole)), "{what}: the whole build changes between runs");
+        }
+        for slice in [1, 7, 512, 16_384] {
+            let mut lists = Vec::new();
+            let expanded = build_layout_slices::<()>(&d, name, &opts, slice, &mut |l| {
+                lists.push(l.clone());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(expanded, whole.expanded, "{what}, slice {slice}");
+            assert!(flat(&lists) == flat(std::slice::from_ref(&whole)), "{what}, slice {slice}: {} pieces", lists.len());
+        }
+    }
+}

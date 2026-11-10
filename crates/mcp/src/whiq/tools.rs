@@ -86,7 +86,7 @@ pub fn definitions() -> Vec<Value> {
                 "background": {"type": "string", "enum": ["light", "dark"]}, "lineweights": {"type": "boolean"},
                 "output": {"type": "string", "description": "Write the SVG/PNG file(s) here (tiles get -c<col>r<row>) instead of answering them"}}},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG of model space is written in slices as it is made; a paper-space layout is still built whole in memory before it is written. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every svg / png / pdf answer says blocks_expanded_total, and past the limit blocks_truncated, blocks_not_drawn and ways_through (a PDF sheet is one build of the whole space, its window only places it on the page). Ways through: export svg / png once per window (a window expands only the objects reaching it, each export is its own build), or layers_off / only_layers for a pass per layer set.",
+        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG is written to the file in slices as it is made: model space in slices of objects in draw order, and a paper-space layout the same (its own objects and each viewport's model-space contents in draw order, each viewport's clip applied), so a big layout is not held whole in memory. One build draws at most 2,000,000 block expansions (each block copy and each entity in it, nested blocks counted); every svg / png / pdf answer says blocks_expanded_total, and past the limit blocks_truncated, blocks_not_drawn and ways_through (a PDF sheet is one build of the whole space, its window only places it on the page). Ways through: export svg / png once per window (a window expands only the objects reaching it, each export is its own build), or layers_off / only_layers for a pass per layer set.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "source": {"type": "string", "description": "Open this drawing first"}, "path": {"type": "string", "description": "The file to write (its extension picks the format)"},
                 "format": {"type": "string", "enum": ["dxf", "dwg", "pdf", "svg", "png"]}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"},
                 "space": {"type": ["string", "array"], "description": "model (default), a layout, a list, or all"}, "window": window,
@@ -1610,6 +1610,100 @@ mod tests {
             assert!(note.get("blocks_truncated").is_none() && note.get("ways_through").is_none());
             assert!(String::from_utf8(out).unwrap() == whole, "slice of {slice} entities");
         }
+    }
+
+    /// A layout with sheet objects below and over two viewports (one clipped to a triangle) and
+    /// 2,400 model objects, a third of them block references.
+    fn layout_drawing() -> Drawing {
+        use cadcraft_engine::doc::{Block, Circle, Common, Entity, Handle, Insert, Line, LwPolyline, Solid, Viewport};
+        use cadcraft_engine::geom::{PolyVertex, Vec2, Vec3};
+        let mut d = Drawing::new_metric();
+        let mut b = Block::new("B");
+        for k in 0..2u64 {
+            let mut e = Entity::new(Handle(900 + k), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(6.0, 4.0, 0.0) }));
+            e.common = Common::default();
+            b.entities.push(e);
+        }
+        d.blocks.insert("B".into(), std::sync::Arc::new(b));
+        let insert = |at: Vec3| {
+            EntityKind::Insert(Insert {
+                block: "B".into(),
+                insert: at,
+                scale: Vec3::new(1.0, 1.0, 1.0),
+                rotation: 0.0,
+                attribs: vec![],
+                cols: 1,
+                rows: 1,
+                col_spacing: 0.0,
+                row_spacing: 0.0,
+            })
+        };
+        for k in 0..2_400u32 {
+            let at = Vec3::new(f64::from(k % 80) * 10.0, f64::from(k / 80) * 10.0, 0.0);
+            let kind = match k % 3 {
+                0 => insert(at),
+                1 => EntityKind::Line(Line { a: at, b: at + Vec3::new(6.0, 4.0, 0.0) }),
+                _ => EntityKind::Circle(Circle { center: at, radius: 2.0 }),
+            };
+            d.add(&Space::Model, Common::default(), kind).unwrap();
+        }
+        let solid = |x: f64| {
+            EntityKind::Solid(Solid { corners: [Vec3::new(x, 0.0, 0.0), Vec3::new(x + 8.0, 0.0, 0.0), Vec3::new(x, 8.0, 0.0), Vec3::new(x + 8.0, 8.0, 0.0)] })
+        };
+        d.add(&Space::Model, Common::default(), solid(100.0)).unwrap();
+        let paper = Space::Paper("Layout1".into());
+        d.add(&paper, Common::default(), solid(10.0)).unwrap();
+        let line = |x: f64, y: f64| EntityKind::Line(Line { a: Vec3::new(x, y, 0.0), b: Vec3::new(x + 120.0, y + 30.0, 0.0) });
+        let vp = |c: Vec2, vc: Vec2, h: f64, id: u32| Viewport {
+            center: c.to3(0.0),
+            width: 100.0,
+            height: 80.0,
+            view_center: vc,
+            view_height: h,
+            id,
+            locked: false,
+            frozen_layers: Vec::new(),
+            layer_colors: Vec::new(),
+            clip: None,
+            on: true,
+        };
+        d.add(&paper, Common::default(), line(0.0, 10.0)).unwrap();
+        d.add(&paper, Common::default(), EntityKind::Viewport(vp(Vec2::new(60.0, 60.0), Vec2::new(300.0, 150.0), 320.0, 2))).unwrap();
+        let tri = [(150.0, 20.0), (250.0, 20.0), (200.0, 100.0)].map(|(x, y)| PolyVertex::new(Vec2::new(x, y))).to_vec();
+        let boundary = d
+            .add(&paper, Common::default(), EntityKind::LwPolyline(LwPolyline { vertices: tri, closed: true, const_width: 0.0, elevation: 0.0, plinegen: false }))
+            .unwrap();
+        let mut clipped = vp(Vec2::new(200.0, 60.0), Vec2::new(500.0, 150.0), 340.0, 3);
+        clipped.clip = Some(boundary);
+        d.add(&paper, Common::default(), EntityKind::Viewport(clipped)).unwrap();
+        d.add(&paper, Common::default(), line(20.0, 80.0)).unwrap();
+        d.add(&paper, Common::default(), EntityKind::Circle(Circle { center: Vec3::new(100.0, 60.0, 0.0), radius: 30.0 })).unwrap();
+        d
+    }
+
+    /// A paper-space layout written in slices (its own objects and each viewport's model-space
+    /// contents, clipped as in the whole build) is byte for byte the SVG of the whole display list,
+    /// for slices of 1, 512 and 16,384.
+    #[test]
+    fn a_layout_svg_written_in_slices_is_byte_identical_to_the_whole_list_one() {
+        let c = ctx(None, true);
+        let d = layout_drawing();
+        assert!(d.model.len() >= 2_000);
+        let prep = preview::prepare(&d, &json!({"space": "Layout1"}), &c).unwrap();
+        let list = prep.list_for(&prep.window, 1600.0, &c).unwrap();
+        assert!(list.prims.len() > 2_000, "{}", list.prims.len());
+        let whole = preview::svg_tile(&list, &prep.layers, &prep.window, 1600.0, false, &c).unwrap().0;
+        assert!(whole.contains("<polyline") && whole.contains("<path") && whole.contains(r#"data-layer="""#));
+        for slice in [1, 512, preview::SLICE_ENTITIES] {
+            let mut out = Vec::new();
+            let (n, expanded) = prep.write_svg_sliced(&mut out, &prep.window, 1600.0, &c, slice).unwrap_or_else(|_| panic!("slice {slice}"));
+            assert_eq!(n, out.len());
+            assert_eq!(expanded, list.expanded, "slice {slice}");
+            assert!(String::from_utf8(out).unwrap() == whole, "slice of {slice} objects");
+        }
+        // A stop between slices leaves the writer with an error, not a short file.
+        c.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(prep.write_svg_sliced(Vec::new(), &prep.window, 1600.0, &c, 512).is_err());
     }
 
     /// Past the block-expansion cap the answer says so in words: how many expansions the drawing
