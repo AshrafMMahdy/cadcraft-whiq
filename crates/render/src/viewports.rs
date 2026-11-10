@@ -210,28 +210,33 @@ pub(crate) fn model_seen(d: &Drawing, win: &Bounds2, me: &Entity) -> bool {
 }
 
 /// The block expansions the layout viewport `e` asks for (see [`super::count`]): what
-/// [`viewport`] builds, counted.
-pub(crate) fn count_viewport(d: &Drawing, e: &Entity, vp: &cadcraft_doc::Viewport, plotting: bool) -> u64 {
+/// [`viewport`] builds, counted, with what the walk noted. `off` are layers counted as switched off.
+pub(crate) fn count_viewport(
+    d: &Drawing,
+    e: &Entity,
+    vp: &cadcraft_doc::Viewport,
+    plotting: bool,
+    off: &[String],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> (u64, super::count::Stats) {
+    let mut counter = super::count::Counter::new(d, plotting, &vp.frozen_layers, off, cancel);
     if !viewport_shown(d, e, vp) || !vp.on {
-        return 0;
+        return (0, counter.stats);
     }
     let poly = viewport_clip(d, e.handle, vp);
     let area = match &poly {
         Some(p) => Some(p.bounds()),
         None => viewport_rect(vp),
     };
-    let Some(View { s, win, .. }) = area.and_then(|a| View::of(vp, a)) else { return 0 };
-    let mut counter = super::count::Counter::new(d, plotting, &vp.frozen_layers);
+    let Some(View { s, win, .. }) = area.and_then(|a| View::of(vp, a)) else { return (0, counter.stats) };
     let all = d.anno_all_visible();
-    d.model
+    let n = d
+        .model
         .iter()
         .filter(|me| model_seen(d, &win, me))
-        .map(|me| {
-            let hidden = cadcraft_doc::is_annotative(me)
-                && matches!(cadcraft_doc::anno_draw(me, 1.0 / s.max(1e-12), all), cadcraft_doc::AnnoDraw::Hidden);
-            counter.top(me, hidden)
-        })
-        .fold(0u64, u64::saturating_add)
+        .map(|me| counter.top(me, cadcraft_doc::anno_draw(me, 1.0 / s.max(1e-12), all)))
+        .fold(0u64, u64::saturating_add);
+    (n, counter.stats)
 }
 
 /// The clip region of a clipped viewport: the outline of its clip boundary entity, when that

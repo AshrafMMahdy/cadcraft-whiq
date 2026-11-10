@@ -2,6 +2,7 @@
 use super::display::append;
 use super::display::{DisplayList, Kind, NO_LAYER, PlotText, VIEWPORT_CONTENT};
 use super::draw::entity;
+use super::count::{ClampedArray, LargestRef, Stats};
 use super::viewports::{MAX_VIEWPORTS, viewport};
 use super::{Bounds2, Builder, Color, Ctx, Drawing, Entity, EntityKind, Handle, Lineweight, Mat3, Space, Vec2, paper, pen, plotstyle, point};
 
@@ -253,44 +254,119 @@ pub fn build_slice(d: &Drawing, ents: &[&Entity], opts: &Options, expanded: usiz
     b.list
 }
 
+/// A layer whose switching off makes the count smaller (see [`BlockCensus::layers_off`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerOff {
+    pub layer: String,
+    /// The expansions asked for with that layer off ([`COUNT_SATURATED`] when still more than can
+    /// be counted).
+    pub total_if_off: u64,
+}
+
+/// What counting the block expansions of a build finds, from the block table without building:
+/// the number, and what an answer needs when the build is too big or draws an array short.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlockCensus {
+    /// The expansions the build asks for ([`COUNT_SATURATED`], `u64::MAX`, when more than can be
+    /// counted: nested references multiply past 1.8e19).
+    pub total: u64,
+    /// The largest single top-level object: the build expands one whole, so windows cannot split it.
+    pub largest: Option<LargestRef>,
+    /// The layers the drawn references (block references, multileader blocks, dimension blocks)
+    /// sit on. The build takes one expansion for every entity of a block before it looks at the
+    /// entity's layer, so only the layer the *references* are on can reduce a count, not the
+    /// layers of their contents.
+    pub reference_layers: Vec<String>,
+    /// Only when `total` is past [`Options::max_block_expansion`]: each reference layer that
+    /// makes the count smaller when switched off, the smallest count first.
+    pub layers_off: Vec<LayerOff>,
+    /// Arrays with more columns or rows than the 10,000 the build draws.
+    pub clamped: Vec<ClampedArray>,
+}
+
+/// Count with `run` (the walk of the build's top-level objects with some layers counted as off:
+/// the count and what it noted), then, when that is past the limit, once more per reference layer.
+fn census_of(opts: &Options, run: impl Fn(&[String]) -> (u64, Stats)) -> BlockCensus {
+    let (total, stats) = run(&[]);
+    let mut c = BlockCensus {
+        total,
+        largest: stats.largest,
+        reference_layers: stats.layers.into_iter().collect(),
+        layers_off: Vec::new(),
+        clamped: stats.clamped.into_values().collect(),
+    };
+    if total > opts.max_block_expansion as u64 {
+        for l in &c.reference_layers {
+            if opts.cancelled() {
+                break;
+            }
+            let after = run(std::slice::from_ref(l)).0;
+            if after < total {
+                c.layers_off.push(LayerOff { layer: l.clone(), total_if_off: after });
+            }
+        }
+        c.layers_off.sort_by(|a, b| a.total_if_off.cmp(&b.total_if_off).then_with(|| a.layer.cmp(&b.layer)));
+    }
+    c
+}
+
 /// The block expansions building the loose entities `ents` asks for ([`DisplayList::expanded`] of
 /// a build with no limit), counted from the block table without building: what [`build_entities`]
 /// and [`build_slice`] (`plotting` false) or the plot's top-level objects (`plotting` true) will
-/// take from [`Options::max_block_expansion`]. Saturates at `u64::MAX`.
-pub fn count_expansions<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents: I, plotting: bool) -> u64 {
-    let mut counter = super::count::Counter::new(d, plotting, &[]);
-    ents.into_iter().map(|e| counter.top(e, hidden_by_scale(d, e))).fold(0, u64::saturating_add)
+/// take from [`Options::max_block_expansion`], with the largest object, the layers the references
+/// are on and the arrays drawn short. Stops early, with a count to discard, when `opts.cancel` is
+/// set.
+pub fn census_entities(d: &Drawing, ents: &[&Entity], plotting: bool, opts: &Options) -> BlockCensus {
+    census_of(opts, |off| {
+        let mut counter = super::count::Counter::new(d, plotting, &[], off, opts.cancel.as_deref());
+        let n = ents.iter().map(|e| counter.top(e, d.anno_draw(e))).fold(0, u64::saturating_add);
+        (n, counter.stats)
+    })
 }
 
-/// The block expansions [`build`] (`plotting` false) or [`build_plot`] (`plotting` true) of `space`
-/// asks for: the entities' own and, for a layout, those of each viewport's model-space contents.
-/// Counted from the block table without building; see [`count_expansions`].
-pub fn count_space(d: &Drawing, space: &Space, plotting: bool) -> u64 {
-    let Some(store) = d.space(space) else { return 0 };
-    if !matches!(space, Space::Paper(_)) {
-        return count_expansions(d, store.iter().map(|e| e.as_ref()), plotting);
-    }
-    let mut counter = super::count::Counter::new(d, plotting, &[]);
-    let mut viewports = 0usize;
-    let mut n = 0u64;
-    for e in store.iter() {
-        let more = if let EntityKind::Viewport(vp) = &e.kind {
-            if viewports >= MAX_VIEWPORTS {
-                continue;
-            }
-            viewports += 1;
-            super::viewports::count_viewport(d, e, vp, plotting)
+/// [`count_expansions`] with the notes: for [`build`] (`plotting` false) or [`build_plot`]
+/// (`plotting` true) of `space`, the entities' own and, for a layout, each viewport's model-space
+/// contents. Counted from the block table without building.
+pub fn census_space(d: &Drawing, space: &Space, plotting: bool, opts: &Options) -> BlockCensus {
+    census_of(opts, |off| {
+        let Some(store) = d.space(space) else { return (0, Stats::default()) };
+        let cancel = opts.cancel.as_deref();
+        let mut counter = super::count::Counter::new(d, plotting, &[], off, cancel);
+        let mut stats = Stats::default();
+        let mut n = 0u64;
+        if !matches!(space, Space::Paper(_)) {
+            n = store.iter().map(|e| counter.top(e, d.anno_draw(e))).fold(0, u64::saturating_add);
         } else {
-            counter.top(e, hidden_by_scale(d, e))
-        };
-        n = n.saturating_add(more);
-    }
-    n
+            let mut viewports = 0usize;
+            for e in store.iter() {
+                let more = if let EntityKind::Viewport(vp) = &e.kind {
+                    if viewports >= MAX_VIEWPORTS {
+                        continue;
+                    }
+                    viewports += 1;
+                    let (more, s) = super::viewports::count_viewport(d, e, vp, plotting, off, cancel);
+                    stats.absorb(s);
+                    more
+                } else {
+                    counter.top(e, d.anno_draw(e))
+                };
+                n = n.saturating_add(more);
+            }
+        }
+        stats.absorb(counter.stats);
+        (n, stats)
+    })
 }
 
-/// Whether the drawing's annotation scale hides the annotative top-level object `e`.
-fn hidden_by_scale(d: &Drawing, e: &Entity) -> bool {
-    cadcraft_doc::is_annotative(e) && matches!(d.anno_draw(e), cadcraft_doc::AnnoDraw::Hidden)
+/// The block expansions of [`census_entities`] (the number only).
+pub fn count_expansions<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents: I, plotting: bool) -> u64 {
+    let ents: Vec<&Entity> = ents.into_iter().collect();
+    census_entities(d, &ents, plotting, &Options::default()).total
+}
+
+/// The block expansions of [`census_space`] (the number only). Saturates at `u64::MAX`.
+pub fn count_space(d: &Drawing, space: &Space, plotting: bool) -> u64 {
+    census_space(d, space, plotting, &Options::default()).total
 }
 
 /// After a viewport is appended to a plot: the layers its contents carry in their handles

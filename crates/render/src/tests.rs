@@ -1266,10 +1266,150 @@ fn the_up_front_count_is_what_an_unlimited_build_expands() {
         d.add(&paper, Common::default(), EntityKind::Viewport(v)).unwrap();
     }
     d.add(&paper, Common::default(), insert_of("Outer")).unwrap();
+    // Annotation: dimensions with a block, multileaders with block content and annotative
+    // references (see `annotative_dimensions_count_what_the_build_expands`), also nested inside
+    // a block, where nothing is scaled and a dimension keeps its block.
+    let mut a = Drawing::new_imperial();
+    a.blocks.insert("DB".into(), std::sync::Arc::new(lines_block("DB", 5)));
+    a.blocks.insert("B".into(), std::sync::Arc::new(lines_block("B", 3)));
+    let mut holder = cadcraft_doc::Block::new("Holder");
+    holder.entities.push(block_entity(1, annotative(), dim_with_block("DB")));
+    holder.entities.push(block_entity(2, annotative(), mleader_with_block("B")));
+    holder.entities.push(block_entity(3, annotative(), insert_of("B")));
+    a.blocks.insert("Holder".into(), std::sync::Arc::new(holder));
+    for kind in [dim_with_block("DB"), mleader_with_block("B"), insert_of("Holder")] {
+        a.add(&Space::Model, Common::default(), kind.clone()).unwrap();
+        a.add(&Space::Model, annotative(), kind).unwrap();
+    }
+    check(&a, &Space::Model, "dimensions, multileaders and annotative references");
+    let paper = Space::Paper("Layout1".into());
+    a.add(&paper, annotative(), dim_with_block("DB")).unwrap();
+    a.add(&paper, annotative(), insert_of("Holder")).unwrap();
+    a.add(&paper, Common::default(), EntityKind::Viewport(vp(Vec2::new(50.0, 50.0), 100.0, 100.0, Vec2::new(0.0, 0.0), 400.0, 2))).unwrap();
+    check(&a, &paper, "annotation in a layout");
+
     let in_view = count_space(&d, &paper, false);
     let all_model = count_space(&d, &Space::Model, false);
     assert!(in_view > 0 && in_view < all_model, "{in_view} of {all_model}");
     check(&d, &paper, "layout");
+}
+
+/// Annotative at 1:1 (every viewport and the model show them: `ANNOALLVISIBLE` is on).
+fn annotative() -> Common {
+    Common { anno_scales: vec![cadcraft_doc::AnnoScale::new("1:1", 1.0, 1.0)], ..Default::default() }
+}
+
+/// A block of `n` lines.
+fn lines_block(name: &str, n: u64) -> cadcraft_doc::Block {
+    let mut b = cadcraft_doc::Block::new(name);
+    for k in 0..n {
+        let (c, kind) = line_common(Common::default());
+        b.entities.push(block_entity(1 + k, c, kind));
+    }
+    b
+}
+
+fn dim_with_block(block: &str) -> EntityKind {
+    EntityKind::Dimension(cadcraft_doc::Dimension { block: Some(block.into()), ..lin_dim() })
+}
+
+fn mleader_with_block(block: &str) -> EntityKind {
+    let EntityKind::Insert(ins) = insert_of(block) else { unreachable!() };
+    EntityKind::MLeader(cadcraft_doc::MLeader {
+        leaders: Vec::new(),
+        landing: Vec3::ZERO,
+        dogleg: 0.0,
+        text: None,
+        style: "Standard".into(),
+        arrow_size: 1.0,
+        spline: false,
+        block: Some(ins),
+    })
+}
+
+/// Annotation objects: annotative dimensions at the current scale draw from their definition
+/// (`anno_scaled` drops the stored block), so they expand nothing, in model space, in a layout's
+/// paper space and through a viewport; plain dimensions, annotative multileaders and annotative
+/// references keep their blocks. The count is the unlimited build's `expanded` in each, so a
+/// drawing of annotative dimensions is not counted past what is built.
+#[test]
+fn annotative_dimensions_count_what_the_build_expands() {
+    let check = |d: &Drawing, space: &Space, what: &str| -> u64 {
+        let built = build(d, space, &uncapped()).expanded as u64;
+        assert_eq!(count_space(d, space, false), built, "{what}");
+        assert_eq!(count_space(d, space, true), build_plot(d, space, &uncapped()).expanded as u64, "{what} (plot)");
+        built
+    };
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("DB".into(), std::sync::Arc::new(lines_block("DB", 5)));
+    d.blocks.insert("B".into(), std::sync::Arc::new(lines_block("B", 3)));
+    let paper = Space::Paper("Layout1".into());
+    // Only annotative dimensions: nothing is expanded, nothing is counted.
+    for _ in 0..30 {
+        d.add(&Space::Model, annotative(), dim_with_block("DB")).unwrap();
+    }
+    d.add(&paper, annotative(), dim_with_block("DB")).unwrap();
+    assert_eq!(check(&d, &Space::Model, "annotative dimensions in model space"), 0);
+    assert_eq!(check(&d, &paper, "annotative dimension in a layout"), 0);
+    // Through a viewport: the model's annotative dimensions are drawn scaled there too.
+    d.add(&paper, Common::default(), EntityKind::Viewport(vp(Vec2::new(50.0, 50.0), 100.0, 100.0, Vec2::new(0.0, 0.0), 400.0, 2))).unwrap();
+    assert_eq!(check(&d, &paper, "annotative dimensions seen through a viewport"), 0);
+    // Plain dimensions with a block expand it (5 entities each), as do annotative multileaders
+    // with block content (the reference's copy and 3 entities) and annotative references.
+    for _ in 0..4 {
+        d.add(&Space::Model, Common::default(), dim_with_block("DB")).unwrap();
+    }
+    assert_eq!(check(&d, &Space::Model, "plain dimensions"), 4 * 5);
+    for _ in 0..3 {
+        d.add(&Space::Model, annotative(), mleader_with_block("B")).unwrap();
+        d.add(&Space::Model, annotative(), insert_of("B")).unwrap();
+    }
+    assert_eq!(check(&d, &Space::Model, "plain dimensions, annotative multileaders and references"), 4 * 5 + 6 * 4);
+    d.add(&paper, annotative(), mleader_with_block("B")).unwrap();
+    d.add(&paper, annotative(), insert_of("B")).unwrap();
+    d.add(&paper, Common::default(), dim_with_block("DB")).unwrap();
+    assert!(check(&d, &paper, "a layout with annotation and a viewport") > 0);
+    // A scale the view does not support, ANNOALLVISIBLE off: hidden, nothing.
+    let mut h = Drawing::new_imperial();
+    h.blocks.insert("B".into(), std::sync::Arc::new(lines_block("B", 3)));
+    h.header.set("ANNOALLVISIBLE", cadcraft_doc::HVal::Int(0));
+    let other = Common { anno_scales: vec![cadcraft_doc::AnnoScale::new("1:2", 1.0, 2.0)], ..Default::default() };
+    h.add(&Space::Model, other, insert_of("B")).unwrap();
+    assert_eq!(check(&h, &Space::Model, "hidden by scale"), 0);
+}
+
+/// A dimension block that holds dimensions whose block is itself: ten of them, 16 levels deep, is
+/// 10^16 expansions, and counting it is the arithmetic over one block, at once (it was a walk of
+/// every node), and stops when the build's cancel flag is set.
+#[test]
+fn a_dimension_block_of_dimensions_is_counted_at_once() {
+    let mut d = Drawing::new_imperial();
+    let mut b = cadcraft_doc::Block::new("D");
+    for k in 0..10u64 {
+        b.entities.push(block_entity(1 + k, Common::default(), dim_with_block("D")));
+    }
+    d.blocks.insert("D".into(), std::sync::Arc::new(b));
+    d.add(&Space::Model, Common::default(), dim_with_block("D")).unwrap();
+    let t = std::time::Instant::now();
+    let n = count_space(&d, &Space::Model, false);
+    // f(15) = 10 and f(depth) = 10 (1 + f(depth + 1)): 10 + 100 + ... + 10^16.
+    assert_eq!(n, 11_111_111_111_111_110);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    // The same block is also a reference cost: references to it (copy unit and AttDefs left out)
+    // are memoised separately and agree with the build on a size that can be built.
+    let mut small = Drawing::new_imperial();
+    let mut b = cadcraft_doc::Block::new("D");
+    b.entities.push(block_entity(1, Common::default(), dim_with_block("D")));
+    b.entities.push(block_entity(9, Common::default(), insert_of("L")));
+    small.blocks.insert("D".into(), std::sync::Arc::new(b));
+    small.blocks.insert("L".into(), std::sync::Arc::new(lines_block("L", 1)));
+    small.add(&Space::Model, Common::default(), dim_with_block("D")).unwrap();
+    small.add(&Space::Model, Common::default(), insert_of("D")).unwrap();
+    assert_eq!(count_space(&small, &Space::Model, false), build(&small, &Space::Model, &uncapped()).expanded as u64);
+    // A count that is stopped returns at once (the caller throws it away).
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let opts = Options { cancel: Some(stop), ..Default::default() };
+    assert_eq!(census_space(&d, &Space::Model, false, &opts).total, 0);
 }
 
 /// Bytes the display list holds per expanded entity, for the block-expansion write-up
@@ -1391,10 +1531,32 @@ fn flat(lists: &[DisplayList]) -> Vec<(DPrim, Vec<Vec2>)> {
     lists.iter().flat_map(|l| l.prims.iter().map(|p| (DPrim { start: 0, ..*p }, l.points(p).to_vec()))).collect()
 }
 
+/// A layout built in pieces is `whole`, the list `build` makes of it: the same primitives in the
+/// same order and the same expansion count, for slices of 1, 7, 512 and 16,384 objects.
+fn assert_slices_are_the_whole(d: &Drawing, name: &str, opts: &Options, whole: &DisplayList, what: &str) {
+    for slice in [1, 7, 512, 16_384] {
+        let mut lists = Vec::new();
+        let expanded = build_layout_slices::<()>(d, name, opts, slice, &mut |l| {
+            lists.push(l.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(expanded, whole.expanded, "{what}, slice {slice}");
+        assert!(flat(&lists) == flat(std::slice::from_ref(whole)), "{what}, slice {slice}: {} pieces", lists.len());
+    }
+}
+
+/// The handle of the `k`th viewport of layout `paper`.
+fn viewport_handle(d: &Drawing, paper: &Space, k: usize) -> cadcraft_doc::Handle {
+    d.space(paper).unwrap().iter().filter(|e| matches!(e.kind, EntityKind::Viewport(_))).nth(k).unwrap().handle
+}
+
 /// A layout built in pieces is the whole build's list: the same primitives in the same order, for
 /// slices of 1, 7, 512 and 16,384 objects, under the block-expansion limit and past it (the budget
 /// is taken in draw order, so the same ones are left out), and with a plot style table (pens, the
-/// pattern budget carried from piece to piece).
+/// pattern budget carried from piece to piece). Also with a layer frozen in a viewport, a viewport
+/// whose contents are skipped (`skip_viewport`), annotative objects and a wipeout seen through a
+/// viewport, and a layout with more viewports than are drawn.
 #[test]
 fn a_layout_built_in_slices_is_the_whole_list() {
     let (d, paper) = layout_fixture();
@@ -1426,15 +1588,184 @@ fn a_layout_built_in_slices_is_the_whole_list() {
         for _ in 0..3 {
             assert!(flat(&[build(&d, &paper, &opts)]) == flat(std::slice::from_ref(&whole)), "{what}: the whole build changes between runs");
         }
-        for slice in [1, 7, 512, 16_384] {
-            let mut lists = Vec::new();
-            let expanded = build_layout_slices::<()>(&d, name, &opts, slice, &mut |l| {
-                lists.push(l.clone());
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(expanded, whole.expanded, "{what}, slice {slice}");
-            assert!(flat(&lists) == flat(std::slice::from_ref(&whole)), "{what}, slice {slice}: {} pieces", lists.len());
-        }
+        assert_slices_are_the_whole(&d, name, &opts, &whole, what);
     }
+
+    // Layers frozen in a viewport, annotative objects and a wipeout seen through viewports (one
+    // of them frozen on the layer of some of the model objects): under and past the limit.
+    let (mut v, paper) = layout_fixture();
+    v.layers.push(layer_named("Trees", true));
+    for k in 0..40u32 {
+        let at = Vec3::new(f64::from(k) * 15.0, 130.0, 0.0);
+        let EntityKind::Insert(mut i) = insert_of("B") else { unreachable!() };
+        i.insert = at;
+        v.add(&Space::Model, Common { layer: "Trees".into(), ..Default::default() }, EntityKind::Insert(i.clone())).unwrap();
+        v.add(&Space::Model, Common { anno_scales: vec![cadcraft_doc::AnnoScale::new("1:2", 1.0, 2.0)], ..Default::default() }, EntityKind::Insert(i)).unwrap();
+    }
+    let wipe = [(150.0, 100.0), (400.0, 100.0), (400.0, 160.0), (150.0, 160.0)].map(|(x, y)| Vec2::new(x, y)).to_vec();
+    v.add(&Space::Model, Common::default(), EntityKind::Wipeout(cadcraft_doc::Wipeout { boundary: wipe })).unwrap();
+    let mut frozen = vp(Vec2::new(60.0, 160.0), 100.0, 80.0, Vec2::new(300.0, 130.0), 160.0, 7);
+    frozen.frozen_layers = vec!["Trees".into()];
+    v.add(&paper, Common::default(), EntityKind::Viewport(frozen)).unwrap();
+    v.add(&paper, Common::default(), EntityKind::Viewport(vp(Vec2::new(200.0, 160.0), 100.0, 80.0, Vec2::new(300.0, 130.0), 160.0, 8))).unwrap();
+    let Space::Paper(name) = &paper else { unreachable!() };
+    let skipped = viewport_handle(&v, &paper, 1);
+    let need = build(&v, &paper, &uncapped()).expanded;
+    assert!(need > 3_000, "{need}");
+    for (what, opts) in [
+        ("frozen layer, annotative objects and a wipeout", Options::default()),
+        ("the same past the limit", Options { max_block_expansion: need / 3, ..Default::default() }),
+        ("skip_viewport", Options { skip_viewport: Some(skipped), ..Default::default() }),
+        ("skip_viewport past the limit", Options { skip_viewport: Some(skipped), max_block_expansion: need / 4, ..Default::default() }),
+    ] {
+        let whole = build(&v, &paper, &opts);
+        assert!(whole.prims.iter().any(|p| p.kind == Kind::Mask), "{what}: the wipeout's mask is in the list");
+        assert_slices_are_the_whole(&v, name, &opts, &whole, what);
+    }
+    // The skipped viewport's contents are left out, the frozen layer's are not drawn there.
+    let all = build(&v, &paper, &Options::default());
+    let skip = build(&v, &paper, &Options { skip_viewport: Some(skipped), ..Default::default() });
+    assert!(skip.expanded < all.expanded, "{} {}", skip.expanded, all.expanded);
+
+    // More viewports than are drawn (256): the rest are left out in the slices too.
+    let mut m = Drawing::new_metric();
+    m.blocks.insert("B".into(), std::sync::Arc::new(lines_block("B", 3)));
+    for k in 0..30u32 {
+        let EntityKind::Insert(mut i) = insert_of("B") else { unreachable!() };
+        i.insert = Vec3::new(f64::from(k) * 10.0, 0.0, 0.0);
+        m.add(&Space::Model, Common::default(), EntityKind::Insert(i)).unwrap();
+    }
+    let paper = Space::Paper("Layout1".into());
+    for k in 0..(crate::viewports::MAX_VIEWPORTS + 4) {
+        let v = vp(Vec2::new(10.0 * (k % 20) as f64, 10.0 * (k / 20) as f64), 8.0, 8.0, Vec2::new(30.0 + (k % 7) as f64 * 40.0, 0.0), 30.0, 2 + k as u32);
+        m.add(&paper, Common::default(), EntityKind::Viewport(v)).unwrap();
+    }
+    let Space::Paper(name) = &paper else { unreachable!() };
+    let whole = build(&m, &paper, &Options::default());
+    let drawn = build(&m, &paper, &Options { max_block_expansion: whole.expanded / 2, ..Default::default() });
+    assert!(drawn.expanded > 0 && whole.expanded > 0);
+    let few = {
+        // The same layout without the four viewports past the limit draws the same list.
+        let mut c = m.clone();
+        let extra: Vec<cadcraft_doc::Handle> = c.space(&paper).unwrap().iter().skip(crate::viewports::MAX_VIEWPORTS).map(|e| e.handle).collect();
+        assert_eq!(extra.len(), 4);
+        for h in extra {
+            c.remove_entity(h);
+        }
+        build(&c, &paper, &Options::default())
+    };
+    assert!(flat(std::slice::from_ref(&few)) == flat(std::slice::from_ref(&whole)), "viewports past MAX_VIEWPORTS are not drawn");
+    assert_slices_are_the_whole(&m, name, &Options::default(), &whole, "more viewports than drawn");
+    let capped = Options { max_block_expansion: whole.expanded / 2, ..Default::default() };
+    assert_slices_are_the_whole(&m, name, &capped, &drawn, "more viewports than drawn, past the limit");
+}
+
+/// A block with one line on layer `contents` and, in a row of `n` references to it, one reference
+/// per entity of the model on layer `refs`.
+fn refs_on_layers(n: u32, refs: &str, contents: &str) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    d.layers.push(layer_named(refs, true));
+    d.layers.push(layer_named(contents, true));
+    let mut b = cadcraft_doc::Block::new("Tree");
+    for k in 0..4u64 {
+        let (c, kind) = line_common(Common { layer: contents.into(), ..Default::default() });
+        b.entities.push(block_entity(1 + k, c, kind));
+    }
+    d.blocks.insert("Tree".into(), std::sync::Arc::new(b));
+    for k in 0..n {
+        let EntityKind::Insert(mut i) = insert_of("Tree") else { unreachable!() };
+        i.insert = Vec3::new(f64::from(k) * 20.0, 0.0, 0.0);
+        d.add(&Space::Model, Common { layer: refs.into(), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+    }
+    d
+}
+
+/// Which layer to switch off: the build takes one expansion for every entity of a block before it
+/// looks at the entity's layer, so the layer of a block's contents reduces nothing and the layer
+/// the references are on removes them all. The census lists the reference layers (and, past the
+/// limit, what each would leave), not the contents' layers.
+#[test]
+fn only_the_layer_of_the_references_reduces_the_count() {
+    let mut d = refs_on_layers(50, "Refs", "Contents");
+    let full = build(&d, &Space::Model, &uncapped()).expanded;
+    assert_eq!(full, 50 * 5);
+    let opts = Options { max_block_expansion: 100, ..Default::default() };
+    let c = census_space(&d, &Space::Model, false, &opts);
+    assert_eq!(c.total, 250);
+    assert_eq!(c.reference_layers, vec!["Refs".to_string()]);
+    assert_eq!(c.layers_off, vec![LayerOff { layer: "Refs".into(), total_if_off: 0 }]);
+    // Under the limit no recount is made.
+    assert!(census_space(&d, &Space::Model, false, &Options::default()).layers_off.is_empty());
+    // The contents' layer off: the build still asks for the same (the references are drawn, their
+    // contents expanded, then not shown); the references' layer off removes every expansion.
+    d.layer_mut("Contents").unwrap().on = false;
+    assert_eq!(build(&d, &Space::Model, &uncapped()).expanded, full);
+    d.layer_mut("Contents").unwrap().on = true;
+    d.layer_mut("Refs").unwrap().on = false;
+    assert_eq!(build(&d, &Space::Model, &uncapped()).expanded, 0);
+    // Two layers of references: switching either off leaves the other's.
+    let mut two = refs_on_layers(10, "Refs", "Contents");
+    two.layers.push(layer_named("Other", true));
+    for k in 0..30u32 {
+        let EntityKind::Insert(mut i) = insert_of("Tree") else { unreachable!() };
+        i.insert = Vec3::new(f64::from(k) * 20.0, 50.0, 0.0);
+        two.add(&Space::Model, Common { layer: "Other".into(), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+    }
+    let c = census_space(&two, &Space::Model, false, &Options { max_block_expansion: 100, ..Default::default() });
+    assert_eq!(c.total, 200);
+    assert_eq!(c.layers_off, vec![LayerOff { layer: "Other".into(), total_if_off: 50 }, LayerOff { layer: "Refs".into(), total_if_off: 150 }]);
+    two.layer_mut("Other").unwrap().on = false;
+    assert_eq!(build(&two, &Space::Model, &uncapped()).expanded, 50);
+}
+
+/// The largest single top-level object (windows cannot split it) is found in the counting pass,
+/// with its handle, kind and block; arrays past the 10,000 side clamp are named; a count that
+/// overflows is `COUNT_SATURATED`.
+#[test]
+fn the_census_names_the_largest_object_clamped_arrays_and_overflow() {
+    // One 1000 x 1000 MINSERT of a two-line block and many small references.
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("Pole".into(), std::sync::Arc::new(lines_block("Pole", 2)));
+    for _ in 0..5 {
+        d.add(&Space::Model, Common::default(), insert_of("Pole")).unwrap();
+    }
+    let EntityKind::Insert(mut big) = insert_of("Pole") else { unreachable!() };
+    big.cols = 1000;
+    big.rows = 1000;
+    big.col_spacing = 5.0;
+    big.row_spacing = 5.0;
+    let h = d.add(&Space::Model, Common::default(), EntityKind::Insert(big)).unwrap();
+    let c = census_space(&d, &Space::Model, false, &Options::default());
+    assert_eq!(c.total, 5 * 3 + 3_000_000);
+    let l = c.largest.unwrap();
+    assert_eq!((l.handle, l.kind, l.block.as_str(), l.count), (h, "array of block references (MINSERT)", "Pole", 3_000_000));
+    assert!(c.clamped.is_empty());
+
+    // 20,000 x 1: drawn as 10,000 x 1, and said so.
+    let mut w = Drawing::new_imperial();
+    w.blocks.insert("Pole".into(), std::sync::Arc::new(lines_block("Pole", 1)));
+    let EntityKind::Insert(mut wide) = insert_of("Pole") else { unreachable!() };
+    wide.cols = 20_000;
+    wide.col_spacing = 2.0;
+    let h = w.add(&Space::Model, Common::default(), EntityKind::Insert(wide)).unwrap();
+    let c = census_space(&w, &Space::Model, false, &Options::default());
+    assert_eq!(c.clamped, vec![ClampedArray { handle: h, block: "Pole".into(), cols: 20_000, rows: 1, drawn_cols: 10_000, drawn_rows: 1 }]);
+    assert_eq!(c.total, build(&w, &Space::Model, &uncapped()).expanded as u64);
+    assert_eq!(build(&w, &Space::Model, &uncapped()).prims.len(), 10_000);
+
+    // Ten levels of 1,000 references: 10^30 does not fit.
+    let mut o = Drawing::new_imperial();
+    o.blocks.insert("L10".into(), std::sync::Arc::new(lines_block("L10", 1)));
+    for k in (0..10).rev() {
+        let mut b = cadcraft_doc::Block::new(&format!("L{k}"));
+        let EntityKind::Insert(mut i) = insert_of(&format!("L{}", k + 1)) else { unreachable!() };
+        i.cols = 1000;
+        i.col_spacing = 1.0;
+        b.entities.push(block_entity(1, Common::default(), EntityKind::Insert(i)));
+        o.blocks.insert(format!("L{k}"), std::sync::Arc::new(b));
+    }
+    o.add(&Space::Model, Common::default(), insert_of("L0")).unwrap();
+    let c = census_space(&o, &Space::Model, false, &Options::default());
+    assert_eq!(c.total, COUNT_SATURATED);
+    assert_eq!(c.largest.unwrap().count, COUNT_SATURATED);
 }
