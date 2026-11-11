@@ -2,7 +2,9 @@
 
 Written on branch `4l13-round2b` (from `whiq` at 08af9f2). Part A of the round: what the limit is for, what the
 agent sees, what can be counted up front, the options, a recommendation, and what was built now (A4). The limit's
-value and behaviour are unchanged.
+value is unchanged. **Since 2026-11-11 (section 11) the picture tools no longer make a picture that passes the limit:
+they refuse it, and they have a "blocks as boxes" option.** Sections 1 to 10 are the record of how it came to be;
+where one of their sentences describes the cut picture, a note says what is true now.
 
 ## 1. What the limit is and what it protects
 
@@ -13,7 +15,10 @@ remaining block contents are not drawn (the build still counts the calls it make
 past the limit; `Options::blocks_truncated(expanded)` is that test). The doc comment on the constant names the reason:
 a hostile or broken file with nested, self-referencing or arrayed references expands exponentially
 (`MAX_BLOCK_DEPTH` = 16 only bounds the depth: a block holding four references to the next, 15 deep, is 4^15 line
-copies; one MINSERT of 10,000 x 10,000 is 100 million copies). It is CWE-400 protection.
+copies; one MINSERT of 10,000 x 10,000 is 100 million copies). It is CWE-400 protection. (That is what the build
+library does. The MCP picture tools, `render_preview` and `export` to svg / png / pdf, never use the cut list since
+2026-11-11: they count first and make no picture past the limit, section 11. The canvas and the plotter still keep what
+the build drew.)
 
 What it protects, measured:
 
@@ -32,12 +37,12 @@ What it protects, measured:
 
 | Consumer | Holds | For how long | At the limit |
 |---|---|---|---|
-| `render_preview` svg (preview.rs `list_for`, `svg_tile`) | the whole display list of the tile, then the whole SVG `String` of the tile (and the JSON answer when it is returned inline) | one tile | `blocks_truncated` (since the last release) |
-| `render_preview` png (`preview::png`) | the display list of the tile plus the pixmap | one tile | `blocks_truncated` |
-| `export` svg model space (`write_svg_sliced`) | one slice of 16,384 top-level entities (`SLICE_ENTITIES`) as a display list, dropped before the next; the file is written as it goes | one slice (but a slice whose entities expand a lot is up to the whole limit: slicing is by top-level entity, not by expansion) | `blocks_truncated` |
-| `export` svg of a layout | one slice at a time since this round (`build_layout_slices`: the sheet's objects and each viewport's contents in draw order); before it the whole layout list | one slice | `blocks_truncated` |
-| `export` png | as `render_preview` png | the export | `blocks_truncated` |
-| `export` pdf (`io::pdf::plot` -> `sheet`) | one `DisplayList` per sheet (`build_plot` of the whole space; the plot window only places the drawing on the page, it does **not** leave out block references outside it), then the PDF writer's own document in memory, then the `Vec<u8>` | per sheet; the document until the file is written | **nothing before this round** (the answer never said); now `blocks_truncated` too |
+| `render_preview` svg (preview.rs `list_for`, `svg_tile`) | the whole display list of the tile, then the whole SVG `String` of the tile (and the JSON answer when it is returned inline) | one tile | refused before drawing (section 11) |
+| `render_preview` png (`preview::png`) | the display list of the tile plus the pixmap | one tile | refused before drawing (section 11) |
+| `export` svg model space (`write_svg_sliced`) | one slice of 16,384 top-level entities (`SLICE_ENTITIES`) as a display list, dropped before the next; the file is written as it goes | one slice (but a slice whose entities expand a lot is up to the whole limit: slicing is by top-level entity, not by expansion) | refused before drawing (section 11) |
+| `export` svg of a layout | one slice at a time since this round (`build_layout_slices`: the sheet's objects and each viewport's contents in draw order); before it the whole layout list | one slice | refused before drawing (section 11) |
+| `export` png | as `render_preview` png | the export | refused before drawing (section 11) |
+| `export` pdf (`io::pdf::plot` -> `sheet`) | one `DisplayList` per sheet (`build_plot` of the whole space; the plot window only places the drawing on the page, it does **not** leave out block references outside it), then the PDF writer's own document in memory, then the `Vec<u8>` | per sheet; the document until the file is written | **nothing before round 2b** (the answer never said); now every sheet is counted first and one sheet over the limit means no file (section 11) |
 | the UI canvas (`ui-egui` `canvas/list.rs`, `rebuild.rs`) | the whole list of the open space, rebuilt at every 2x zoom step and edit, kept while the view is open | while the view is open | silent: no message to the user (a gap, not changed here) |
 | engine `plot` preview (`cmd/exchange.rs`), `io::write_framed`, `io::plotter` svg/png | the whole built list, then the output as one `String` / `Vec` | the call | silent |
 
@@ -111,10 +116,9 @@ entry points per slice, and the up-front count to show progress and say "this wi
   frames) costs the whole drawing's expansions on every page.
 * *Layers off* (`layers_off`, `layers_on`, `only_layers`): works today for every format, a reference on a layer that is
   off is not expanded.
-* *Draw named blocks as their extents box*: **not built.** A render option (a set of block names; each reference draws
-  the transformed outline of the block's extents instead of its contents, drawn and named in the answer). Needs the
-  block extents (`doc/extents.rs` has them per block and depth), a polyline draw path in `insert`, a tool argument and
-  the answer saying which blocks were drawn as boxes. Gives an overview of any size, always.
+* *Draw named blocks as their extents box*: **built 2026-11-11** (section 11, `blocks_as_boxes`). A render option (a
+  set of block names; each reference draws the transformed outline of the block's extents instead of its contents,
+  drawn and named in the answer). Gives an overview of any size, always.
 
 **(d) The route through PDF or tiles.** Tiles already work (above): each tile is its own build and file, complete if
 it needs the limit or less; the answer now says so. For PDF the route needs (c)(3): when a window is given for model
@@ -129,8 +133,8 @@ window, each page its own build: one complete file at any size, memory per page.
 
 1. *Now (built, A4 below):* the count in every answer, `blocks_not_drawn`, and the ways through in words.
 2. *Next, owner's yes needed per item:* PDF culls by window for model space ((c)(3)/(d)): this is what makes the owner's
-   PDF-of-tiles route real, gives one complete file at any size, and costs one pass over the entities. And the
-   "blocks as extents boxes" option for a guaranteed overview.
+   PDF-of-tiles route real, gives one complete file at any size, and costs one pass over the entities (still open).
+   The "blocks as extents boxes" option for a guaranteed overview was approved and built on 2026-11-11 (section 11).
 3. *Then streaming (b) for the SVG writer by expansion and for PNG:* complete output at any size for the file formats
    that are written anyway. With streaming the limit's memory purpose goes; its time/bomb purpose stays, so the
    decision to keep, raise or replace the value (with the up-front count the refusal can be exact: "this needs
@@ -146,21 +150,24 @@ and it composes with (b).
 * `cadcraft_render::count_space` / `count_expansions` (+ `count.rs`, viewport counting in `viewports.rs`; the
   viewport window/scale code was moved into a helper `View::of` shared by drawing and counting, no change of output).
 * Every answer that draws (`render_preview` svg and png tile, `export` svg, png, pdf) carries
-  `blocks_expanded_total`: the expansions the build asks for, counted before building. When it is past the limit:
-  `blocks_truncated: true`, `blocks_expanded` (the limit), `blocks_not_drawn` (total minus limit), a warning, and
-  `ways_through`: windows or tiles with the minimum number needed, layers off, and what a one-file drawing would need;
-  a layout answer points at `viewport: handle`; a PDF answer says its window only places the page and sends the agent
-  to svg/png windows or layer passes (it lists the sheets: `blocks_truncated_sheets`).
+  `blocks_expanded_total`: the expansions the build asks for, counted before building. *(When it was past the limit
+  this round's answer said `blocks_truncated: true`, `blocks_expanded`, `blocks_not_drawn`, a warning, `ways_through`
+  and, for a PDF, `blocks_truncated_sheets`, and a cut picture was written. Replaced on 2026-11-11: section 11.)* The
+  ways (windows or tiles with the minimum number needed, layers off; a layout answer points at `viewport: handle`; a PDF
+  answer says its window only places the page and sends the agent to svg/png windows or layer passes) are now the
+  body of the refusal.
 * PDF: `io::plot_with_blocks` returns the bytes and, per sheet, the count and the build's `expanded`; `plot` is
   unchanged. The PDF export answer says `blocks_truncated` like the others.
 * Tool descriptions of `render_preview` and `export` say what the limit is and the ways through.
-* Not changed: `MAX_BLOCK_EXPANSION` (2,000,000), what is drawn past it, the UI (still silent), the plotter callers.
+* Not changed: `MAX_BLOCK_EXPANSION` (2,000,000), the UI (still silent), the plotter callers. (What is drawn past the
+  limit changed for the picture tools on 2026-11-11: nothing is drawn, section 11.)
 
 ## 7. Questions for the owner
 
 1. Is a PDF that culls by window (so `pages: [{window}]` is complete per page) approved? It changes what is built for a
    PDF with a window (the picture is the same; fewer expansions).
-2. Is "draw these blocks as their extents box" approved as an agent-chosen option (named in the answer)?
+2. Is "draw these blocks as their extents box" approved as an agent-chosen option (named in the answer)? **Yes,
+   2026-11-11, built (section 11).**
 3. If streaming makes SVG/PNG complete at any size, what should stop a hostile bomb: keep a limit for it, and at what
    value, or the cancel alone? (No limit, timeout or fallback has been added.)
 4. The UI shows no message when the canvas truncates; should it say so (a status-bar line from `count_space`)?
@@ -213,17 +220,22 @@ byte-identical) or the build runs twice (once for the bounds). `build_plot` also
 
 ## 10. Round 2b: what the blind review changed
 
+*(Section 11 replaced the answer's vocabulary: where this section says `blocks_truncated`, `blocks_not_drawn`,
+`blocks_expanded` (the limit) or a picture with the first expansions drawn, read "the picture is refused" and the
+fields of section 11. The rules below that still hold are marked.)*
+
 A picture-making answer never tells the agent to change the customer's drawing: no route that edits it (explode, arrays
-rebuilt as separate references, undo, close with discard) is offered anywhere. Editing routes were written and removed:
+rebuilt as separate references, undo, close with discard) is offered anywhere. *(Still true.)* Editing routes were written and removed:
 they alter customer data, have limits of their own (arrayrect refuses very large arrays), lose properties and are not
 safe to undo blind.
 
 **The build is the ground truth; the count explains it.** Every answer that draws takes `blocks_expanded_total` from the
-build's own `DisplayList::expanded` when the build drew everything; `blocks_truncated` is true only when that count went
-past the limit. Past the limit the build stops, so the total is then the count from the block table
-(`render::census_space` / `census_entities`), never below what the build took. A count and a build that disagree under
-the limit give the build's figure. Tests: mcp `the_build_decides_whether_an_answer_is_truncated` and
-`a_picture_of_annotative_dimensions_is_not_answered_as_truncated` (41 annotative dimensions whose block table count is
+build's own `DisplayList::expanded`. *(Until 2026-11-11 `blocks_truncated` was true only when that count went past the
+limit and the total was then the count from the block table. Now the count from the block table
+(`render::census_space` / `census_entities`) decides before anything is drawn, because it is proven equal to the build;
+the build's own count is still checked and a picture whose build passed the limit is thrown away, never used.)* A count
+and a build that disagree under the limit give the build's figure. Tests: mcp `the_build_decides_whether_an_answer_is_truncated` and
+`a_picture_of_annotative_dimensions_is_still_drawn` (41 annotative dimensions whose block table count is
 2,050,000 > the limit; the build expands 0; render_preview, export svg and export png do not say truncated).
 
 **Annotative dimensions.** At depth 0 a non-hidden annotative object goes through `anno_scaled`, which sets a
@@ -252,8 +264,9 @@ whole) and does not advise windows. It offers only routes that leave the drawing
 2. *Reading* (`read_drawing`, `search_drawing`, measuring, extents) does not expand blocks, so the information stays
    reachable.
 
-If no layer leaves a build that fits, the answer says "no complete picture of this object can be drawn today; what is
-drawn is the first N expansions in draw order". Tests: mcp
+*(Until 2026-11-11: if no layer left a build that fit, the answer said "no complete picture of this object can be drawn
+today; what is drawn is the first N expansions in draw order". Now nothing is drawn, and the refusal also offers the
+blocks as boxes; it says "none of these alone gives a complete picture" when no way alone fits, section 11.)* Tests: mcp
 `one_object_over_the_limit_is_named_and_only_routes_that_leave_the_drawing_are_offered` (names the 30 x 30 array, tiles
 stay truncated, the layer figure given equals the `expanded` of a build with that layer off, no editing words in the
 answer, the plain statement when no layer fits), render `only_the_layer_of_the_references_reduces_the_count`,
@@ -262,8 +275,9 @@ answer, the plain statement when no layer fits), render `only_the_layer_of_the_r
 fits the limit: mcp `passing_the_block_cap_is_reported_with_the_ways_through` ("at least 7 windows", each tile under
 the limit drawn whole).
 
-**Drawings with no complete picture today** (the owner is deciding on new routes: PDF by window, blocks drawn as boxes,
-streaming by expansion):
+**Drawings with no complete picture today** *(this list is the state before 2026-11-11; blocks as boxes now give a
+complete overview of the first, third and fourth kinds when the boxes fit; PDF by window and streaming are still not
+built)*:
 
 * One block reference or array that alone exceeds the limit and whose references sit on one layer (or on layers that all
   still leave a build over the limit): windows cannot split it, layers cannot split it; reading is the only route.
@@ -275,18 +289,21 @@ streaming by expansion):
   owner decides); the answer says so (`arrays_clamped`) and that no way to draw more exists today.
 
 **Saturated and huge counts.** A count that overflows `u64` is `COUNT_SATURATED` (`u64::MAX`); the answer then says
-"more than can be counted (nested references multiply past 1.8e19)" in the field and the warning, gives no number of
-windows and never prints the saturated value. Any count above 2^53 is a decimal string; up to it a number. Fields that
+"more than can be counted (nested references multiply past 1.8e19)" in the field and the reason, gives no number of
+windows and never prints the saturated value. (`blocks_not_drawn` no longer exists; `blocks_expanded_total`,
+`largest_object.blocks_expanded_total`, `layers_that_reduce[].blocks_expanded_total_if_off` and
+`heaviest_blocks[].blocks_expanded_total_if_boxed` are the fields that can be a number, a string or the words.) Any count above 2^53 is a decimal string; up to it a number. Fields that
 can be a number, a string or the words: `blocks_expanded_total`, `blocks_not_drawn`, `largest_object.blocks_expanded`,
 `layers_that_reduce[].blocks_expanded_total_if_off`; documented in the `render_preview` and `export` descriptions (mcp
 `the_descriptions_document_the_number_or_string_fields`). Behaviour: mcp `a_count_that_overflows_answers_the_words_and_no_number`;
 render `the_census_names_the_largest_object_clamped_arrays_and_overflow`.
 
-**PDF.** `plot_with_blocks` / `SheetBlocks` carry each sheet's `total` (the build's count when drawn whole, else the
-count), `expanded`, `limit` and the census. The answer has `sheets: [{sheet, blocks_expanded_total, blocks_not_drawn,
-and for a truncated sheet its own largest_object, reference_layers, layers_that_reduce}]`, totals that are the sums of
-them, and at the top level the largest object, reference layers and ways of the sheet that needs the most
-(`details_of_sheet` names it). Tests: mcp `a_pdf_note_gives_the_sheets_figures_and_they_add_up`; io
+**PDF.** *(Replaced by section 11: `plot_complete`, `SheetBlocks { sheet, number, total, limit, census }`, and the
+refusal's `sheets_over_limit` / `sheet_numbers_over_limit`.)* `plot_with_blocks` / `SheetBlocks` carried each sheet's
+`total` (the build's count when drawn whole, else the count), `expanded`, `limit` and the census. The answer had
+`sheets: [{sheet, blocks_expanded_total, blocks_not_drawn, and for a truncated sheet its own largest_object,
+reference_layers, layers_that_reduce}]`, totals that were the sums of them, and at the top level the largest object,
+reference layers and ways of the sheet that needs the most (`details_of_sheet` named it). Tests: mcp `a_pdf_note_gives_the_sheets_figures_and_they_add_up`; io
 `a_pdf_plot_past_the_limit_says_how_much_was_not_drawn` (a real plot past a lowered limit,
 `PdfOptions::max_block_expansion`, not read from JSON).
 
@@ -304,3 +321,275 @@ for picking twice and counting, 1.45 s for picking once and counting from it. Th
 
 **Streaming writer.** Nothing in the workspace writes a file with `svg::write_list` (the plotter's SVG and
 `write_framed` return bytes, as their callers expect), so none was changed; the doc comments now say what it does.
+
+## 11. 2026-11-11: a picture over the limit is not made; blocks as boxes (4L13 item 3)
+
+The owner's decision. The limit stays 2,000,000 and stays where it is (`MAX_BLOCK_EXPANSION`, `crates/render/src/lib.rs`).
+It concerns **only making a picture**: the MCP tools `render_preview` and `export` to svg, png and pdf. Opening,
+reading (`read_drawing`, `search_drawing`, takeoff), measuring, extents and editing a drawing are untouched and say
+nothing about it. In the answers the unit is called a **block piece**: every copy of a block (each cell of a MINSERT
+array) and every object in it, nested blocks counted; the field names keep `blocks_expanded_*`.
+
+**Why.** A cut picture looks like a finished one. The agent (or the customer it reports to) can take a plan with its
+trees, symbols or fixtures silently missing for the whole plan, and a warning in a field is easy to lose. A picture is
+now either complete or not made.
+
+### What changed
+
+1. **Over the limit, nothing incomplete is produced.** One picture is one build: a `render_preview` tile, an `export`
+   svg or png of one space, one PDF sheet. When it needs more than the limit, **no picture is returned and no file is
+   written**, and a file already at the output path is not touched, renamed to `OLD_` or removed (the count is made
+   before the file is opened). The answer is a refusal in the engine's refusal form (`code: too_large`, `reason`,
+   `next_step`) that says: how many block pieces the picture needs (`blocks_expanded_total`) and that one picture draws
+   at most 2,000,000 (`blocks_expanded_limit`); what is left if each reference layer is switched off, and whether that
+   fits (`layers_that_reduce`, as before); the heaviest blocks by name, each with what is left if that block is drawn
+   as outline boxes and whether that fits (`heaviest_blocks`), the biggest saving first, ending where drawing all the
+   listed blocks as boxes fits (`heaviest_blocks_all_boxed`); when even every block as boxes does not fit, every block
+   that saves anything is listed and it says so; windows or tiles where the existing rules say they help (the
+   truthful wording stays: an object larger than a window is expanded whole in every window touching it, a layout is
+   built whole, a PDF sheet is not culled by its window), the largest object when one object alone needs more than
+   the limit, and reading. `next_step` carries all the ways in words, numbered; the structured fields carry the
+   figures. Under the limit the answer is what it was (`blocks_expanded_total` only, plus `arrays_clamped`) and the
+   SVG / PNG / PDF bytes are the same as before.
+2. **Tiles.** Each tile is its own picture. With `output` the tiles that fit are written; a tile over the limit is not,
+   and its entry says `picture_made: false` with the whole refusal under `refused`. Inline, the same entries carry no
+   image. With one picture asked for (one tile, or no tiling) the refusal is the call's error. `export svg|png` of
+   several spaces does the same per space.
+3. **PDF.** One file: every sheet is counted before any is drawn; if any sheet is over the limit no PDF is written and
+   the refusal names the sheets over it with their page numbers (`sheet_numbers_over_limit`, `sheets_over_limit` with
+   each sheet's own figures and tables, `sheets_within_limit`). `io::plot_complete(d, space, opts, limit)` returns
+   `Plot::TooBig(sheets)` or `Plot::Drawn(..)`; `io::plot` (the engine's `plot` hook) still cuts when called with no limit, and with the plot option `blockLimit` (set by a session with the picture rule, round 4) it counts what it draws and refuses like `plot_complete`.
+4. **Removed vocabulary.** `blocks_truncated`, `blocks_not_drawn`, `blocks_expanded` (as the limit), `warning`,
+   `ways_through` (the field; the text is `next_step`), `blocks_truncated_sheets`, `details_of_sheet`,
+   `SheetBlocks::truncated` / `not_drawn`, `io::plot_with_blocks`. No answer describes a cut picture any more.
+
+### Decided before drawing, and what stays the ground truth
+
+The up-front count is the decision wherever it is proven equal to what the build expands: the equality test
+`the_up_front_count_is_what_an_unlimited_build_expands` (render) checks `count == unlimited build` for nested blocks
+(parallel path), arrays, hidden and layer-0 contents, self reference, layouts with viewports, annotation, plots, and now
+also with every block, one at a time and all together, drawn as boxes; so a picture that the build would draw whole is
+never refused. The case of section 10 (41 annotative dimensions whose block table holds 2,050,000 pieces while the
+build expands none, because an annotative dimension is drawn from its definition) is counted as 0 by the walk
+(`Counter::top`), so the picture is drawn; the test `a_picture_of_annotative_dimensions_is_still_drawn` runs it through
+render_preview and export svg / png. The build's own count is still checked after the build: if it passes the limit
+(which the equality test says cannot happen) the picture is thrown away and the error says so; nothing incomplete is
+ever returned or written.
+
+### Blocks as boxes (`blocks_as_boxes`)
+
+`render_preview` and `export` (svg, png, pdf) take `blocks_as_boxes`: a list of block names, compared as block names are everywhere in the engine (ignoring case; `Drawing::block`). Every reference to a
+named block, at any nesting depth, is drawn as **one outline** of the reference's extents on the reference's own layer
+and colour, instead of its contents, and costs **one** block piece. The extents are the block's contents' extents
+(`doc::block_contents_bounds`, the inner part of the reference extents of `doc/extents.rs`: layers off left out) under
+the reference's transform, so a rotated or scaled reference gives a rotated rectangle; a MINSERT array is one outline
+of the whole array (the box of its four corner copies in the turned frame, turned forward again), not one per cell.
+The up-front count and the build agree with the option on (the extended equality test). The answer names
+`blocks_drawn_as_boxes: [{block, outlines_drawn}]` (outlines actually drawn: nested ones once per copy of the block that
+holds them; a block with nothing visible in it draws none; a PDF gives it per sheet and summed). A name that is not a block of the drawing is refused in words naming
+it (`not_found`, with the nearest block names, where the full list is and to call again with names from it), nothing
+drawn or written. Anything that is not a list of block names (a number, `[123]`, an object, a `null` in the list) is
+refused naming what was given, with the expected form and an example, on every path that can receive it (the tools, the
+PDF JSON, the engine's plot hook; the png / svg plotter says it does not draw boxes). The drawing is never changed.
+
+**What a box replaces.** A boxed reference draws one outline and nothing else: its contents AND its attribute texts are
+not drawn (decided: attribute texts on millions of references are themselves a load the option exists to remove). The
+answer's note says so. **What the outline covers.** The extents are taken once per block, from the drawing the picture
+is built from (layers off or frozen in the drawing are left out, as are the layer switches of the call and the frozen
+layers of a `viewport:` target). Layers frozen only in one layout viewport, and layers marked do-not-plot in a PDF, are
+not subtracted: the box would have to be different per viewport and per plot, and the extents code has one rule set
+that cannot take those without a second copy of it. So there the outline can be larger than what the block would draw,
+never smaller (the answer's note says so).
+
+### How the heaviest-blocks list is found, and what it costs (measured, round 3)
+
+**Design (round 4; round 3's version walked up through the ancestors of every cut and was still quadratic on two shapes).**
+The count walks the block table once (memoised). When the picture is over the limit, or blocks are drawn as boxes, one
+more walk records every reference by indices only (the layer interned once, the block by address, the expansion by
+index: no string per record; a block that holds no reference on layer 0 does not depend on the layer its reference is
+on, so it is one expansion however many layers refer to it). Everything per block and per layer then comes from that
+recording by arithmetic (`crates/render/src/savings.rs`): references are merged per (holder, what they draw, layer);
+`down(n)`, what one copy of an expansion costs, is made once from the leaves up and `up(n)`, how many copies of it are
+drawn in all, once from the top down. What a name (a block drawn as boxes, a layer switched off) takes off is then a sum
+over that name's OWN references only: each cut reference takes off `up(holder) x (what it costs - what it is replaced
+by - copies x what the same name already removes inside one copy of what it draws)`, i.e. every removed piece is counted
+at the deepest cut on its path, so a cut below a cut of the same name stays exact and nothing is counted twice. What the
+name removes inside one copy of an expansion is a memoised walk that goes only into expansions that hold, somewhere
+below, a reference of that name (a per-expansion set of names, built once, kept only for names held by two or more
+expansions: a name held by one expansion cannot nest). A block can sit beneath itself (a block holding itself, stopped at
+the depth limit), so blocks use the same inner term. The arithmetic is `u128`: a figure that overflows even that is "not
+known" and taints what is computed from it, never a wrong number; what is left after a saving is the wide total minus the
+wide saving, so it is exact where the `u64` total overflowed (a layer that leaves 20 of an overflowing total says
+"leaves 20, which fits"; a remainder past 3.4e38 gets `left_cannot_be_counted: true` and the refusal never says "none of
+these alone" while such an entry exists). A saving past `u64` is "more than can be counted" and sorts first by its wide
+value. The only counts besides the two walks are the few that find how many of the heaviest blocks, boxed together, fit
+(halving: about log2(blocks) walks) and one to state the figure with all the listed blocks boxed. The layer table of a
+census is built once (`Drawing::layer` is a linear scan).
+
+Test `the_refusal_grows_with_the_drawing_not_with_its_square` runs every shape below with a bound, and
+`heaviest_equals_walks` asserts that every figure that is given (block and layer, order, after-figure) equals a real
+count of a drawing with that block boxed or that layer off, on every fixture including a block holding itself.
+
+Measured (release build, one core, test `refusal_shapes`; the limit set so every table is made; tables only):
+
+| drawing | tables (was) |
+|---|---|
+| 250 / 1,000 / 2,000 / 4,000 / 20,000 blocks each holding two references to itself | 0.013 / 0.06 / 0.22 / 0.35 / 2.1 s (0.54 / 9 / 43 s for 250 / 1,000 / 2,000) |
+| 125 / 250 / 500 / 1,000 / 4,000 blocks each holding 20 references to itself (every saving overflows) | 0.06 / 0.11 / 0.14 / 0.33 / 1.8 s (1.07 / 4.7 / 20 / 88 s) |
+| the same, each reference on a layer of its own | 0.08 / 0.09 / 0.21 / 0.50 / 2.5 s (1,000: 241 s) |
+| 4,000 blocks x 30 references plus one block holding 20 references to itself (the total overflows) | 0.12 s (150 s) |
+| 300,000 references over 1,000 / 5,000 / 20,000 layers | 0.32 / 0.36 / 0.46 s (3.4 / 22 / 104 s) |
+| 20,000 layers, each with a reference to one block holding 25 / 100 references to a leaf block | 0.8 / 2.1 s (18 s for the verifier's shape) |
+| 1,000 / 4,000 blocks drawn as boxes, success path (the outlines tally) | 0.02 / 0.10 s (5 s / 80 s) |
+| 50 blocks x 2,000 refs / 500 x 1,000 / 5,000 x 100 / 20,000 x 30 (500,000 to 600,000 objects) | 0.16 / 1.2 / 1.6 / 2.1 s |
+| 2,000 blocks x 300 refs, nested (600,000 objects, total 1.1e14) | 3.8 s |
+
+The list can therefore be very long (thousands of entries) when a drawing is far over the limit with many block types.
+**No cap was put on it**; the answer is bounded by the existing `max_result_bytes` instead: the heaviest are shown first
+as far as it allows (`heaviest_blocks_more` says how many more; boxing the listed ones and calling again lists the next
+ones), the layer table likewise (`layers_that_reduce_more`), and each name is said once in the words and once in the
+field. (No real drawing of the corpus is anywhere near the limit, section 3, and the corpus is not on this machine, so
+these are generated drawings.)
+
+### Not changed, and why
+
+The value of the limit; the desktop canvas and the plotter and engine `plot` callers (they still keep what the build
+drew; the canvas options only gained the field `blocks_as_boxes: None`); PDF culling by window; streaming output; the
+10,000 columns / rows clamp of a MINSERT (`arrays_clamped` is still said in every answer that draws one short: that is
+a cut picture of another cause, not named in the decision). No timeout, cap or default was added. One check was added behind the count: if a build still goes past the limit although the count said it fits (the equality test says it cannot), no picture is made and the answer says, in words, that the picture came out over the limit although the count said it fits, that the count may be wrong for this drawing, what both figures are, and to switch off more layers and / or draw more blocks as boxes and call again (a PDF sheet the same way, with its number). It changes no result when the count and the build agree; the owner decided it stays.
+
+Tests: render `a_boxed_reference_is_one_outline_of_its_extents_under_its_transform`,
+`a_boxed_block_nested_in_another_is_boxed_at_every_depth`, `the_heaviest_blocks_are_listed_down_to_where_boxing_them_fits`,
+the extended equality test; io `a_complete_pdf_plot_past_the_limit_makes_no_file`,
+`a_pdf_of_several_sheets_with_one_over_the_limit_makes_no_file`; mcp `a_picture_over_the_limit_is_refused_and_nothing_is_written`
+(svg, png, with output, export svg / png / pdf; existing files untouched; layer off, boxes, still over after a choice),
+`tiles_that_fit_are_written_and_a_tile_over_the_limit_is_refused_on_its_own`,
+`a_pdf_with_a_sheet_over_the_limit_is_not_written_and_names_the_sheets`, `an_unknown_block_name_is_refused_naming_it`,
+`under_the_limit_the_answer_is_the_count_and_nothing_else`, the descriptions test. The tests lower the limit through
+`Options::max_block_expansion`, `PdfOptions::max_block_expansion` / `plot_complete`'s `limit`, and (mcp, test builds
+only) `preview::lower_limit`.
+
+### Round 2 (blind review) in short
+
+* Round 2 removed the quadratic walk for blocks that hold themselves and for thousands of layers; it was not yet linear
+  for every shape (a walk per overflowing block or per layer with shared content remained). Round 3 (below) made it so:
+  every shape is measured in the table above.
+* The PDF count stops on a cancel (the tools pass theirs) and counts identical (space, boxes, limit) sheets once.
+* A layout over the limit is refused once for the call (it is built whole for every tile); refused tile entries count
+  against `max_result_bytes`; the heaviest list is said once in the words (`next_step`) and once as `heaviest_blocks`,
+  the example does not repeat the names.
+* The engine commands `plot`, `export` (svg / png / pdf), `publish`, `pdfbook` and `preview`, reached through `edit`,
+  count first (`Session::complete_pictures`, set by the MCP only; the desktop app is unchanged) and over the limit write
+  nothing and say to use the `export` tool with `blocks_as_boxes` / `layers_off`. `publish` and `pdfbook` count every
+  sheet before the first file. `pngout`, `jpgout` and `bmpout` are not commands of this engine (edit says unknown
+  command), so nothing can be written through them.
+* Every refusal steers: it says what was wrong, what to give instead (with an example) and to call again.
+
+### Round 3 in short
+
+* The refusal and the success path never cost a walk per name (design above); the heaviest and layer lists are bounded by
+  `max_result_bytes`; a saturated total lists the blocks that save instead of claiming nothing helps.
+* A stop during drawing ends the call as cancelled with no file, for svg, png, the tile loop and PDF (the plotter checks
+  the stop after every sheet).
+* The engine commands that can write or return an image, an SVG or a PDF all follow the rule through `edit` (counted
+  first, nothing written over the limit): `export`, `plot`, `publish`, `pdfbook`, `preview`, `wblock`, `qsave` / `save`,
+  `saveas`, `document.bytes`, `layout.saveas` (the last five by the file's extension or format). `blocks_as_boxes` is drawn
+  only by `plot` to PDF (counted with the boxes and written with them); every other command refuses it naming the `export`
+  tool, so no picture is counted one way and drawn another. Names are checked as the tools check them.
+* `blocks_as_boxes` is a list of block names only; a string, a number or a list with a non-string is refused naming what
+  was given and the form expected. No default stands in for a wrong value.
+
+### Round 4 (blind verification of round 3): what changed
+
+* **`plot` through `edit` counts what the plotter draws.** The count the engine made (the drawing as it stands, as a plot)
+  was not what the hook draws in two cases: `offLayers: true` (the PDF turns layers that are off on before drawing) and
+  an SVG of a layout (`plotter::svg` is the screen build, which includes do-not-plot layers). The engine now hands the
+  rule's limit to the plotter itself (the plot option `blockLimit`, set only by a session with `complete_pictures`, never
+  taken from the caller): `io::plot` counts every sheet as it will draw it and refuses, and the PNG and SVG plotters count
+  as they build (the build's own `expanded` is checked too), so a picture over the limit is refused, never cut, nothing
+  written. The engine's own count stays as the first, stoppable check; it counts no more than the plotter draws, so it
+  never refuses a picture that would fit. Tests: mcp `plot_through_edit_refuses_what_the_plotter_draws_over_the_limit`
+  (limit 100: `offLayers`, the SVG of a layout; the same commands without them still work).
+* **Refusal tables: no walk up through ancestors** (design above). Measured, release, one core, tables only (limit 100):
+
+  | n | one block holds n references to Z (was 0.07 / 0.68 / 10 s at 1k / 4k / 16k) | n separate blocks hold Z once (was 1.1 / 4.3 / 18.4 / 78.8 s at 2k / 4k / 8k / 16k) |
+  |---|---|---|
+  | 1,000 | 0.007 s | 0.014 s |
+  | 2,000 | 0.011 s | 0.031 s |
+  | 4,000 | 0.030 s | 0.064 s |
+  | 8,000 | 0.059 s | 0.167 s |
+  | 16,000 | 0.132 s | 0.367 s |
+
+  Still not linear, said plainly: a layer cut both on a reference to a fat block Z and on a reference inside Z, for n
+  layers with Z holding n references on those n layers (16,000 of each: 0.88 s; 4,000: 0.09 s, about x3.4 per doubling),
+  because the inner term visits Z once per layer and walks Z's n references each time. A real drawing would need that many
+  layers each used both above and inside one block. No cap was added. Tests (`the_tables_of_the_two_quadratic_shapes_grow_in_step_with_the_drawing`:
+  4,000 and 8,000, best of three, 8k under 3 x 4k plus 100 ms; figures equal to the walks at n = 12; `measure_the_tables`, ignored, prints
+  the table above).
+* **Memory of the recording.** A site is 32 bytes of indices. A chain of 16 blocks x 100 references shown from N layers is
+  16 expansions and 1,600 + N records at any N (test `the_recording_does_not_grow_with_the_layers_that_refer_to_a_chain`;
+  when the references inside sit on layer 0 each layer needs its own 15 expansions, as the build's would). Peak memory of
+  the whole census (release, test binary, `ru_maxrss`) for N = 4,000: 16 MB (round 3: 2.5 GB); N = 1,000: 9.9 MB.
+* **The refusal is within the answer budget and says only true things.** The budget is the call's `max_bytes`, else
+  `max_result_bytes`. The whole refusal is measured as it is serialised (the fixed text, the blocks already drawn as boxes,
+  every entry) and the entries shown are the most that fit (the lists grow together, then each alone, by halving; one entry
+  of each is always given). The names of the blocks already drawn as boxes are listed when they fit and counted when they
+  do not. Below the fixed text plus one entry of each list the refusal is that size and no smaller (3,881 bytes with 180
+  character names, 30 boxed names; 4,000 bytes held at every one of 24 rounds). "N more of the M are not listed" now says
+  "all M (the K listed and N more)". A way that leaves nothing (the only reference layer switched off leaves 0) is an
+  empty picture: it is not said to fit and the refusal still says no way alone gives a complete picture. A remainder that
+  could not be counted is said so and is never turned into "none of these". A dimension is not said to be reducible by
+  boxes (its block is drawn from its definition and is never drawn as a box). Tests: mcp
+  `the_refusal_fits_the_answer_budget_whatever_is_in_it`, `a_way_that_leaves_nothing_is_not_a_way_and_no_sentence_is_false`,
+  render `what_is_left_is_exact_when_the_total_overflows`.
+* **Other.** `saveas`, `qsave`, `document.bytes` (and `wblock`) now pass their parameters to the picture rule, so a
+  `blocks_as_boxes` given to them is refused naming the `export` tool instead of ignored (`layout.saveas` writes only drawing
+  files, never a picture). The nearest-block-names code uses the one edit distance the MCP's name matching uses
+  (`doc::edit_distance`, capped at 64 characters). "stopped as asked" says to call again to make the picture; the
+  build-went-over message says "call again". Tests `refused_tile_entries_count_against_the_answer_size` and
+  `a_build_over_the_limit_that_the_count_missed_says_what_to_try` are back (adapted).
+* **Not done:** an `edit` picture command cannot be stopped while the plotter draws or counts: the plot hook is a plain
+  function `fn(&Drawing, &Space, &Value)` and the file writers are the same, so passing the session's stop to them means
+  changing the hook types and every `IoHooks` literal in the tests of three crates. The engine's own count before the hook
+  is stoppable.
+
+### Round 5 (small exact fixes)
+
+* **The refusal tables can be stopped.** `savings::derive` takes the build's stop flag and checks it per holder list while
+  the references are merged, per node in the `down`, `up` and name-set passes, and per name (layer, block, boxed block) in
+  the final loops; never per inner item. A stopped census is one to discard, as a stopped count is: the callers already
+  check the flag after it and answer "stopped as asked ... call again to make it". (Measured before: up to 21 s without
+  a stop on extreme drawings.) The plot hook that is not `complete_only` (`io/src/pdf.rs`, the census made by `sheet()` for
+  a sheet that is drawn) needed only the total, the largest object, the layers, the arrays drawn short and the outlines,
+  and showed no table, yet worked the tables out past the limit: it now calls `census_space_total`, which gives those and
+  never the tables. (The `complete_only` count keeps the tables: a sheet over the limit is refused with them.)
+* **A dimension, said truly.** `blocks_as_boxes` never applies to the dimension itself (it is drawn from its own block).
+  When its block refers to blocks that are in the heaviest list, drawing those as boxes does reduce it, and the refusal
+  says so and names them (`BlockCensus::largest_holds`: the blocks of the list that the largest dimension's block refers
+  to at any depth); when none is, it says that only the layer it is on can reduce it. Where the budget leaves such a block
+  out of the entries shown, it says "N of the blocks not listed here (heaviest_blocks_more)". The earlier sentence "only
+  switching off the layer it is on can reduce it" was false for a dimension whose block holds references.
+* **Wording.** "a dimension is drawn from its own block, and that block is not drawn as a box" is said only when the
+  largest object is a dimension (it used to be added to every "no block to box" answer, and said "drawn from its
+  definition"). "for N of the layers and blocks above" counts only the entries shown; when the budget left some out it
+  says "for N layers or blocks, some not listed here,".
+* **`blocks_as_boxes` given to a save of a drawing file** (`saveas`, `qsave`, `document.bytes`, `save_drawing`, `export`
+  to dxf / dwg) is not refused (the save is valid) and no longer ignored silently: the answer carries
+  `blocks_as_boxes_used: false` and `blocks_as_boxes_note`: "blocks_as_boxes was not used: it applies only when a picture
+  or PDF is made, and the drawing file is saved complete". `save_drawing` now lists `blocks_as_boxes` in its arguments
+  for this (it was dropped as an unknown argument before).
+* **One answer budget.** `answer_budget` and the runtime's trim of the answer both take the call's `max_bytes` (never
+  below 1,024 bytes) from `contract::answer_bytes`; the refusal's budget used to lack the floor.
+
+### Known cost
+
+Past the limit the refusal works out its tables, and for some shapes that is slow and memory-hungry (under the limit none
+of this runs). Measured, release build, one core:
+
+* A drawing over the limit with thousands of layers, each referencing a deep chain of blocks whose inner references are on
+  layer 0 (so each layer needs its own expansions of the whole chain): a chain 16 deep with 100 references per level,
+  referenced from 4,000 layers: 5.2 s and 300 MB; from 16,000 layers: 21 s and 1.5 GB.
+* The admitted quadratic shape (a layer cut both on each reference to a fat block and inside it): 1.28 s at 16,000
+  layers, 16.6 s at 64,000.
+
+The stop flag now ends the tables in these cases (above); no cap was put on them.

@@ -104,6 +104,15 @@ pub struct PdfOptions {
     /// Block contents one sheet expands before the rest are not drawn:
     /// [`cadcraft_render::MAX_BLOCK_EXPANSION`]. Not read from JSON (only tests give another value).
     pub max_block_expansion: usize,
+    /// Blocks drawn as one outline box per reference instead of their contents
+    /// (`blocks_as_boxes: [names]`; names compared as block names are, ignoring case).
+    pub blocks_as_boxes: Vec<String>,
+    /// A sheet that needs more than `max_block_expansion` is not drawn at all and no file is made
+    /// ([`Plot::TooBig`]), instead of a sheet with the block contents past the limit left out.
+    /// Not read from JSON: [`plot_complete`] sets it, [`plot`] (the engine's hook) leaves it off.
+    pub complete_only: bool,
+    /// Stops counting and drawing when set (not read from JSON): the plot then ends with an error.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for PdfOptions {
@@ -129,6 +138,9 @@ impl Default for PdfOptions {
             hyperlinks: true,
             plot_transparency: None,
             max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
+            blocks_as_boxes: Vec::new(),
+            complete_only: false,
+            cancel: None,
         }
     }
 }
@@ -166,8 +178,18 @@ impl PdfOptions {
             hyperlinks: v.get("hyperlinks").and_then(Value::as_bool).unwrap_or(true),
             plot_transparency: v.get("plotTransparency").and_then(Value::as_bool),
             max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
+            // Set by the plot after `validate_blocks_as_boxes` (this parser cannot refuse).
+            blocks_as_boxes: Vec::new(),
+            complete_only: false,
+            cancel: None,
         }
     }
+}
+
+/// `blocks_as_boxes` checked against the drawing (see [`cadcraft_doc::checked_boxed_names`]): a list of
+/// names of its blocks, the names as the drawing spells them.
+pub(crate) fn validate_blocks_as_boxes(d: &Drawing, opts: &Value) -> Result<Vec<String>> {
+    cadcraft_doc::checked_boxed_names(d, opts.get("blocks_as_boxes")).map_err(IoError::Format)
 }
 
 fn offset(v: Option<&Value>) -> Option<[f64; 2]> {
@@ -220,44 +242,84 @@ fn window(v: Option<&Value>) -> Option<Bounds2> {
     (w.width() > 0.0 && w.height() > 0.0).then_some(w)
 }
 
-/// Plot with JSON options (the engine's `plot` hook).
-pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
-    plot_with_blocks(d, space, opts).map(|p| p.bytes)
+/// The JSON option the engine sets for the picture rule (`Session::complete_pictures`): the most block
+/// pieces one picture draws. With it the plot hooks ([`plot`], [`crate::plotter::plot`]) count what THEY draw
+/// (layers that are off drawn on hidden PDF layers, the screen build of a layout's SVG...) and refuse a picture
+/// over it instead of cutting it. The engine writes the same name (it cannot depend on this crate).
+pub const BLOCK_LIMIT_KEY: &str = "blockLimit";
+
+/// The limit given in `opts` ([`BLOCK_LIMIT_KEY`]), when there is one.
+pub(crate) fn block_limit(opts: &Value) -> Option<usize> {
+    opts.get(BLOCK_LIMIT_KEY).and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
-/// The block contents one plotted sheet needed and drew (see [`cadcraft_render::MAX_BLOCK_EXPANSION`]).
+/// What the plot hooks answer when a picture needs `need` block pieces ([`cadcraft_render::COUNT_SATURATED`]:
+/// more than can be counted) and one draws at most `limit`: nothing was drawn or written, and where a complete
+/// one is made.
+pub(crate) fn too_big_message(what: &str, need: u64, limit: usize) -> String {
+    let need = if need == cadcraft_render::COUNT_SATURATED { "more than can be counted".to_string() } else { need.to_string() };
+    format!(
+        "{what} needs {need} block pieces (every copy of a block and every object in it, nested blocks counted) and one picture draws at most {limit}: no picture was made and no file was written. Make it with the `export` tool instead (arguments: {{\"path\": \"<file>.pdf\" (or .svg / .png), \"space\": \"<layout or model>\", \"blocks_as_boxes\": [\"<block name>\"], \"layers_off\": [\"<layer>\"]}}; or `render_preview` with the same arguments to look at it): its answer lists which blocks to give in blocks_as_boxes and which layers to switch off so the picture is complete, then call it again with them"
+    )
+}
+
+/// For the image and SVG plotters under the picture rule: refuse before drawing when the picture of `space`
+/// (`plotting`: as a plot builds it, else as the screen does) needs more than `limit`.
+pub(crate) fn refuse_if_over(d: &Drawing, space: &Space, plotting: bool, limit: usize) -> Result<()> {
+    let opts = cadcraft_render::Options { max_block_expansion: limit, ..cadcraft_render::Options::default() };
+    let need = cadcraft_render::count_space_with(d, space, plotting, &opts);
+    if need > limit as u64 {
+        return Err(IoError::Format(too_big_message(&format!("the picture of {}", space.tab_name()), need, limit)));
+    }
+    Ok(())
+}
+
+/// Plot with JSON options (the engine's `plot` hook). A sheet that needs more block contents than
+/// [`cadcraft_render::MAX_BLOCK_EXPANSION`] is drawn with the rest left out, unless `opts` carries
+/// [`BLOCK_LIMIT_KEY`]: then every sheet is counted first (as it is drawn: layers that are off included when
+/// `offLayers` is set) and a sheet over the limit is refused, nothing drawn.
+pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
+    let limit = block_limit(opts);
+    match plot_outcome(d, space, opts, limit.map(|l| (l, None)))? {
+        Plot::Drawn(p) => Ok(p.bytes),
+        Plot::TooBig(sheets) => {
+            let over: Vec<&SheetBlocks> = sheets.iter().filter(|b| b.over_limit()).collect();
+            let Some(worst) = over.iter().max_by_key(|b| b.total) else {
+                return Err(IoError::Format("a sheet needs more block contents than one sheet draws".into()));
+            };
+            let more = if over.len() > 1 { format!(" (and {} more sheets are over the limit)", over.len() - 1) } else { String::new() };
+            Err(IoError::Format(too_big_message(&format!("sheet {} ({}){more}", worst.number, worst.sheet), worst.total, limit.unwrap_or(0))))
+        }
+    }
+}
+
+/// The block contents one plotted sheet needs (see [`cadcraft_render::MAX_BLOCK_EXPANSION`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SheetBlocks {
     /// The sheet: `Model` or the layout's name.
     pub sheet: String,
-    /// Block expansions the sheet asks for: what its build counted when the sheet was drawn whole,
-    /// else (past the limit, the build stops there) the count made from the block table before the
-    /// build, never below what the build counted. [`COUNT_SATURATED`](cadcraft_render::COUNT_SATURATED)
-    /// when more than can be counted.
+    /// Its page number in the file (from 1).
+    pub number: usize,
+    /// Block expansions the sheet asks for: what its build counted when the sheet was drawn, else
+    /// the count made from the block table before any build.
+    /// [`COUNT_SATURATED`](cadcraft_render::COUNT_SATURATED) when more than can be counted.
     pub total: u64,
-    /// What the build counted of them: above `limit` the contents past it were not drawn.
-    pub expanded: usize,
-    /// The most expansions one build draws.
+    /// The most expansions one sheet draws.
     pub limit: usize,
     /// What the count from the block table found: the largest single object, the layers the
-    /// references are on (and what switching each off leaves, past the limit) and arrays drawn short.
+    /// references are on, and, past the limit, what switching each layer off or drawing each block
+    /// as a box leaves; arrays drawn short; the references drawn as boxes.
     pub census: cadcraft_render::BlockCensus,
 }
 
 impl SheetBlocks {
-    /// Whether block contents were left out of the sheet because of the limit (the build's own
-    /// count went past it).
-    pub fn truncated(&self) -> bool {
-        self.expanded > self.limit
-    }
-
-    /// Expansions asked for and not drawn: what is past the limit (saturated with the total).
-    pub fn not_drawn(&self) -> u64 {
-        if self.total == cadcraft_render::COUNT_SATURATED { self.total } else { self.total.saturating_sub(self.limit as u64) }
+    /// Whether the sheet needs more block contents than one sheet draws.
+    pub fn over_limit(&self) -> bool {
+        self.total > self.limit as u64
     }
 }
 
-/// A plotted file and what each of its sheets did with block contents.
+/// A plotted file and what each of its sheets needed of block contents.
 #[derive(Clone, Debug)]
 pub struct Plotted {
     pub bytes: Vec<u8>,
@@ -265,12 +327,57 @@ pub struct Plotted {
     pub blocks: Vec<SheetBlocks>,
 }
 
-/// [`plot`] that also says, per sheet, how many block expansions it needed and drew.
-pub fn plot_with_blocks(d: &Drawing, space: &Space, opts: &Value) -> Result<Plotted> {
+/// What a plot made: the file, or, when a sheet needs more block contents than one sheet draws,
+/// nothing but what each sheet needs (no sheet was drawn and no bytes exist).
+#[derive(Clone, Debug)]
+pub enum Plot {
+    Drawn(Plotted),
+    TooBig(Vec<SheetBlocks>),
+}
+
+impl Plot {
+    /// The file, or an error when a sheet was too big (a plot that is not [`PdfOptions::complete_only`] never is).
+    pub fn into_drawn(self) -> Result<Plotted> {
+        match self {
+            Plot::Drawn(p) => Ok(p),
+            Plot::TooBig(_) => Err(IoError::Format("a sheet needs more block contents than one sheet draws".into())),
+        }
+    }
+}
+
+/// [`plot`] for a caller that must not make an incomplete file: every sheet is counted before any is
+/// drawn, and when one needs more than `limit` block pieces (the blocks named in `blocks_as_boxes`
+/// counting one each; [`cadcraft_render::MAX_BLOCK_EXPANSION`] is the limit of the MCP tools) nothing
+/// is drawn and the answer is [`Plot::TooBig`] with the figures of every sheet. Otherwise the file
+/// and each sheet's count.
+pub fn plot_complete(
+    d: &Drawing,
+    space: &Space,
+    opts: &Value,
+    limit: usize,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Plot> {
+    plot_outcome(d, space, opts, Some((limit, cancel)))
+}
+
+/// `complete_only`: `Some((limit, cancel))` for [`plot_complete`].
+fn plot_outcome(
+    d: &Drawing,
+    space: &Space,
+    opts: &Value,
+    complete_only: Option<(usize, Option<std::sync::Arc<std::sync::atomic::AtomicBool>>)>,
+) -> Result<Plot> {
     validate_plot_offset_json(opts)?;
+    let boxed = validate_blocks_as_boxes(d, opts)?;
     // `layouts: [name | "Model"] | "all"` plots those sheets into one file, one page each,
     // instead of `space`; "all" = Model if it has objects, then the layouts in tab order.
-    let o = PdfOptions::from_json(opts);
+    let mut o = PdfOptions::from_json(opts);
+    o.blocks_as_boxes = boxed;
+    if let Some((limit, cancel)) = complete_only {
+        o.complete_only = true;
+        o.max_block_expansion = limit;
+        o.cancel = cancel;
+    }
     // `pages: [{window: [[x1,y1],[x2,y2]], paper?, landscape?, scale?}]` plots model space once
     // per window, one page each (a book of sheet frames), instead of `space`.
     if let Some(pages) = opts.get("pages") {
@@ -291,6 +398,9 @@ pub fn plot_with_blocks(d: &Drawing, space: &Space, opts: &Value) -> Result<Plot
                 po.fit = Some(true);
                 po.compress = o.compress;
                 po.max_block_expansion = o.max_block_expansion;
+                po.blocks_as_boxes = o.blocks_as_boxes.clone();
+                po.complete_only = o.complete_only;
+                po.cancel = o.cancel.clone();
                 Ok((Space::Model, po))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -408,11 +518,12 @@ fn sheet_name(space: &Space) -> String {
 /// Write a vector PDF with one page per space (at most [`MAX_PAGES`]), each labelled with its
 /// layout name. The options apply to every sheet; layouts use their own page setups.
 pub fn pdf_sheets(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Vec<u8>> {
-    pdf_sheets_with_blocks(d, spaces, o).map(|p| p.bytes)
+    pdf_sheets_with_blocks(d, spaces, o)?.into_drawn().map(|p| p.bytes)
 }
 
-/// [`pdf_sheets`] that also says, per sheet, what it did with block contents.
-pub fn pdf_sheets_with_blocks(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Plotted> {
+/// [`pdf_sheets`] that also says, per sheet, what it needs of block contents (and, with
+/// [`PdfOptions::complete_only`], draws nothing when a sheet needs more than the limit).
+pub fn pdf_sheets_with_blocks(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Plot> {
     let items: Vec<(Space, PdfOptions)> = spaces.iter().take(MAX_PAGES + 1).map(|s| (s.clone(), o.clone())).collect();
     pdf_items_with_blocks(d, &items, o)
 }
@@ -421,10 +532,10 @@ pub fn pdf_sheets_with_blocks(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> 
 /// page plots with its own options (window, paper, orientation); `o` supplies the file-wide
 /// ones (compression, title, layers, links).
 pub fn pdf_items(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<Vec<u8>> {
-    pdf_items_with_blocks(d, items, o).map(|p| p.bytes)
+    pdf_items_with_blocks(d, items, o)?.into_drawn().map(|p| p.bytes)
 }
 
-fn pdf_items_with_blocks(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<Plotted> {
+fn pdf_items_with_blocks(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions) -> Result<Plot> {
     if items.iter().any(|(_, io)| io.offset.is_some_and(|offset| !valid_plot_offset(offset))) {
         return Err(IoError::Format("plot offset must contain two finite values within ±100000 mm".into()));
     }
@@ -434,11 +545,16 @@ fn pdf_items_with_blocks(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOpti
     if items.len() > MAX_PAGES {
         return Err(IoError::Format(format!("at most {MAX_PAGES} sheets fit in one PDF")));
     }
+    let done = |r: std::result::Result<Plotted, Failure>| match r {
+        Ok(p) => Ok(Plot::Drawn(p)),
+        Err(Failure::TooBig(sheets)) => Ok(Plot::TooBig(sheets)),
+        Err(e) => Err(e.into_io()),
+    };
     match write_pdf(d, items, o, o.text_as_geometry) {
         // A font the PDF writer can't embed after all, or one that makes it fail internally:
         // plot the text as outlines instead. Outlines embed no font, so this runs at most once.
-        Err(Failure::Write(e)) if !o.text_as_geometry && font_failure(&e) => write_pdf(d, items, o, true).map_err(Failure::into_io),
-        r => r.map_err(Failure::into_io),
+        Err(Failure::Write(e)) if !o.text_as_geometry && font_failure(&e) => done(write_pdf(d, items, o, true)),
+        r => done(r),
     }
 }
 
@@ -456,6 +572,9 @@ fn font_failure(e: &WriteError) -> bool {
 enum Failure {
     Io(IoError),
     Write(WriteError),
+    /// A sheet needs more block contents than one sheet draws and the plot must be complete: the
+    /// figures of every sheet.
+    TooBig(Vec<SheetBlocks>),
 }
 
 impl From<IoError> for Failure {
@@ -475,6 +594,7 @@ impl Failure {
         match self {
             Failure::Io(e) => e,
             Failure::Write(e) => IoError::Format(format!("PDF export failed: {e}")),
+            Failure::TooBig(_) => IoError::Format("a sheet needs more block contents than one sheet draws".into()),
         }
     }
 }
@@ -514,13 +634,91 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
         let mut fonts = fonts::Fonts::new(!text_as_geometry);
         let mut groups = Groups::default();
         let mut blocks = Vec::new();
-        for (s, po) in items {
-            let page = sheet(drawn, s, po, &links)?;
+        // The blocks drawn as boxes, per sheet (made once per distinct list of names). With
+        // `complete_only` every sheet is counted before any is drawn (once per distinct space, boxes
+        // and limit: `pages` can name up to 256 sheets of the same space): one sheet over the limit and
+        // no file is made.
+        let stopped = || o.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        let stop = || Failure::Io(IoError::Format("stopped as asked".into()));
+        let mut made: std::collections::HashMap<Vec<String>, std::sync::Arc<cadcraft_render::BoxBlocks>> = std::collections::HashMap::new();
+        let mut boxes: Vec<Option<std::sync::Arc<cadcraft_render::BoxBlocks>>> = Vec::new();
+        for (_, po) in items {
+            if po.blocks_as_boxes.is_empty() {
+                boxes.push(None);
+                continue;
+            }
+            if !made.contains_key(&po.blocks_as_boxes) {
+                let b = cadcraft_render::BoxBlocks::new(drawn, &po.blocks_as_boxes).map_err(|e| Failure::Io(IoError::Format(e)))?;
+                made.insert(po.blocks_as_boxes.clone(), std::sync::Arc::new(b));
+            }
+            boxes.push(made.get(&po.blocks_as_boxes).cloned());
+        }
+        let mut counted: Vec<Option<cadcraft_render::BlockCensus>> = items.iter().map(|_| None).collect();
+        #[cfg(test)]
+        let after_count = || {
+            if let Some(f) = STOP_AFTER_COUNT.with(|c| c.borrow().clone()) {
+                f.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        #[cfg(not(test))]
+        let after_count = || {};
+        if o.complete_only {
+            let mut sheets = Vec::new();
+            let mut seen: std::collections::HashMap<(String, Vec<String>, usize), usize> = std::collections::HashMap::new();
+            for (k, (s, po)) in items.iter().enumerate() {
+                if stopped() {
+                    return Err(stop());
+                }
+                let key = (format!("{s:?}"), po.blocks_as_boxes.clone(), po.max_block_expansion);
+                let census = match seen.get(&key).and_then(|j| counted.get(*j)).cloned().flatten() {
+                    Some(c) => c,
+                    None => {
+                        let opts = cadcraft_render::Options {
+                            max_block_expansion: po.max_block_expansion,
+                            blocks_as_boxes: boxes.get(k).cloned().flatten(),
+                            cancel: po.cancel.clone(),
+                            ..cadcraft_render::Options::default()
+                        };
+                        let c = cadcraft_render::census_space(drawn, s, true, &opts);
+                        #[cfg(test)]
+                        let c = if UNDERCOUNT.with(std::cell::Cell::get) { cadcraft_render::BlockCensus { total: 0, ..c } } else { c };
+                        if stopped() {
+                            return Err(stop());
+                        }
+                        seen.insert(key, k);
+                        c
+                    }
+                };
+                sheets.push(SheetBlocks {
+                    sheet: sheet_name(s),
+                    number: k + 1,
+                    total: census.total,
+                    limit: po.max_block_expansion,
+                    census: census.clone(),
+                });
+                if let Some(slot) = counted.get_mut(k) {
+                    *slot = Some(census);
+                }
+            }
+            if sheets.iter().any(SheetBlocks::over_limit) {
+                return Err(Failure::TooBig(sheets));
+            }
+            after_count();
+        }
+        for (k, (s, po)) in items.iter().enumerate() {
+            if stopped() {
+                return Err(stop());
+            }
+            let pre = Pre { number: k + 1, boxes: boxes.get(k).cloned().flatten(), census: counted.get_mut(k).and_then(Option::take) };
+            let page = sheet(drawn, s, po, &links, pre)?;
             blocks.push(page.blocks.clone());
             let doc = writer.document_mut();
             // Groups are added to the document, so they must exist before the page starts.
             groups.add(doc, d, &page.layers);
             write_page(doc, &page, &groups, &mut fonts)?;
+        }
+        if stopped() {
+            return Err(stop());
         }
         if items.len() == 1 && !groups.ids.is_empty() {
             writer.document_mut().set_optional_content_page_mode(true);
@@ -572,8 +770,18 @@ struct SheetPage {
     blocks: SheetBlocks,
 }
 
+/// What is known of a sheet before it is drawn.
+struct Pre {
+    /// Its page number (from 1).
+    number: usize,
+    /// The blocks drawn as boxes.
+    boxes: Option<std::sync::Arc<cadcraft_render::BoxBlocks>>,
+    /// Its count, when it was made before drawing ([`PdfOptions::complete_only`]).
+    census: Option<cadcraft_render::BlockCensus>,
+}
+
 /// Plot one space.
-fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String)]) -> Result<SheetPage> {
+fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String)], pre: Pre) -> std::result::Result<SheetPage, Failure> {
     let page = page_for(d, space, o)?;
     let unit_mm = paper::page_unit_mm(d, &page);
     let sheet = Sheet::from_page(&page, unit_mm);
@@ -590,8 +798,9 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         plot_style_table,
         view: None,
         skip_viewport: None,
-        cancel: None,
+        cancel: o.cancel.clone(),
         max_block_expansion: o.max_block_expansion,
+        blocks_as_boxes: pre.boxes,
     };
     let k = unit_mm * PT_PER_MM;
     let window = o.window.filter(|w| matches!(space, Space::Model) && !w.is_empty());
@@ -602,14 +811,26 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     let tolerance = if tol.is_finite() && tol > 0.0 { tol } else { ropts.tolerance };
     // Relative point sizes follow the plotted window (else the extents).
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
-    let census = cadcraft_render::census_space(d, space, true, &ropts);
+    let census = match pre.census {
+        Some(c) => c,
+        None => cadcraft_render::census_space_total(d, space, true, &ropts),
+    };
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
+    // A build that was stopped is a partial list: the sheet is not used.
+    if o.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(Failure::Io(IoError::Format("stopped as asked".into())));
+    }
     let expanded = list.expanded;
     let limit = o.max_block_expansion;
-    // Drawn whole: the build's count is the figure. Past the limit the build stops there, and the
-    // count from the block table says how much more the sheet asks for.
+    // Drawn whole: the build's count is the figure. Past the limit the build stopped there (the
+    // count from the block table, made before it, is never below what it took).
     let total = if expanded > limit { census.total.max(expanded as u64) } else { expanded as u64 };
-    let blocks = SheetBlocks { sheet: sheet_name(space), total, expanded, limit, census };
+    let blocks = SheetBlocks { sheet: sheet_name(space), number: pre.number, total, limit, census };
+    // A build past the limit is incomplete: for a caller that wants a complete file it is not used.
+    // (The count made before the build says so first; this is the build's own count, the ground truth.)
+    if o.complete_only && blocks.over_limit() {
+        return Err(Failure::TooBig(vec![blocks]));
+    }
     let b = window.unwrap_or(list.bounds);
     let s = plot_scale(&b, &sheet, fit, o.scale);
     let map = if fit || matches!(space, Space::Model) {
@@ -1059,4 +1280,42 @@ fn uri(url: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the count made before drawing says 0, so the build's own check is what must catch a sheet over the limit.
+    static UNDERCOUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test hook: this flag is set right after the count, so the drawing is what is stopped.
+    static STOP_AFTER_COUNT: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod mismatch_tests {
+    use super::*;
+
+    /// The count says a sheet fits but the build goes over the limit: no file, and the sheet's figures
+    /// say the count said it fits (so the answer can say the count may be wrong).
+    #[test]
+    fn a_build_over_the_limit_that_the_count_missed_makes_no_file() {
+        let d = crate::read(b"0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nA\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n1\n0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nA\n10\n0\n20\n0\n70\n10\n71\n10\n44\n2\n45\n2\n0\nENDSEC\n0\nEOF\n", "x.dxf").unwrap();
+        UNDERCOUNT.with(|c| c.set(true));
+        let r = plot_complete(&d, &Space::Model, &serde_json::json!({}), 50, None);
+        UNDERCOUNT.with(|c| c.set(false));
+        let Plot::TooBig(sheets) = r.unwrap() else { panic!("a file was made") };
+        let [sheet] = &sheets[..] else { panic!("{sheets:?}") };
+        assert!(sheet.over_limit() && sheet.census.total <= sheet.limit as u64, "{sheet:?}");
+    }
+
+    /// A stop that arrives while the sheet is being drawn (right after the count) ends the plot with an
+    /// error: no file, not a half-drawn one answered as done.
+    #[test]
+    fn a_stop_during_drawing_ends_the_plot() {
+        let d = crate::read(b"0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nA\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n1\n0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nA\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n", "x.dxf").unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        STOP_AFTER_COUNT.with(|c| *c.borrow_mut() = Some(stop.clone()));
+        let r = plot_complete(&d, &Space::Model, &serde_json::json!({}), 50, Some(stop));
+        STOP_AFTER_COUNT.with(|c| *c.borrow_mut() = None);
+        assert!(r.is_err(), "a plot that was stopped came out as done");
+    }
 }

@@ -47,6 +47,7 @@ pub use cadcraft_doc as doc;
 pub use cadcraft_fonts as fonts;
 pub use cadcraft_geom as geom;
 pub use cadcraft_render as render;
+pub use cmd::file::BOXES_NOT_USED;
 pub use cmd::hatch::{HatchPicks, PatternChoice, PickMode, pattern_choices};
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
 pub use prompt::{Accept, Drag, Input, Interactive, Picker, Prompt, Step};
@@ -74,10 +75,23 @@ pub fn build_version() -> &'static str {
     &VERSION
 }
 
+/// What [`Session::complete_pictures`] enforces: the most block pieces one picture draws, and the
+/// caller's stop flag (a stopped count ends the command with an error, nothing written).
+#[derive(Clone, Debug)]
+pub struct PictureRule {
+    pub limit: usize,
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
 /// The editor session: open drawings, settings, the running command and the command log.
 pub struct Session {
     pub docs: Vec<DocState>,
     pub active: usize,
+    /// `Some(limit)`: a command that writes a picture (PDF, PNG, SVG: `plot`, `export`, `publish`,
+    /// `pdfbook`, `preview`) first counts the block pieces it would draw and, when a sheet needs more
+    /// than `limit`, writes nothing and says so, instead of drawing the sheet with the block contents
+    /// past the limit left out. Off (`None`) in the desktop app; the MCP server turns it on.
+    pub complete_pictures: Option<PictureRule>,
     /// Monotonic count of changes to the open drawings and the active one. A screenshot queued
     /// across a switch is rejected even when a later switch returns to the same drawing.
     pub doc_epoch: u64,
@@ -165,6 +179,7 @@ impl Session {
         Session {
             docs: Vec::new(),
             active: 0,
+            complete_pictures: None,
             doc_epoch: 0,
             settings: Settings::default(),
             running: None,

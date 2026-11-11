@@ -127,10 +127,10 @@ struct Builder<'a> {
     transparency: u8,
 }
 
-/// Upper bound on the block contents drawn per display list (each block reference, MINSERT copy
-/// and entity drawn inside a block counts one). Nested, self-referencing or arrayed block
-/// references in a hostile file would otherwise expand exponentially (`MAX_BLOCK_DEPTH` only
-/// bounds the depth); past the limit the remaining block contents are not drawn.
+/// Upper bound on the block contents drawn per display list (every block copy and every object in it counts one).
+/// A build stops expanding at it; the MCP picture tools count first and make no picture, and write no file, for a
+/// picture that would need more.
+// AGREED LIMIT (owner, 2026-11-11): 2,000,000 — the most block contents one picture or PDF sheet expands; over it nothing incomplete is made, the tool refuses and names the ways through (layers off, blocks as boxes) — why: an unbounded expansion ran the server out of memory (the SVG export of 4L-13 Round 2) — arbitrary by agreement.
 pub const MAX_BLOCK_EXPANSION: usize = 2_000_000;
 
 impl Builder<'_> {
@@ -302,22 +302,28 @@ mod table;
 pub use table::{MAX_LAYOUT_CELLS, TableFill, TableGeom, TableLine, TableText, table_covered, table_geometry, table_style_of};
 
 mod blocks;
+mod boxes;
 mod count;
 mod dim_draw;
 mod display;
 mod draw;
 mod pipeline;
+mod savings;
 mod props;
 mod slices;
 mod text_entity;
 mod viewports;
 
+pub use boxes::BoxBlocks;
+pub use count::{COUNT_SATURATED, ClampedArray, LargestRef};
 pub use dim_draw::{dim_text, dimension_in};
 pub use display::{DPrim, DisplayList, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
-pub use slices::build_layout_slices;
-pub use count::{COUNT_SATURATED, ClampedArray, LargestRef};
-pub use pipeline::{BlockCensus, LayerOff, Options, build, build_entities, build_plot, build_slice, census_entities, census_space, count_expansions, count_space};
+pub use pipeline::{
+    BlockCensus, BlockSaving, BoxedRefs, LayerOff, Options, build, build_entities, build_plot, build_slice, census_entities, census_space, census_space_total,
+    count_expansions, count_space, count_space_with,
+};
 use props::{default_lineweight, resolve_common};
+pub use slices::build_layout_slices;
 use text_entity::text_style;
 pub use text_entity::{layout_mtext_entity, place_text_entity, text_align};
 pub use viewports::{viewport_clip, viewport_content};

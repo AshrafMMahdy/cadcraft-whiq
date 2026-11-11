@@ -141,13 +141,15 @@ fn is_dxf(path: &str) -> bool {
 
 /// The drawing written to `path` with `opts`: through [`IoHooks::write`] when no option is set,
 /// else through the [`write_as`] hook.
-fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<Vec<u8>> {
+fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs, p: &Value) -> Result<Vec<u8>> {
     let hooks = io().ok_or_else(|| bad(cmd, "file formats are not available in this build"))?;
     if opts.binary && !is_dxf(path) {
         return Err(bad(cmd, "binary applies to DXF files only"));
     }
     // A drawing file is the drawing outside the Block Editor; an image is what is shown.
     let d: &cadcraft_doc::Drawing = if is_drawing_file(path) { s.state()?.drawing() } else { s.doc()? };
+    // An image or a PDF is a picture: complete or not written.
+    super::exchange::picture_fits_for_file(s, cmd, path, d, p)?;
     let r = if *opts == SaveAs::default() {
         (hooks.write)(d, path)
     } else {
@@ -403,18 +405,18 @@ fn run_closeall(s: &mut Session, _p: &Value) -> Result<Value> {
     ok()
 }
 
-pub(crate) fn save_to(s: &mut Session, path: &str) -> Result<usize> {
+pub(crate) fn save_to(s: &mut Session, path: &str, p: &Value) -> Result<usize> {
     let opts = SaveAs { version: None, binary: s.state()?.binary_dxf && is_dxf(path) };
-    save_as(s, "save", path, &opts)
+    save_as(s, "save", path, &opts, p)
 }
 
 /// Save to `path` with `opts`. A drawing file then keeps the version and binary choice: the
 /// version goes into the drawing's `$ACADVER`, so later saves (QSAVE) write it again.
-fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<usize> {
+fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs, p: &Value) -> Result<usize> {
     if s.doc()?.refedit.is_some() {
         return Err(bad(cmd, "A block reference is being edited in place: finish with REFCLOSE (Save or Discard) before saving."));
     }
-    let bytes = write_bytes(s, cmd, path, opts)?;
+    let bytes = write_bytes(s, cmd, path, opts, p)?;
     let n = commit_save(s, path, &bytes, store)?;
     if is_drawing_file(path) {
         let st = s.state_mut()?;
@@ -480,14 +482,14 @@ fn run_save(s: &mut Session, p: &Value) -> Result<Value> {
         Some(p) => p.to_string(),
         None => s.state()?.path.clone().ok_or_else(|| bad("qsave", "drawing has no file name yet; use saveas {path}"))?,
     };
-    let n = save_to(s, &path)?;
+    let n = save_to(s, &path, p)?;
     Ok(saved(&path, n))
 }
 
 fn run_saveas(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").ok_or_else(|| bad("saveas", "`path` is required"))?.to_string();
     let opts = save_options("saveas", p)?;
-    let n = save_as(s, "saveas", &path, &opts)?;
+    let n = save_as(s, "saveas", &path, &opts, p)?;
     let mut r = saved(&path, n);
     if is_drawing_file(&path) {
         r["version"] = json!(opts.version.unwrap_or_else(|| drawing_version(s, &path)).year());
@@ -525,8 +527,11 @@ fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let opts = save_options("document.bytes", p)?;
     let version = opts.version.unwrap_or_else(|| drawing_version(s, &format!("drawing.{fmt}")));
     let lost = not_saved_as(s.doc()?, version);
-    let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
+    let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts, p)?;
     let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
+    if is_drawing_file(format!("drawing.{fmt}")) {
+        note_boxes_not_used(p, &mut r);
+    }
     if drops_unknown(format!("drawing.{fmt}")) {
         report_not_saved(s, &mut r, &lost);
     }
@@ -593,6 +598,21 @@ fn report_not_saved(s: &mut Session, r: &mut Value, lost: &std::collections::BTr
     }
 }
 
+/// What a save of a drawing file says when it was given `blocks_as_boxes`.
+pub const BOXES_NOT_USED: &str =
+    "blocks_as_boxes was not used: it applies only when a picture or PDF is made, and the drawing file is saved complete";
+
+/// A save of a drawing file (DXF, DWG) given `blocks_as_boxes` is valid, but the option applies to pictures only:
+/// say in the answer that it was not used, and why.
+pub fn note_boxes_not_used(p: &Value, r: &mut Value) {
+    if p.get("blocks_as_boxes").is_some_and(|v| !v.is_null())
+        && let Some(o) = r.as_object_mut()
+    {
+        o.insert("blocks_as_boxes_used".into(), json!(false));
+        o.insert("blocks_as_boxes_note".into(), json!(BOXES_NOT_USED));
+    }
+}
+
 /// Save, then report the entities the file couldn't keep (nothing is dropped silently).
 fn save_reporting(s: &mut Session, p: &Value, run: fn(&mut Session, &Value) -> Result<Value>) -> Result<Value> {
     // What the file will hold depends on the version it is saved as (the data store from 2013).
@@ -600,6 +620,9 @@ fn save_reporting(s: &mut Session, p: &Value, run: fn(&mut Session, &Value) -> R
     let version = save_options("save", p).ok().and_then(|o| o.version).unwrap_or_else(|| drawing_version(s, &path));
     let lost = s.doc().map(|d| not_saved_as(d, version)).unwrap_or_default();
     let mut r = run(s, p)?;
+    if r.get("path").and_then(Value::as_str).is_some_and(is_drawing_file) {
+        note_boxes_not_used(p, &mut r);
+    }
     if r.get("path").and_then(Value::as_str).is_some_and(drops_unknown) {
         report_not_saved(s, &mut r, &lost);
     }

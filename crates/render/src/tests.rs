@@ -1192,6 +1192,83 @@ fn layer_named(name: &str, on: bool) -> cadcraft_doc::Layer {
     cadcraft_doc::Layer { name: name.into(), on, ..Default::default() }
 }
 
+/// With blocks drawn as boxes the count still is what an unlimited build expands, for each block
+/// of the drawing alone and for all of them, in the screen build and the plot; and the references
+/// the census says are drawn as boxes are the outlines (5-point polylines: these drawings hold
+/// only lines otherwise) the build draws.
+fn count_equals_build_with_boxes(d: &Drawing, space: &Space, what: &str) {
+    let names: Vec<String> = d.blocks.keys().cloned().collect();
+    let mut sets: Vec<Vec<String>> = names.iter().map(|n| vec![n.clone()]).collect();
+    sets.push(names.clone());
+    for set in sets {
+        let boxes = std::sync::Arc::new(BoxBlocks::new(d, &set).unwrap());
+        let o = Options { blocks_as_boxes: Some(boxes), ..uncapped() };
+        let built = build(d, space, &o);
+        let c = census_space(d, space, false, &o);
+        assert_eq!(c.total, built.expanded as u64, "{what}: boxes {set:?}");
+        let plot = build_plot(d, space, &o).expanded as u64;
+        assert_eq!(count_space_with(d, space, true, &o), plot, "{what}: boxes {set:?} (plot)");
+        // A subset of the objects (what a tile or an export slice builds): the count of those objects is
+        // what `build_entities` expands.
+        if matches!(space, Space::Model) {
+            let subset: Vec<&cadcraft_doc::Entity> = d.model.iter().map(|e| e.as_ref()).step_by(3).collect();
+            let built = build_entities(d, subset.iter().copied(), &o).expanded as u64;
+            assert_eq!(census_entities(d, &subset, false, &o).total, built, "{what}: boxes {set:?} (subset)");
+        }
+        if matches!(what, "nested" | "layers and arrays" | "self reference") {
+            let outlines = built.prims.iter().filter(|p| p.kind == Kind::Polyline && p.len == 5).count() as u64;
+            assert_eq!(c.boxed.iter().map(|b| b.outlines).sum::<u64>(), outlines, "{what}: boxes {set:?}");
+            assert_eq!(c.boxed.len(), set.len(), "{what}");
+        }
+    }
+}
+
+/// What the census says drawing one block as boxes leaves is what a count with that block boxed
+/// says (so, what a build expands), for every block of the drawing that saves anything: the saving
+/// is worked out from how often each copy is expanded, not by a walk per block, and must agree with
+/// the walks, also for a block that is part of itself and for layouts.
+fn heaviest_equals_walks(d: &Drawing, space: &Space, what: &str) {
+    heaviest_equals_walks_at(d, space, what, 1);
+}
+
+/// [`heaviest_equals_walks`] with the limit `cap` (0: the list never ends early).
+fn heaviest_equals_walks_at(d: &Drawing, space: &Space, what: &str, cap: usize) {
+    let o = Options { max_block_expansion: cap, ..Default::default() };
+    let c = census_space(d, space, false, &o);
+    let mut expected = Vec::new();
+    for name in d.blocks.keys() {
+        let boxed = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(d, std::slice::from_ref(name)).unwrap())), ..uncapped() };
+        let after = census_space(d, space, false, &boxed).total;
+        if after < c.total {
+            expected.push((name.clone(), after));
+        }
+    }
+    expected.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let got: Vec<(String, u64)> = c.heaviest.iter().map(|h| (h.block.clone(), h.total_if_boxed.unwrap())).collect();
+    // The list ends where boxing all of it fits (never at a limit of 1 here, unless one block saves everything).
+    assert_eq!(got, expected, "{what}");
+    // The layers: what the census says switching each reference layer off leaves is what a count with it
+    // off says.
+    let mut layers_expected = Vec::new();
+    for l in &c.reference_layers {
+        let mut off = d.clone();
+        if let Some(layer) = off.layer_mut(l) {
+            layer.on = false;
+        }
+        let after = census_space(&off, space, false, &uncapped()).total;
+        if after < c.total {
+            layers_expected.push((l.clone(), after));
+        }
+    }
+    layers_expected.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let layers_got: Vec<(String, u64)> = c.layers_off.iter().map(|l| (l.layer.clone(), l.total_if_off.unwrap())).collect();
+    assert_eq!(layers_got, layers_expected, "{what} (layers)");
+}
+
+fn count_space_with(d: &Drawing, space: &Space, plotting: bool, o: &Options) -> u64 {
+    census_space(d, space, plotting, o).total
+}
+
 /// The count made from the block table alone is the number a build with no limit takes: nested
 /// blocks, arrays, layers that hide references (and layer 0 contents following the reference's
 /// layer), a block that refers to itself (stopped at the depth limit like the build), and a
@@ -1204,6 +1281,8 @@ fn the_up_front_count_is_what_an_unlimited_build_expands() {
         assert_eq!(count_space(d, space, false), built, "{what}");
         let plot = build_plot(d, space, &uncapped()).expanded as u64;
         assert_eq!(count_space(d, space, true), plot, "{what} (plot)");
+        count_equals_build_with_boxes(d, space, what);
+        heaviest_equals_walks(d, space, what);
     };
     // Nested blocks, the parallel path (600 > 2 chunks).
     let nested = many_nested_inserts(600);
@@ -1466,7 +1545,14 @@ fn nested_count_vs_build() {
     let t = std::time::Instant::now();
     let l = build(&d, &Space::Model, &uncapped());
     let held = l.prims.len() * std::mem::size_of::<DPrim>() + (l.verts.len() + l.tris.len()) * 16;
-    println!("built expanded {} prims {} held {} MB in {:?}, {:.1} bytes per expanded", l.expanded, l.prims.len(), held >> 20, t.elapsed(), held as f64 / l.expanded as f64);
+    println!(
+        "built expanded {} prims {} held {} MB in {:?}, {:.1} bytes per expanded",
+        l.expanded,
+        l.prims.len(),
+        held >> 20,
+        t.elapsed(),
+        held as f64 / l.expanded as f64
+    );
     let t = std::time::Instant::now();
     let l = build(&d, &Space::Model, &Options::default());
     println!("built at the limit: expanded {} (limit {}) prims {} in {:?}", l.expanded, MAX_BLOCK_EXPANSION, l.prims.len(), t.elapsed());
@@ -1495,8 +1581,16 @@ fn layout_fixture() -> (Drawing, Space) {
             1 => EntityKind::Line(cadcraft_doc::Line { a: at, b: at + Vec3::new(6.0, 4.0, 0.0) }),
             _ => EntityKind::Circle(cadcraft_doc::Circle { center: at, radius: 2.0 }),
         };
-        d.add(&Space::Model, Common { color: cadcraft_geom_red(), lineweight: cadcraft_doc::Lineweight::Mm100(if k % 5 == 0 { 100 } else { 25 }), ..Default::default() }, kind)
-            .unwrap();
+        d.add(
+            &Space::Model,
+            Common {
+                color: cadcraft_geom_red(),
+                lineweight: cadcraft_doc::Lineweight::Mm100(if k % 5 == 0 { 100 } else { 25 }),
+                ..Default::default()
+            },
+            kind,
+        )
+        .unwrap();
     }
     let paper = Space::Paper("Layout1".into());
     let line = |x: f64, y: f64| EntityKind::Line(cadcraft_doc::Line { a: Vec3::new(x, y, 0.0), b: Vec3::new(x + 120.0, y + 30.0, 0.0) });
@@ -1506,7 +1600,11 @@ fn layout_fixture() -> (Drawing, Space) {
     d.add(&paper, Common::default(), EntityKind::Viewport(vp(Vec2::new(60.0, 60.0), 100.0, 80.0, Vec2::new(300.0, 150.0), 320.0, 2))).unwrap();
     let tri = [(150.0, 20.0), (250.0, 20.0), (200.0, 100.0)].map(|(x, y)| PolyVertex::new(Vec2::new(x, y))).to_vec();
     let boundary = d
-        .add(&paper, Common::default(), EntityKind::LwPolyline(cadcraft_doc::LwPolyline { vertices: tri, closed: true, const_width: 0.0, elevation: 0.0, plinegen: false }))
+        .add(
+            &paper,
+            Common::default(),
+            EntityKind::LwPolyline(cadcraft_doc::LwPolyline { vertices: tri, closed: true, const_width: 0.0, elevation: 0.0, plinegen: false }),
+        )
         .unwrap();
     let mut clipped = vp(Vec2::new(200.0, 60.0), 100.0, 80.0, Vec2::new(500.0, 150.0), 340.0, 3);
     clipped.clip = Some(boundary);
@@ -1600,7 +1698,12 @@ fn a_layout_built_in_slices_is_the_whole_list() {
         let EntityKind::Insert(mut i) = insert_of("B") else { unreachable!() };
         i.insert = at;
         v.add(&Space::Model, Common { layer: "Trees".into(), ..Default::default() }, EntityKind::Insert(i.clone())).unwrap();
-        v.add(&Space::Model, Common { anno_scales: vec![cadcraft_doc::AnnoScale::new("1:2", 1.0, 2.0)], ..Default::default() }, EntityKind::Insert(i)).unwrap();
+        v.add(
+            &Space::Model,
+            Common { anno_scales: vec![cadcraft_doc::AnnoScale::new("1:2", 1.0, 2.0)], ..Default::default() },
+            EntityKind::Insert(i),
+        )
+        .unwrap();
     }
     let wipe = [(150.0, 100.0), (400.0, 100.0), (400.0, 160.0), (150.0, 160.0)].map(|(x, y)| Vec2::new(x, y)).to_vec();
     v.add(&Space::Model, Common::default(), EntityKind::Wipeout(cadcraft_doc::Wipeout { boundary: wipe })).unwrap();
@@ -1637,7 +1740,8 @@ fn a_layout_built_in_slices_is_the_whole_list() {
     }
     let paper = Space::Paper("Layout1".into());
     for k in 0..(crate::viewports::MAX_VIEWPORTS + 4) {
-        let v = vp(Vec2::new(10.0 * (k % 20) as f64, 10.0 * (k / 20) as f64), 8.0, 8.0, Vec2::new(30.0 + (k % 7) as f64 * 40.0, 0.0), 30.0, 2 + k as u32);
+        let v =
+            vp(Vec2::new(10.0 * (k % 20) as f64, 10.0 * (k / 20) as f64), 8.0, 8.0, Vec2::new(30.0 + (k % 7) as f64 * 40.0, 0.0), 30.0, 2 + k as u32);
         m.add(&paper, Common::default(), EntityKind::Viewport(v)).unwrap();
     }
     let Space::Paper(name) = &paper else { unreachable!() };
@@ -1693,7 +1797,7 @@ fn only_the_layer_of_the_references_reduces_the_count() {
     let c = census_space(&d, &Space::Model, false, &opts);
     assert_eq!(c.total, 250);
     assert_eq!(c.reference_layers, vec!["Refs".to_string()]);
-    assert_eq!(c.layers_off, vec![LayerOff { layer: "Refs".into(), total_if_off: 0 }]);
+    assert_eq!(c.layers_off, vec![LayerOff { layer: "Refs".into(), saving: 250, total_if_off: Some(0) }]);
     // Under the limit no recount is made.
     assert!(census_space(&d, &Space::Model, false, &Options::default()).layers_off.is_empty());
     // The contents' layer off: the build still asks for the same (the references are drawn, their
@@ -1713,7 +1817,13 @@ fn only_the_layer_of_the_references_reduces_the_count() {
     }
     let c = census_space(&two, &Space::Model, false, &Options { max_block_expansion: 100, ..Default::default() });
     assert_eq!(c.total, 200);
-    assert_eq!(c.layers_off, vec![LayerOff { layer: "Other".into(), total_if_off: 50 }, LayerOff { layer: "Refs".into(), total_if_off: 150 }]);
+    assert_eq!(
+        c.layers_off,
+        vec![
+            LayerOff { layer: "Other".into(), saving: 150, total_if_off: Some(50) },
+            LayerOff { layer: "Refs".into(), saving: 50, total_if_off: Some(150) }
+        ]
+    );
     two.layer_mut("Other").unwrap().on = false;
     assert_eq!(build(&two, &Space::Model, &uncapped()).expanded, 50);
 }
@@ -1787,7 +1897,638 @@ fn reference_layers_ignore_case_and_leave_out_layers_missing_from_the_table() {
     assert_eq!(c.reference_layers, vec!["Trees".to_string()]);
     assert!(c.references_off_table);
     // Switching "Trees" off removes the 12 references on it (any spelling) and leaves the ghost's.
-    assert_eq!(c.layers_off, vec![LayerOff { layer: "Trees".into(), total_if_off: 5 }]);
+    assert_eq!(c.layers_off.iter().map(|l| (l.layer.as_str(), l.total_if_off)).collect::<Vec<_>>(), vec![("Trees", Some(5))]);
     d.layer_mut("Trees").unwrap().on = false;
     assert_eq!(build(&d, &Space::Model, &uncapped()).expanded, 5);
+}
+
+/// A block `name` whose contents fill the box (0, 0) to (10, 4): a line along each of two sides.
+fn box_block(name: &str) -> cadcraft_doc::Block {
+    let mut b = cadcraft_doc::Block::new(name);
+    let line = |to: Vec3| EntityKind::Line(cadcraft_doc::Line { a: Vec3::ZERO, b: to });
+    b.entities.push(block_entity(1, Common::default(), line(Vec3::new(10.0, 0.0, 0.0))));
+    b.entities.push(block_entity(2, Common::default(), line(Vec3::new(0.0, 4.0, 0.0))));
+    b
+}
+
+fn insert_struct(block: &str) -> cadcraft_doc::Insert {
+    cadcraft_doc::Insert {
+        block: block.into(),
+        insert: Vec3::ZERO,
+        scale: Vec3::new(1.0, 1.0, 1.0),
+        rotation: 0.0,
+        attribs: vec![],
+        cols: 1,
+        rows: 1,
+        col_spacing: 0.0,
+        row_spacing: 0.0,
+    }
+}
+
+fn boxed_options(d: &Drawing, names: &[&str]) -> Options {
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(d, &names).unwrap())), ..uncapped() }
+}
+
+fn near(a: Vec2, x: f64, y: f64) -> bool {
+    (a.x - x).abs() < 1e-9 && (a.y - y).abs() < 1e-9
+}
+
+/// A reference to a boxed block is ONE closed outline of the block's extents under the reference's
+/// transform, in the reference's colour: a rotated, scaled reference gives a rotated rectangle, a
+/// MINSERT array is one outline of the whole array (also when turned), a base point is honoured,
+/// and the contents are not drawn.
+#[test]
+fn a_boxed_reference_is_one_outline_of_its_extents_under_its_transform() {
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("Bx".into(), std::sync::Arc::new(box_block("Bx")));
+    let red = Common { color: Color::Index(1), ..Default::default() };
+    let at = |x: f64, y: f64, scale: (f64, f64), rotation: f64, cols: u32, rows: u32| {
+        let mut i = insert_struct("bx");
+        i.insert = Vec3::new(x, y, 0.0);
+        i.scale = Vec3::new(scale.0, scale.1, 1.0);
+        i.rotation = rotation;
+        i.cols = cols;
+        i.rows = rows;
+        i.col_spacing = 30.0;
+        i.row_spacing = 20.0;
+        EntityKind::Insert(i)
+    };
+    // Scale (2, 3), turned a quarter: the box 0..10 x 0..4 becomes 0..20 x 0..12, then x' = -y, y' = x.
+    d.add(&Space::Model, red.clone(), at(100.0, 50.0, (2.0, 3.0), std::f64::consts::FRAC_PI_2, 1, 1)).unwrap();
+    // A 3 x 2 array, not turned.
+    d.add(&Space::Model, red.clone(), at(0.0, 200.0, (1.0, 1.0), 0.0, 3, 2)).unwrap();
+    // The same array turned by 30 degrees.
+    let turn = 30f64.to_radians();
+    d.add(&Space::Model, red.clone(), at(500.0, 0.0, (1.0, 1.0), turn, 3, 2)).unwrap();
+    let list = build(&d, &Space::Model, &boxed_options(&d, &["Bx"]));
+    assert_eq!(list.prims.len(), 3, "one outline per reference, contents not drawn");
+    assert_eq!(list.expanded, 3, "one unit each");
+    assert!(list.prims.iter().all(|p| p.kind == Kind::Polyline && p.len == 5 && p.color == Rgb(255, 0, 0)));
+    let pts = |k: usize| list.points(&list.prims[k]).to_vec();
+    let q = pts(0);
+    let mut got: Vec<(i64, i64)> = q[..4].iter().map(|p| ((p.x * 1e6).round() as i64, (p.y * 1e6).round() as i64)).collect();
+    got.sort();
+    assert_eq!(got, vec![(88_000_000, 50_000_000), (88_000_000, 70_000_000), (100_000_000, 50_000_000), (100_000_000, 70_000_000)]);
+    assert!(near(q[4], q[0].x, q[0].y), "closed");
+    // The array: 10 + 2 x 30 wide and 4 + 20 high, one rectangle.
+    let a = pts(1);
+    let b = Bounds2::from_points(a.iter().copied());
+    assert!(near(b.min, 0.0, 200.0) && near(b.max, 70.0, 224.0), "{b:?}");
+    // Turned: the same rectangle seen in the turned frame, about the insertion point.
+    let t = pts(2);
+    let back = Mat3::rotate(-turn);
+    let local: Vec<Vec2> = t.iter().map(|p| back.apply(*p - Vec2::new(500.0, 0.0))).collect();
+    let lb = Bounds2::from_points(local.iter().copied());
+    assert!(near(lb.min, 0.0, 0.0) && near(lb.max, 70.0, 24.0), "{lb:?}");
+    // Every point is a corner of that rectangle (a rotated rectangle, not its bounding box).
+    assert!(local[..4].iter().all(|p| (p.x.abs() < 1e-9 || (p.x - 70.0).abs() < 1e-9) && (p.y.abs() < 1e-9 || (p.y - 24.0).abs() < 1e-9)));
+    // The same drawing unboxed draws the contents: 2 lines in each of 1 + 6 + 6 copies.
+    let full = build(&d, &Space::Model, &uncapped());
+    assert_eq!(full.prims.len(), 2 * 13);
+}
+
+/// A reference nested in a block is boxed too, once per copy of the block holding it, with the
+/// transforms of both; the base point of the boxed block moves the outline; a block with no
+/// contents draws no outline but still takes its unit; a reference on a layer that is off draws nothing.
+#[test]
+fn a_boxed_block_nested_in_another_is_boxed_at_every_depth() {
+    let mut d = Drawing::new_imperial();
+    let mut inner = box_block("Inner");
+    inner.base = Vec3::new(2.0, 1.0, 0.0);
+    d.blocks.insert("Inner".into(), std::sync::Arc::new(inner));
+    d.blocks.insert("Empty".into(), std::sync::Arc::new(cadcraft_doc::Block::new("Empty")));
+    let mut outer = cadcraft_doc::Block::new("Outer");
+    let mut i = insert_struct("Inner");
+    i.insert = Vec3::new(5.0, 0.0, 0.0);
+    i.rotation = std::f64::consts::FRAC_PI_2;
+    outer.entities.push(block_entity(1, Common::default(), EntityKind::Insert(i)));
+    outer.entities.push(block_entity(2, Common::default(), insert_of("Empty")));
+    d.blocks.insert("Outer".into(), std::sync::Arc::new(outer));
+    d.layers.push(layer_named("Off", false));
+    for x in [100.0, 300.0] {
+        let mut o = insert_struct("Outer");
+        o.insert = Vec3::new(x, 200.0, 0.0);
+        d.add(&Space::Model, Common::default(), EntityKind::Insert(o)).unwrap();
+    }
+    d.add(&Space::Model, Common { layer: "Off".into(), ..Default::default() }, insert_of("Outer")).unwrap();
+    let o = boxed_options(&d, &["INNER", "empty"]);
+    let list = build(&d, &Space::Model, &o);
+    // Per Outer copy: the Outer's copy unit, 2 entities, and one unit for each boxed reference: 1 + 2 + 2.
+    assert_eq!(list.expanded, 2 * 5);
+    assert_eq!(list.prims.len(), 2);
+    let c = census_space(&d, &Space::Model, false, &o);
+    assert_eq!(c.total, 10);
+    let mut tally: Vec<(String, u64)> = c.boxed.iter().map(|b| (b.block.clone(), b.outlines)).collect();
+    tally.sort();
+    assert_eq!(tally, vec![("Empty".to_string(), 0), ("Inner".to_string(), 2)]);
+    // Inner's box is (0..10, 0..4) around base (2, 1): in Inner's frame x in -2..8, y in -1..3; turned a
+    // quarter (x' = -y, y' = x) and moved by (5, 0): x in 2..6, y in -2..8; then by the Outer's insertion point.
+    let q = list.points(&list.prims[0]);
+    let b = Bounds2::from_points(q.iter().copied());
+    assert!(near(b.min, 102.0, 198.0) && near(b.max, 106.0, 208.0), "{b:?}");
+}
+
+/// Blocks that save the most when drawn as boxes, biggest saving first, ending where boxing all
+/// the listed ones fits; every figure is what an unlimited build with that choice expands; and
+/// when even boxing every block does not fit, every block is listed and the figure says so.
+#[test]
+fn the_heaviest_blocks_are_listed_down_to_where_boxing_them_fits() {
+    let mut d = Drawing::new_imperial();
+    // Tree 20 lines, Shrub 8, Stake 2; 10 / 10 / 10 references: 210 + 90 + 30 = 330 units.
+    for (name, n) in [("Tree", 20u64), ("Shrub", 8), ("Stake", 2)] {
+        d.blocks.insert(name.into(), std::sync::Arc::new(lines_block(name, n)));
+        for k in 0..10 {
+            let mut i = insert_struct(name);
+            i.insert = Vec3::new(f64::from(k) * 20.0, 0.0, 0.0);
+            d.add(&Space::Model, Common::default(), EntityKind::Insert(i)).unwrap();
+        }
+    }
+    let cap = |n: usize| Options { max_block_expansion: n, ..Default::default() };
+    let c = census_space(&d, &Space::Model, false, &cap(100));
+    assert_eq!(c.total, 330);
+    // Alone: Tree leaves 130 (10 + 90 + 30), Shrub 250, Stake 310. Tree + Shrub leave 50: fits.
+    assert_eq!(
+        c.heaviest,
+        vec![
+            BlockSaving { block: "Tree".into(), saving: 200, total_if_boxed: Some(130) },
+            BlockSaving { block: "Shrub".into(), saving: 80, total_if_boxed: Some(250) }
+        ]
+        .into_iter()
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(c.total_if_listed_boxed, 50);
+    // Each figure is what a build with that block boxed expands.
+    for h in &c.heaviest {
+        let o = boxed_options(&d, &[h.block.as_str()]);
+        assert_eq!(Some(build(&d, &Space::Model, &o).expanded as u64), h.total_if_boxed);
+    }
+    let all = boxed_options(&d, &["Tree", "Shrub"]);
+    assert_eq!(build(&d, &Space::Model, &all).expanded as u64, 50);
+    // A limit of 140: Tree alone fits, so the list ends at Tree.
+    let c = census_space(&d, &Space::Model, false, &cap(140));
+    assert_eq!(c.heaviest.iter().map(|h| h.block.as_str()).collect::<Vec<_>>(), vec!["Tree"]);
+    assert_eq!(c.total_if_listed_boxed, 130);
+    // A limit of 20: all three boxed leave 30 (still over): every block is listed.
+    let c = census_space(&d, &Space::Model, false, &cap(20));
+    assert_eq!(c.heaviest.iter().map(|h| h.block.as_str()).collect::<Vec<_>>(), vec!["Tree", "Shrub", "Stake"]);
+    assert_eq!(c.total_if_listed_boxed, 30);
+    // With Tree already boxed the figures are relative to that choice, and Tree is not offered again.
+    let c = census_space(&d, &Space::Model, false, &Options { max_block_expansion: 100, ..boxed_options(&d, &["Tree"]) });
+    assert_eq!(c.total, 130);
+    assert_eq!(c.heaviest.iter().map(|h| (h.block.as_str(), h.total_if_boxed)).collect::<Vec<_>>(), vec![("Shrub", Some(50))]);
+    // Under the limit nothing is worked out.
+    assert!(census_space(&d, &Space::Model, false, &cap(1_000)).heaviest.is_empty());
+}
+
+/// What the refusal costs on a big drawing: the count, the per-layer and per-block tables and the
+/// list of heaviest blocks, for drawings with `blocks` distinct blocks referred to `refs` times each
+/// (the limit is set to a quarter of the total, so every table is made):
+/// `cargo test -p cadcraft-render refusal_cost --release -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn refusal_cost() {
+    for (blocks, refs, lines, nested) in
+        [(50usize, 2_000usize, 20u64, false), (500, 1_000, 8, false), (5_000, 100, 8, false), (20_000, 30, 5, false), (2_000, 300, 5, true)]
+    {
+        let mut d = Drawing::new_imperial();
+        for b in 0..blocks {
+            let name = format!("B{b}");
+            let mut blk = lines_block(&name, lines);
+            if nested {
+                // Each block also holds three references to other blocks.
+                for k in 0..3usize {
+                    let i = insert_struct(&format!("B{}", (b + 1 + k * 7) % blocks.max(1)));
+                    if (b + 1 + k * 7) % blocks > b {
+                        blk.entities.push(block_entity(100 + k as u64, Common::default(), EntityKind::Insert(i)));
+                    }
+                }
+            }
+            d.blocks.insert(name, std::sync::Arc::new(blk));
+        }
+        for b in 0..blocks {
+            for r in 0..refs {
+                let mut i = insert_struct(&format!("B{b}"));
+                i.insert = Vec3::new(r as f64 * 10.0, b as f64 * 10.0, 0.0);
+                d.add(&Space::Model, Common::default(), EntityKind::Insert(i)).unwrap();
+            }
+        }
+        let total = count_space(&d, &Space::Model, false);
+        let t = std::time::Instant::now();
+        let c = census_space(&d, &Space::Model, false, &Options { max_block_expansion: (total / 4) as usize, ..Default::default() });
+        println!(
+            "{blocks} blocks x {refs} refs ({} objects, nested {nested}): total {total}, tables in {:?}: {} blocks listed, boxing them leaves {}",
+            d.model.len(),
+            t.elapsed(),
+            c.heaviest.len(),
+            c.total_if_listed_boxed
+        );
+    }
+}
+
+/// `n` blocks `S0`..`S{n-1}`, each a line and `selfs` references to itself, each referred to `refs`
+/// times from model space (`Cyc` extra: see the saturating shape).
+fn self_referencing_blocks(n: usize, selfs: usize, refs: usize) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    for b in 0..n {
+        let name = format!("S{b}");
+        let mut blk = lines_block(&name, 1);
+        for k in 0..selfs {
+            blk.entities.push(block_entity(100 + k as u64, Common::default(), EntityKind::Insert(insert_struct(&name))));
+        }
+        d.blocks.insert(name.clone(), std::sync::Arc::new(blk));
+        for r in 0..refs {
+            let mut i = insert_struct(&name);
+            i.insert = Vec3::new(r as f64 * 10.0, b as f64 * 10.0, 0.0);
+            d.add(&Space::Model, Common::default(), EntityKind::Insert(i)).unwrap();
+        }
+    }
+    d
+}
+
+fn census_time(d: &Drawing, cap: usize) -> (std::time::Duration, BlockCensus) {
+    let t = std::time::Instant::now();
+    let c = census_space(d, &Space::Model, false, &Options { max_block_expansion: cap, ..Default::default() });
+    (t.elapsed(), c)
+}
+
+/// `n` blocks each holding `selfs` references to itself, each referred to once, on layer `L{k}` when
+/// `layers` else on layer 0.
+fn overflowing_blocks(n: usize, selfs: usize, layers: bool) -> Drawing {
+    let mut d = self_referencing_blocks(n, selfs, 0);
+    for b in 0..n {
+        let layer = if layers {
+            d.layers.push(layer_named(&format!("L{b}"), true));
+            format!("L{b}")
+        } else {
+            "0".to_string()
+        };
+        d.add(&Space::Model, Common { layer, ..Default::default() }, EntityKind::Insert(insert_struct(&format!("S{b}")))).unwrap();
+    }
+    d
+}
+
+/// `n` top-level references, each on a layer of its own, to one block holding `leaves` references to a
+/// leaf block (its layer-0 contents follow each reference's layer).
+fn shared_content_on_layers(n: usize, leaves: usize) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("Leaf".into(), std::sync::Arc::new(lines_block("Leaf", 1)));
+    let mut shared = cadcraft_doc::Block::new("Shared");
+    for k in 0..leaves {
+        shared.entities.push(block_entity(1 + k as u64, Common::default(), EntityKind::Insert(insert_struct("Leaf"))));
+    }
+    d.blocks.insert("Shared".into(), std::sync::Arc::new(shared));
+    for l in 0..n {
+        d.layers.push(layer_named(&format!("L{l}"), true));
+        d.add(&Space::Model, Common { layer: format!("L{l}"), ..Default::default() }, EntityKind::Insert(insert_struct("Shared"))).unwrap();
+    }
+    d
+}
+
+/// A saturated drawing: 4,000 blocks x 30 references plus one block holding 20 references to itself.
+fn saturated_drawing() -> Drawing {
+    let mut d = self_referencing_blocks(4_000, 0, 30);
+    let mut cyc = lines_block("Cyc", 1);
+    for k in 0..20u64 {
+        cyc.entities.push(block_entity(100 + k, Common::default(), EntityKind::Insert(insert_struct("Cyc"))));
+    }
+    d.blocks.insert("Cyc".into(), std::sync::Arc::new(cyc));
+    d.add(&Space::Model, Common::default(), EntityKind::Insert(insert_struct("Cyc"))).unwrap();
+    d
+}
+
+/// The refusal's tables cost about as much as the drawing is big, not its square, on every shape that
+/// made an earlier version quadratic: blocks that refer to themselves, every saving overflowing (alone
+/// and with each reference on its own layer), a saturated total with one overflowing block, thousands of
+/// layers (with shared content below each), many boxed names on the success path; the figures are still
+/// what a count says. (Before: 2,000 self-referencing blocks took 43 s; 1,000 blocks holding 20
+/// references to themselves 88 s, on their own layers 241 s.)
+#[test]
+fn the_refusal_grows_with_the_drawing_not_with_its_square() {
+    let limit = std::time::Duration::from_secs(10);
+    heaviest_equals_walks(&self_referencing_blocks(30, 2, 1), &Space::Model, "self referencing blocks");
+    heaviest_equals_walks(&overflowing_blocks(12, 1, true), &Space::Model, "self referencing blocks on layers");
+    let (t, c) = census_time(&self_referencing_blocks(2_000, 2, 1), 100);
+    assert!(c.total > 100 && !c.heaviest.is_empty() && t < limit, "{t:?}");
+    // Every saving overflows: nothing is walked per block; all are listed, "more than can be counted"
+    // first, and boxing them all leaves n pieces, which fits.
+    for layers in [false, true] {
+        let (t, c) = census_time(&overflowing_blocks(1_000, 20, layers), 2_000);
+        assert_eq!(c.total, COUNT_SATURATED);
+        assert_eq!(c.heaviest.len(), 1_000, "every block is needed to fit");
+        assert!(c.heaviest.iter().all(|h| h.saving == COUNT_SATURATED && h.total_if_boxed == Some(COUNT_SATURATED)));
+        assert_eq!(c.total_if_listed_boxed, 1_000);
+        assert_eq!(c.layers_off.len(), if layers { 1_000 } else { 1 });
+        assert!(t < limit, "layers {layers}: {t:?}");
+    }
+    // A saturated total with one overflowing block: it is listed first; the others save a number.
+    let d = saturated_drawing();
+    let (t, c) = census_time(&d, 1_000);
+    assert_eq!(c.total, COUNT_SATURATED);
+    assert!(t < limit, "{t:?}");
+    assert_eq!((c.heaviest[0].block.as_str(), c.heaviest[0].saving), ("Cyc", COUNT_SATURATED));
+    assert!(c.heaviest[1..].iter().all(|h| h.saving == 30 && h.total_if_boxed == Some(COUNT_SATURATED)), "{:?}", c.heaviest[1]);
+    let names: Vec<String> = c.heaviest.iter().map(|h| h.block.clone()).collect();
+    let boxed = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(&d, &names).unwrap())), ..uncapped() };
+    assert_eq!(census_space(&d, &Space::Model, false, &boxed).total, c.total_if_listed_boxed);
+    // 3,000 layers of references, layer 0 contents following them; and 20,000 layers with shared content below.
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("Tree".into(), std::sync::Arc::new(lines_block("Tree", 4)));
+    for l in 0..3_000 {
+        d.layers.push(layer_named(&format!("L{l}"), true));
+        for r in 0..100 {
+            let mut i = insert_struct("Tree");
+            i.insert = Vec3::new(r as f64 * 10.0, l as f64 * 10.0, 0.0);
+            d.add(&Space::Model, Common { layer: format!("L{l}"), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+        }
+    }
+    let (t, c) = census_time(&d, 1_000);
+    assert_eq!(c.layers_off.len(), 3_000);
+    assert_eq!((c.layers_off[0].saving, c.layers_off[0].total_if_off), (500, Some(1_500_000 - 500)));
+    assert!(t < limit, "{t:?}");
+    let (t, c) = census_time(&shared_content_on_layers(20_000, 25), 1_000);
+    assert_eq!(c.layers_off.len(), 20_000);
+    assert!(t < limit, "{t:?}");
+    // The success path with many boxed names: the outlines come from the one recording pass.
+    let d = self_referencing_blocks(1_000, 0, 30);
+    let names: Vec<String> = (0..1_000).map(|b| format!("S{b}")).collect();
+    let o = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(&d, &names).unwrap())), ..Default::default() };
+    let t = std::time::Instant::now();
+    let c = census_space(&d, &Space::Model, false, &o);
+    assert!(t.elapsed() < limit, "{:?}", t.elapsed());
+    assert_eq!(c.boxed.len(), 1_000);
+    assert!(c.boxed.iter().all(|b| b.outlines == 30), "{:?}", c.boxed[0]);
+}
+
+/// A block `name` holding one reference per name in `targets`, on layer `layer(k)` of the k-th.
+fn block_of_refs(name: &str, targets: &[String], layer: impl Fn(usize) -> String) -> cadcraft_doc::Block {
+    let mut b = cadcraft_doc::Block::new(name);
+    for (k, t) in targets.iter().enumerate() {
+        b.entities.push(block_entity(1 + k as u64, Common { layer: layer(k), ..Default::default() }, EntityKind::Insert(insert_struct(t))));
+    }
+    b
+}
+
+/// The first shape that made the tables quadratic: one block `Z` holding `n` references, each to a leaf of
+/// its own on a layer of its own, and one block `Y` holding `n` references to `Z`, shown once.
+fn one_block_holds_n_references_to_z(n: usize) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    let mut leaves = Vec::new();
+    for k in 0..n {
+        d.blocks.insert(format!("Leaf{k}"), std::sync::Arc::new(lines_block(&format!("Leaf{k}"), 1)));
+        d.layers.push(layer_named(&format!("L{k}"), true));
+        leaves.push(format!("Leaf{k}"));
+    }
+    d.layers.push(layer_named("Refs", true));
+    d.blocks.insert("Z".into(), std::sync::Arc::new(block_of_refs("Z", &leaves, |k| format!("L{k}"))));
+    d.blocks.insert("Y".into(), std::sync::Arc::new(block_of_refs("Y", &vec!["Z".to_string(); n], |_| "Refs".into())));
+    d.add(&Space::Model, Common { layer: "Refs".into(), ..Default::default() }, EntityKind::Insert(insert_struct("Y"))).unwrap();
+    d
+}
+
+/// The second: the same `Z`, held once by each of `n` separate blocks `B{k}`, each shown once on a layer of its own.
+fn n_separate_blocks_hold_z_once(n: usize) -> Drawing {
+    let mut d = one_block_holds_n_references_to_z(n);
+    d.model = Default::default();
+    for k in 0..n {
+        d.blocks.insert(format!("B{k}"), std::sync::Arc::new(block_of_refs(&format!("B{k}"), &["Z".to_string()], |_| "Refs".into())));
+        d.layers.push(layer_named(&format!("T{k}"), true));
+        d.add(&Space::Model, Common { layer: format!("T{k}"), ..Default::default() }, EntityKind::Insert(insert_struct(&format!("B{k}")))).unwrap();
+    }
+    d
+}
+
+/// The tables on both shapes agree with a count of each alternative (small), and their cost grows in step
+/// with the drawing, not with its square (measured: 4,000 to 8,000 took 4x before; here the time of 8,000 is
+/// under 3x that of 4,000, with a little slack for a busy machine).
+#[test]
+fn the_tables_of_the_two_quadratic_shapes_grow_in_step_with_the_drawing() {
+    heaviest_equals_walks_at(&one_block_holds_n_references_to_z(12), &Space::Model, "one block holds n references to Z", 0);
+    heaviest_equals_walks_at(&n_separate_blocks_hold_z_once(12), &Space::Model, "n separate blocks hold Z once", 0);
+    type Shape = fn(usize) -> Drawing;
+    for (what, shape) in [("one block holds n references to Z", one_block_holds_n_references_to_z as Shape), ("n separate blocks hold Z once", n_separate_blocks_hold_z_once as Shape)] {
+        // The best of three runs of each size, so a busy machine does not decide.
+        let best = |n: usize| (0..3).map(|_| census_time(&shape(n), 100).0).min().unwrap();
+        let (t4, t8) = (best(4_000), best(8_000));
+        let c = census_time(&shape(8_000), 100).1;
+        assert!(c.layers_off.len() >= 8_000 && !c.heaviest.is_empty(), "{what}");
+        eprintln!("{what}: 4k {t4:?} 8k {t8:?}");
+        assert!(t8 < t4 * 3 + std::time::Duration::from_millis(100), "{what}: 4k {t4:?}, 8k {t8:?}");
+        assert!(t8 < std::time::Duration::from_secs(5), "{what}: 8k {t8:?}");
+    }
+}
+
+/// The measured times of the two shapes (not part of the normal run): `cargo test -p cadcraft-render --release
+/// --lib measure_the_tables -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_the_tables() {
+    for n in [1_000usize, 2_000, 4_000, 8_000, 16_000] {
+        let a = census_time(&one_block_holds_n_references_to_z(n), 100).0;
+        let b = census_time(&n_separate_blocks_hold_z_once(n), 100).0;
+        // The shape that is still quadratic: a layer cut both on a block's reference to Z and on a reference inside Z
+        // (so what it removes inside Z is worked out), with Z holding n references on n layers.
+        let mut d = one_block_holds_n_references_to_z(n);
+        d.model = Default::default();
+        for k in 0..n {
+            d.blocks.insert(format!("B{k}"), std::sync::Arc::new(block_of_refs(&format!("B{k}"), &["Z".to_string()], |_| format!("L{k}"))));
+            d.add(&Space::Model, Common::default(), EntityKind::Insert(insert_struct(&format!("B{k}")))).unwrap();
+        }
+        let c = census_time(&d, 100).0;
+        eprintln!("n = {n}: one block holds n references to Z {a:?}; n separate blocks hold Z once {b:?}; layer cut above and inside a fat Z {c:?}");
+    }
+}
+
+/// A chain of 16 blocks, each holding 100 references to the next (on `inner_layer`), shown `layers` times,
+/// each on a layer of its own.
+fn chain_shown_from_layers(layers: usize, inner_layer: &str) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    for i in 0..16 {
+        let name = format!("C{i}");
+        let blk = if i == 15 {
+            lines_block(&name, 1)
+        } else {
+            block_of_refs(&name, &vec![format!("C{}", i + 1); 100], |_| inner_layer.to_string())
+        };
+        d.blocks.insert(name, std::sync::Arc::new(blk));
+    }
+    for l in 0..layers {
+        d.layers.push(layer_named(&format!("L{l}"), true));
+        d.add(&Space::Model, Common { layer: format!("L{l}"), ..Default::default() }, EntityKind::Insert(insert_struct("C0"))).unwrap();
+    }
+    d.layers.push(layer_named("Inner", true));
+    d
+}
+
+/// What a recording keeps is indices, and a block whose contents do not follow the reference's layer is
+/// one expansion however many layers refer to it: a chain of 16 blocks x 100 references shown from 1,000 layers
+/// is 16 expansions and 1,600 + 1,000 records, like from 10 (when the references inside sit on layer 0, which
+/// they follow, each layer needs its own 15 expansions, and the records grow with N, as the build's would).
+#[test]
+fn the_recording_does_not_grow_with_the_layers_that_refer_to_a_chain() {
+    let sizes = |d: &Drawing| {
+        let table = crate::count::LayerTable::new(d);
+        let mut c = crate::count::Counter::new(d, false, &[], crate::count::Pass { record: true, ..Default::default() }, None, &table, None);
+        for e in d.model.iter() {
+            c.top(e, d.anno_draw(e));
+        }
+        c.recorded_sizes()
+    };
+    assert_eq!(sizes(&chain_shown_from_layers(10, "Inner")), (16, 15 * 100 + 10));
+    assert_eq!(sizes(&chain_shown_from_layers(1_000, "Inner")), (16, 15 * 100 + 1_000));
+    // The same chain with the inner references on layer 0 follows each layer: 16 expansions per layer.
+    assert_eq!(sizes(&chain_shown_from_layers(10, "0")), (151, 15 * 100 * 10 + 10));
+    // And the figures are the same either way (small chain, checked against the walks).
+    let mut small = chain_shown_from_layers(5, "Inner");
+    for i in 0..15 {
+        small.blocks.insert(format!("C{i}"), std::sync::Arc::new(block_of_refs(&format!("C{i}"), &vec![format!("C{}", i + 1); 3], |_| "Inner".into())));
+    }
+    heaviest_equals_walks_at(&small, &Space::Model, "a chain shown from layers", 0);
+}
+
+/// The peak memory of the recording for the chain shown from 4,000 layers (run by hand under `/usr/bin/time -v`):
+/// `cargo test -p cadcraft-render --release --lib measure_the_recording_memory -- --ignored`.
+#[test]
+#[ignore]
+fn measure_the_recording_memory() {
+    let n = std::env::var("CHAIN_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000);
+    let d = chain_shown_from_layers(n, "Inner");
+    let (t, c) = census_time(&d, 100);
+    eprintln!("{n} layers: {t:?}, {} layers, {} heaviest", c.layers_off.len(), c.heaviest.len());
+}
+
+/// A total that overflows the `u64` counts still says what is left when a layer is off, exactly (not by taking a
+/// saving off the overflowed total): a dimension block holding 20 dimensions of itself on layer `Big` and 20
+/// references on layer `Rest`; with `Big` off only the `Rest` pieces are left, and that fits.
+#[test]
+fn what_is_left_is_exact_when_the_total_overflows() {
+    let mut d = Drawing::new_imperial();
+    for l in ["Big", "Rest", "Top"] {
+        d.layers.push(layer_named(l, true));
+    }
+    d.blocks.insert("P".into(), std::sync::Arc::new(lines_block("P", 1)));
+    let mut dim = cadcraft_doc::Block::new("D");
+    for k in 0..20u64 {
+        dim.entities.push(block_entity(1 + k, Common { layer: "Big".into(), ..Default::default() }, dim_with_block("D")));
+        dim.entities.push(block_entity(100 + k, Common { layer: "Rest".into(), ..Default::default() }, EntityKind::Insert(insert_struct("P"))));
+    }
+    d.blocks.insert("D".into(), std::sync::Arc::new(dim));
+    d.add(&Space::Model, Common { layer: "Top".into(), ..Default::default() }, dim_with_block("D")).unwrap();
+    let c = census_time(&d, 1_000).1;
+    assert_eq!(c.total, COUNT_SATURATED);
+    let mut off = d.clone();
+    off.layer_mut("Big").unwrap().on = false;
+    let left = census_space(&off, &Space::Model, false, &uncapped()).total;
+    assert!(left < 1_000, "{left}");
+    let big = c.layers_off.iter().find(|l| l.layer == "Big").unwrap();
+    assert_eq!((big.saving, big.total_if_off), (COUNT_SATURATED, Some(left)));
+}
+
+/// A stop during the tables ends them early (the callers then discard the count).
+#[test]
+fn a_stop_ends_the_heaviest_pass() {
+    let d = self_referencing_blocks(6_000, 0, 20);
+    let (full, _) = census_time(&d, 100);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let o = Options { max_block_expansion: 100, cancel: Some(cancel.clone()), ..Default::default() };
+    let flag = cancel.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(full / 4);
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let t = std::time::Instant::now();
+    let _ = census_space(&d, &Space::Model, false, &o);
+    let stopped = t.elapsed();
+    let _ = stopper.join();
+    assert!(stopped < full.mul_f64(0.9), "{stopped:?} against {full:?}");
+}
+
+/// `cargo test -p cadcraft-render refusal_shapes --release -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn refusal_shapes() {
+    for n in [250, 1_000, 2_000, 4_000, 20_000] {
+        let (t, c) = census_time(&self_referencing_blocks(n, 2, 1), 100);
+        println!("{n} self-referencing blocks: {t:?} ({} listed)", c.heaviest.len());
+    }
+    for n in [125, 250, 500, 1_000, 4_000] {
+        println!("{n} blocks holding 20 references to themselves: {:?}", census_time(&overflowing_blocks(n, 20, false), 2 * n).0);
+        println!("{n} of them, each on its own layer: {:?}", census_time(&overflowing_blocks(n, 20, true), 2 * n).0);
+    }
+    println!("4000 blocks x 30 + saturating Cyc: {:?}", census_time(&saturated_drawing(), 1_000).0);
+    for layers in [1_000, 5_000, 20_000] {
+        let mut d = Drawing::new_imperial();
+        d.blocks.insert("Tree".into(), std::sync::Arc::new(lines_block("Tree", 4)));
+        for l in 0..layers {
+            d.layers.push(layer_named(&format!("L{l}"), true));
+            for r in 0..(300_000 / layers) {
+                let mut i = insert_struct("Tree");
+                i.insert = Vec3::new(r as f64 * 10.0, l as f64 * 10.0, 0.0);
+                d.add(&Space::Model, Common { layer: format!("L{l}"), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+            }
+        }
+        println!("{layers} reference layers ({} objects): {:?}", d.model.len(), census_time(&d, 1_000).0);
+    }
+    println!("20000 layers x 25 shared leaves: {:?}", census_time(&shared_content_on_layers(20_000, 25), 1_000).0);
+    println!("20000 layers x 100 shared leaves: {:?}", census_time(&shared_content_on_layers(20_000, 100), 1_000).0);
+    for names in [1_000usize, 4_000] {
+        let d = self_referencing_blocks(names, 0, 30);
+        let list: Vec<String> = (0..names).map(|b| format!("S{b}")).collect();
+        let o = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(&d, &list).unwrap())), ..Default::default() };
+        let t = std::time::Instant::now();
+        let _ = census_space(&d, &Space::Model, false, &o);
+        println!("{names} boxed names on the success path: {:?}", t.elapsed());
+    }
+}
+
+/// The tables of a past-the-limit drawing stop when the stop flag is set (a stopped census is one to discard),
+/// `census_space_total` gives the total with no tables, and a dimension past the limit says which of the heaviest
+/// blocks its own block refers to.
+#[test]
+fn the_tables_stop_and_the_total_has_none_and_a_dimension_names_the_blocks_inside_it() {
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("P".into(), std::sync::Arc::new(lines_block("P", 3)));
+    d.blocks.insert("Q".into(), std::sync::Arc::new(lines_block("Q", 3)));
+    let mut dim = cadcraft_doc::Block::new("D");
+    dim.entities.push(block_entity(1, Common::default(), insert_of("P")));
+    dim.entities.push(block_entity(2, Common::default(), insert_of("P")));
+    d.blocks.insert("D".into(), std::sync::Arc::new(dim));
+    d.add(&Space::Model, Common::default(), dim_with_block("D")).unwrap();
+    d.add(&Space::Model, Common::default(), insert_of("Q")).unwrap();
+    let opts = Options { max_block_expansion: 5, ..Default::default() };
+    let full = census_space(&d, &Space::Model, false, &opts);
+    assert!(full.total > 5 && !full.heaviest.is_empty() && !full.layers_off.is_empty(), "{full:?}");
+    let names: Vec<&str> = full.heaviest.iter().map(|b| b.block.as_str()).collect();
+    assert!(names.contains(&"P") && names.contains(&"Q"), "{names:?}");
+    // The dimension's block refers to P, not to Q.
+    assert_eq!(full.largest.as_ref().map(|l| l.kind), Some("dimension"));
+    assert_eq!(full.largest_holds, vec!["P".to_string()]);
+    // The total alone: the same total, no tables.
+    let lean = census_space_total(&d, &Space::Model, false, &opts);
+    assert_eq!(lean.total, full.total);
+    assert!(lean.heaviest.is_empty() && lean.layers_off.is_empty() && lean.largest_holds.is_empty() && lean.blocks_referenced == 0, "{lean:?}");
+    // A stop set before the count: no tables come out of it.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stopped = Options { max_block_expansion: 5, cancel: Some(stop), ..Default::default() };
+    assert!(stopped.cancelled());
+    let c = census_space(&d, &Space::Model, false, &stopped);
+    assert!(c.heaviest.is_empty() && c.layers_off.is_empty(), "{c:?}");
+    // And the tables themselves stop: a recording worked out with the flag set gives nothing.
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let table = super::count::LayerTable::new(&d);
+    let mut counter = super::count::Counter::new(
+        &d,
+        false,
+        &[],
+        super::count::Pass { record: true, ..Default::default() },
+        None,
+        &table,
+        Some(&flag),
+    );
+    for e in d.model.iter() {
+        counter.top(e, d.anno_draw(e));
+    }
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let stats = counter.into_stats();
+    assert!(stats.savings.is_empty() && stats.layer_savings.is_empty(), "stopped tables are empty");
 }

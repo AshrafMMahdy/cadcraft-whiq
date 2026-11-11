@@ -402,6 +402,8 @@ fn run_wblock(s: &mut Session, p: &Value) -> Result<Value> {
         d.model.push(e);
     }
     let hooks = super::file::io().ok_or_else(|| bad("wblock", "file formats are not available in this build"))?;
+    // An image or a PDF is a picture: complete or not written.
+    super::exchange::picture_fits_for_file(s, "wblock", &path, &d, p)?;
     let bytes = (hooks.write)(&d, &path).map_err(|e| bad("wblock", e))?;
     #[cfg(not(target_arch = "wasm32"))]
     std::fs::write(&path, &bytes).map_err(|e| bad("wblock", format!("{path}: {e}")))?;

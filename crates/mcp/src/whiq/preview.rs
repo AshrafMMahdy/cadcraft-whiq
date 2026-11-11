@@ -2,14 +2,16 @@
 //! layout, a layout viewport's model view), the whole extents or a window, in tiles for big
 //! drawings, with layers switched on or off; or a PNG to look at. Every primitive carries its
 //! layer (`<g data-layer>` runs, draw order kept), so a viewer can also hide layers itself.
-//! Nothing is capped: a drawing too big for one answer comes back tile by tile
-//! (`continue_from`), each tile holding only what it shows.
+//! A drawing too big for one answer comes back tile by tile (`continue_from`), each tile holding
+//! only what it shows. One picture draws at most [`MAX_BLOCK_EXPANSION`](cadcraft_engine::render::MAX_BLOCK_EXPANSION)
+//! block pieces: a picture that would need more is not made (no picture, no file) and the answer
+//! is a refusal with the ways to a complete one ([`refusal`]).
 
 use std::fmt::Write as _;
 
 use cadcraft_engine::doc::{Drawing, Entity, EntityKind, Handle, Space};
 use cadcraft_engine::geom::{Bounds2, Vec2};
-use cadcraft_engine::render::{BlockCensus, COUNT_SATURATED, DisplayList, Kind};
+use cadcraft_engine::render::{BlockCensus, BoxBlocks, COUNT_SATURATED, DisplayList, Kind};
 use serde_json::{Value, json};
 
 use super::contract::{ToolError, code};
@@ -353,11 +355,20 @@ pub struct Prepared<'a> {
     /// Each layer and whether it is shown (after the switches).
     pub layer_states: Vec<(String, bool)>,
     lineweights: bool,
-    /// Block contents expanded before the rest are not drawn (a test lowers it).
+    /// The most block pieces one picture draws: a picture that needs more is not made (a test
+    /// lowers it).
     pub block_cap: usize,
+    /// The answer budget (`max_result_bytes`): a refusal lists as much as fits in it.
+    pub budget: usize,
+    /// The blocks drawn as outline boxes (`blocks_as_boxes`, as the drawing spells them) and
+    /// their extents.
+    pub boxed_names: Vec<String>,
+    boxes: Option<std::sync::Arc<BoxBlocks>>,
     /// What counting a layout's block expansions found: the whole layout is built for every tile,
     /// so it is counted once per call.
     layout_census: std::cell::OnceCell<BlockCensus>,
+    /// What the last count before drawing said (for the message when the build disagrees).
+    counted: std::cell::Cell<Option<u64>>,
 }
 
 impl Prepared<'_> {
@@ -376,6 +387,7 @@ impl Prepared<'_> {
             view_height: window.height(),
             cancel: Some(ctx.cancel.clone()),
             max_block_expansion: self.block_cap,
+            blocks_as_boxes: self.boxes.clone(),
             ..cadcraft_engine::render::Options::default()
         }
     }
@@ -396,46 +408,44 @@ impl Prepared<'_> {
             space => self.layout_census.get_or_init(|| cadcraft_engine::render::census_space(d, space, false, &opts)).clone(),
         };
         ctx.check()?;
+        self.counted.set(Some(c.total));
+        // Test hook: stop right after the count, so the drawing is what is stopped.
+        #[cfg(test)]
+        if STOP_AFTER_COUNT.with(std::cell::Cell::get) {
+            ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(c)
     }
 
-    /// The block expansions a build of `window` asks for (the number of [`Prepared::census`]).
+    /// The block pieces a build of `window` asks for (the number of [`Prepared::census`]).
     pub fn expansions(&self, window: &Bounds2, ctx: &Ctx) -> Result<u64, ToolError> {
         Ok(self.census(window, None, ctx)?.total)
     }
 
-    /// What every answer that draws says about block contents: the expansions the build took
-    /// (`built`, the build's own count: `DisplayList::expanded`), and when that is past the limit
-    /// the count of what the drawing asks for, what was not drawn and the ways through; arrays
-    /// drawn short are named ([`Prepared::blocks_note_for`]).
-    pub fn blocks_note(&self, window: &Bounds2, built: usize, picked: Option<&[&Entity]>, ctx: &Ctx) -> Result<Option<Value>, ToolError> {
-        let census = self.census(window, picked, ctx)?;
-        Ok(Some(self.blocks_note_for(built, &census)))
+    /// The refusal of a picture whose count `census` is past the limit, decided before anything is
+    /// drawn (the count is what the build expands: tests `the_up_front_count_is_what_an_unlimited_build_expands`
+    /// and the annotative ones prove it, so a picture the build would draw whole is never refused).
+    /// `None` when the picture fits.
+    pub fn refusal(&self, census: &BlockCensus) -> Option<ToolError> {
+        (census.total > self.block_cap as u64).then(|| refusal(self.block_cap, census.total, self.through(), census, &self.boxed_names, self.budget))
     }
 
-    /// [`Prepared::blocks_note`] for a build that took `built` expansions and a count `census`.
-    /// The build is the ground truth: `blocks_truncated` is true only when its own count went past
-    /// the limit, and a build that drew everything gives its own figure as the total. Past the
-    /// limit the build stops, so the total is the count (never below what the build took).
-    pub fn blocks_note_for(&self, built: usize, census: &BlockCensus) -> Value {
-        let cap = self.block_cap;
-        let truncated = built > cap;
-        let total = if truncated { census.total.max(built as u64) } else { built as u64 };
-        let mut note = json!({"blocks_expanded_total": count_value(total)});
-        if truncated {
-            let not_drawn = if total == COUNT_SATURATED { total } else { total.saturating_sub(cap as u64) };
-            note["blocks_truncated"] = json!(true);
-            note["blocks_expanded"] = json!(cap);
-            note["blocks_not_drawn"] = count_value(not_drawn);
-            note["warning"] = json!(if total == COUNT_SATURATED {
-                format!("block contents past {cap} expanded entities were not drawn: the drawing needs {UNCOUNTABLE}")
-            } else {
-                format!("block contents past {cap} expanded entities were not drawn: {not_drawn} of the {total} the drawing needs are missing from this picture")
-            });
-            let kind = if matches!(self.target.space, Space::Model) { Through::Model } else { Through::Layout };
-            note["ways_through"] = json!(ways_through(cap, total, kind, census));
-            truncated_fields(&mut note, cap, census);
-        }
+    fn through(&self) -> Through {
+        if matches!(self.target.space, Space::Model) { Through::Model } else { Through::Layout }
+    }
+
+    /// The error for a build that went past the limit although the count said it fits: no picture is
+    /// made, and the agent is told what to try next.
+    fn over_error(&self, built: usize) -> ToolError {
+        mismatch_error(self.block_cap, self.counted.get(), built as u64, "picture")
+    }
+
+    /// What every answer that drew a picture says about block contents: the block pieces the build
+    /// took (`built`, the build's own count: `DisplayList::expanded`), the blocks drawn as boxes
+    /// with the references of each, and arrays drawn short.
+    pub fn blocks_note(&self, built: usize, census: &BlockCensus) -> Value {
+        let mut note = json!({"blocks_expanded_total": built});
+        boxed_fields(&mut note, census);
         clamped_fields(&mut note, census);
         note
     }
@@ -486,6 +496,9 @@ impl Prepared<'_> {
             space => cadcraft_engine::render::build(d, space, &opts),
         };
         ctx.check()?;
+        if list.expanded > self.block_cap {
+            return Err(self.over_error(list.expanded));
+        }
         Ok(list)
     }
 
@@ -524,6 +537,9 @@ impl Prepared<'_> {
                 each(list)
             })?;
             ctx.check()?;
+            if expanded > self.block_cap {
+                return Err(WriteErr::Tool(self.over_error(expanded)));
+            }
             return Ok(expanded);
         }
         let d = self.drawing();
@@ -539,6 +555,9 @@ impl Prepared<'_> {
             expanded = list.expanded;
             picked.clear();
             ctx.check()?;
+            if expanded > self.block_cap {
+                return Err(WriteErr::Tool(self.over_error(expanded)));
+            }
             each(&list)
         };
         for (k, e) in d.model.iter().enumerate() {
@@ -565,14 +584,59 @@ impl Prepared<'_> {
         self.write_svg_sliced(out, window, width_px, ctx, SLICE_ENTITIES)
     }
 
-    pub fn write_svg_sliced<W: std::io::Write>(&self, out: W, window: &Bounds2, width_px: f64, ctx: &Ctx, slice: usize) -> Result<(usize, usize), WriteErr> {
+    pub fn write_svg_sliced<W: std::io::Write>(
+        &self,
+        out: W,
+        window: &Bounds2,
+        width_px: f64,
+        ctx: &Ctx,
+        slice: usize,
+    ) -> Result<(usize, usize), WriteErr> {
         let mut w = SvgWriter::new(out, &self.layers, window, width_px, false);
         let expanded = self.each_list_sliced(window, width_px, ctx, slice, &mut |list| w.add(list, ctx))?;
         Ok((w.finish()?.2, expanded))
     }
 }
 
-/// Which picture ran past the block-expansion limit, for the ways through it.
+/// The most block pieces one picture draws: [`MAX_BLOCK_EXPANSION`](cadcraft_engine::render::MAX_BLOCK_EXPANSION).
+/// (Tests lower it for the calls they make on their own thread with [`lower_limit`], so the
+/// behaviour past it can be run without building millions of objects.)
+pub fn block_limit() -> usize {
+    #[cfg(test)]
+    if let Some(n) = TEST_LIMIT.with(std::cell::Cell::get) {
+        return n;
+    }
+    cadcraft_engine::render::MAX_BLOCK_EXPANSION
+}
+
+#[cfg(test)]
+thread_local! {
+    pub static STOP_AFTER_COUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Lowers the limit on this thread until the guard is dropped.
+#[cfg(test)]
+pub struct LowerLimit;
+
+#[cfg(test)]
+impl Drop for LowerLimit {
+    fn drop(&mut self) {
+        TEST_LIMIT.with(|c| c.set(None));
+    }
+}
+
+#[cfg(test)]
+pub fn lower_limit(n: usize) -> LowerLimit {
+    TEST_LIMIT.with(|c| c.set(Some(n)));
+    LowerLimit
+}
+
+/// Which picture needs more than the block-piece limit, for the ways to a complete one.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Through {
     /// SVG or PNG of model space (or a viewport's model view).
@@ -606,46 +670,187 @@ fn count_text(n: u64) -> String {
     if n == COUNT_SATURATED { UNCOUNTABLE.to_string() } else { n.to_string() }
 }
 
-/// The structured fields of a truncated answer: the one object that needs the most and the
-/// reference layers that reduce the count.
-fn truncated_fields(note: &mut Value, cap: usize, census: &BlockCensus) {
+/// How many entries of the layer table and of the heaviest list a refusal shows: as many as fit the
+/// answer budget (`max_result_bytes`, or the call's `max_bytes`) measured on the refusal as it is
+/// serialised, the heaviest first, at least one of each. An entry appears in the words and in a field.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shown {
+    pub blocks: usize,
+    pub layers: usize,
+}
+
+impl Shown {
+    /// Every entry of the census.
+    pub fn all(census: &BlockCensus) -> Shown {
+        Shown { blocks: census.heaviest.len(), layers: census.layers_off.len() }
+    }
+}
+
+/// The bytes of an error as it is answered.
+fn serialised(e: &ToolError) -> usize {
+    e.to_value().to_string().len()
+}
+
+/// The refusal `build` makes with as many entries as fit `budget`, found by measuring the serialised refusal
+/// (the fixed text, the names already drawn as boxes, every entry), never by an estimate: the lists grow
+/// together, then each alone, by halving (a measurement is one build of the refusal, the cost of its entries).
+/// `build(shown, names)`: `names` says whether the blocks already drawn as boxes are listed by name (they are
+/// when the refusal still fits with them; otherwise they are counted). At least one entry of each list is
+/// always given (the agent needs a name to act on), so a budget below the fixed text and one entry of each is
+/// exceeded by exactly that much.
+fn fitted(blocks: usize, layers: usize, has_names: bool, budget: usize, build: impl Fn(Shown, bool) -> ToolError) -> ToolError {
+    let first = Shown { blocks: blocks.min(1), layers: layers.min(1) };
+    let names = has_names && serialised(&build(first, true)) <= budget;
+    let fits = |s: Shown| serialised(&build(s, names)) <= budget;
+    // Largest k of `lo..=hi` for which `at(k)` fits (`lo` is taken as fitting).
+    let most = |lo: usize, hi: usize, at: &dyn Fn(usize) -> Shown| {
+        let (mut lo, mut hi) = (lo, hi);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(at(mid)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    };
+    let k = most(1, blocks.max(layers).max(1), &|k| Shown { blocks: blocks.min(k), layers: layers.min(k) });
+    let mut best = Shown { blocks: blocks.min(k), layers: layers.min(k) };
+    let layers_kept = best.layers;
+    best.blocks = most(best.blocks, blocks, &|k| Shown { blocks: k, layers: layers_kept });
+    let blocks_kept = best.blocks;
+    best.layers = most(best.layers, layers, &|k| Shown { blocks: blocks_kept, layers: k });
+    build(best, names)
+}
+
+/// The words for the blocks the call already draws as boxes: their names, or how many when the names do not fit.
+fn already_drawn(boxed: &[String], names: bool) -> String {
+    if boxed.is_empty() {
+        String::new()
+    } else if names {
+        format!(" (already drawn as boxes in this call: {})", boxed.join(", "))
+    } else {
+        format!(" (already drawn as boxes in this call: {} blocks, the ones named in this call's blocks_as_boxes)", boxed.len())
+    }
+}
+
+/// Whether `left` pieces make a complete picture one picture can draw: a way that leaves nothing is an empty
+/// picture, not a way through.
+fn fits_one(left: u64, cap: usize) -> bool {
+    left > 0 && left <= cap as u64
+}
+
+/// "saves N" / "saves more than can be counted" for a figure.
+fn saves(n: u64) -> Value {
+    count_value(n)
+}
+
+/// The fields a refusal carries about what makes the picture big: the one object that needs the
+/// most, the layers the references are on and what switching each off leaves, and the heaviest
+/// blocks with what drawing each as outline boxes leaves. The lists are shown as far as `shown` says;
+/// `..._more` is how many were left out (box the listed ones and call again to list the next).
+fn refusal_fields(note: &mut Value, cap: usize, census: &BlockCensus, shown: Shown) {
     if let Some(l) = &census.largest {
         note["largest_object"] = json!({
             "handle": l.handle.hex(),
             "kind": l.kind,
             "block": l.block,
-            "blocks_expanded": count_value(l.count),
-            "fits_one_build": l.count <= cap as u64,
+            "blocks_expanded_total": count_value(l.count),
+            "fits_one_picture": fits_one(l.count, cap),
         });
     }
-    note["reference_layers"] = json!(census.reference_layers);
+    let layer_names: Vec<&String> = census.reference_layers.iter().take(shown.layers.max(1)).collect();
+    note["reference_layers"] = json!(layer_names);
+    if census.reference_layers.len() > layer_names.len() {
+        note["reference_layers_more"] = json!(census.reference_layers.len() - layer_names.len());
+    }
     if !census.layers_off.is_empty() {
-        note["layers_that_reduce"] = json!(census
-            .layers_off
-            .iter()
-            .map(|l| json!({"layer": l.layer, "blocks_expanded_total_if_off": count_value(l.total_if_off), "fits_one_build": l.total_if_off <= cap as u64}))
-            .collect::<Vec<_>>());
+        note["layers_that_reduce"] = json!(
+            census
+                .layers_off
+                .iter()
+                .take(shown.layers)
+                .map(|l| {
+                    let mut v = json!({"layer": l.layer, "saves": saves(l.saving)});
+                    match l.total_if_off {
+                        Some(t) => {
+                            v["blocks_expanded_total_if_off"] = count_value(t);
+                            v["fits_one_picture"] = json!(fits_one(t, cap));
+                        }
+                        None => v["left_cannot_be_counted"] = json!(true),
+                    }
+                    v
+                })
+                .collect::<Vec<_>>()
+        );
+        if census.layers_off.len() > shown.layers {
+            note["layers_that_reduce_more"] = json!(census.layers_off.len() - shown.layers);
+        }
+    }
+    if !census.heaviest.is_empty() {
+        note["heaviest_blocks"] = json!(
+            census
+                .heaviest
+                .iter()
+                .take(shown.blocks)
+                .map(|b| {
+                    let mut v = json!({"block": b.block, "saves": saves(b.saving)});
+                    match b.total_if_boxed {
+                        Some(t) => {
+                            v["blocks_expanded_total_if_boxed"] = count_value(t);
+                            v["fits_one_picture"] = json!(fits_one(t, cap));
+                        }
+                        None => v["left_cannot_be_counted"] = json!(true),
+                    }
+                    v
+                })
+                .collect::<Vec<_>>()
+        );
+        if census.heaviest.len() > shown.blocks {
+            note["heaviest_blocks_more"] = json!(census.heaviest.len() - shown.blocks);
+        }
+        note["heaviest_blocks_all_boxed"] = json!({
+            "blocks": census.heaviest.len(),
+            "blocks_expanded_total": count_value(census.total_if_listed_boxed),
+            "fits_one_picture": fits_one(census.total_if_listed_boxed, cap)
+        });
     }
 }
 
+/// The blocks drawn as boxes in a picture and the references of each (said in every answer that
+/// drew with `blocks_as_boxes`).
+fn boxed_fields(note: &mut Value, census: &BlockCensus) {
+    if census.boxed.is_empty() {
+        return;
+    }
+    note["blocks_drawn_as_boxes"] =
+        json!(census.boxed.iter().map(|b| json!({"block": b.block, "outlines_drawn": count_value(b.outlines)})).collect::<Vec<_>>());
+    note["blocks_drawn_as_boxes_note"] = json!(
+        "every reference to these blocks is drawn as ONE outline of its extents (the block's extents under the reference's transform; an array of references is one outline of the whole array) on the reference's own layer and colour, instead of everything the reference draws: its contents AND its attribute texts are not drawn. outlines_drawn is how many outlines were drawn (a block with nothing visible in it draws none). The outline covers the block as the drawing's extents measure it: layers that are off or frozen in the drawing are left out, but layers frozen only in one layout viewport, and layers marked do-not-plot in a PDF, are not subtracted (the extents are taken once per block), so there the outline can be larger than what the block would draw, never smaller. The drawing itself is not changed"
+    );
+}
+
 /// Arrays drawn short by the 10,000 columns / rows the build draws of a MINSERT (said in every
-/// answer that draws, truncated or not).
+/// answer that draws).
 fn clamped_fields(note: &mut Value, census: &BlockCensus) {
     if census.clamped.is_empty() {
         return;
     }
-    note["arrays_clamped"] = json!(census
-        .clamped
-        .iter()
-        .map(|a| json!({
-            "handle": a.handle.hex(),
-            "block": a.block,
-            "cols": a.cols,
-            "rows": a.rows,
-            "drawn_cols": a.drawn_cols,
-            "drawn_rows": a.drawn_rows,
-        }))
-        .collect::<Vec<_>>());
+    note["arrays_clamped"] = json!(
+        census
+            .clamped
+            .iter()
+            .map(|a| json!({
+                "handle": a.handle.hex(),
+                "block": a.block,
+                "cols": a.cols,
+                "rows": a.rows,
+                "drawn_cols": a.drawn_cols,
+                "drawn_rows": a.drawn_rows,
+            }))
+            .collect::<Vec<_>>()
+    );
     note["arrays_clamped_note"] = json!(format!(
         "{} block array{} drawn short: a block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows and the rest of its copies are not in this picture (arrays_clamped lists them; reading, measuring and extents still see the whole array). No way to draw more of such an array exists today",
         census.clamped.len(),
@@ -653,43 +858,74 @@ fn clamped_fields(note: &mut Value, census: &BlockCensus) {
     ));
 }
 
-/// The ways to a complete picture when a build needs `total` block expansions and the limit is
-/// `cap` per build, in words for the agent. Only routes that leave the drawing as it is; each is
-/// proved by a test, and what does not exist is said. Windows are advised only when the largest
-/// single object fits the limit: a build expands an object whole in every window that touches it.
-pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus) -> Vec<String> {
-    let mut ways = Vec::new();
-    let too_big = census.largest.as_ref().filter(|l| l.count > cap as u64);
-    if let Some(l) = too_big {
-        ways.push(format!(
-            "windows and tiles cannot complete this: the {} {} (block {}) alone needs {} expansions, more than the {cap} one build draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again",
-            l.kind,
-            l.handle.hex(),
-            l.block,
-            count_text(l.count)
-        ));
-    } else {
-        let windows = total.div_ceil((cap as u64).max(1)).max(2);
-        let how_many = if total == COUNT_SATURATED {
-            "this drawing needs more than can be counted, so no number of windows is given".to_string()
-        } else {
-            format!("this drawing needs {total}, so use at least {windows} windows")
-        };
-        match kind {
-            Through::Model => ways.push(format!(
-                "draw it in windows: only objects whose extent reaches the window are expanded and the limit is per build, so a window (or tile) that needs {cap} or fewer is drawn whole. No single object needs more than {cap}, and {how_many}: render_preview with tiles {{cols, rows}} and output writes every tile to its own file (each tile's answer says its own blocks_expanded_total), or export svg / png with window [[x0, y0], [x1, y1]] once per region"
-            )),
-            Through::Layout => ways.push(format!(
-                "a layout is built whole, so a window does not reduce it. Draw the model space its viewports show instead: render_preview with viewport: <handle> (read_drawing section \"layouts\" lists them) and tiles or a window, one build per tile; each needs {cap} or fewer to be whole. The layout needs {} in one build",
-                count_text(total)
-            )),
-            Through::Pdf => ways.push(format!(
-                "a PDF sheet is one build of the whole space and its window only places the drawing on the page, it does not leave out the block references outside it. For the regions of the drawing write SVG or PNG: export svg / png with window [[x0, y0], [x1, y1]] per region, or render_preview with tiles and output. {how_many}; the sheet needs {} in one build and {cap} is the most a build draws",
-                count_text(total)
-            )),
+/// The answer when a build reached `built` block pieces, past the `cap` one picture draws, although the
+/// count made before drawing (`counted`) said it fits: the count may be wrong for this drawing. No
+/// picture is made and no file is written; the way on is the same as for a refusal.
+pub fn mismatch_error(cap: usize, counted: Option<u64>, built: u64, what: &str) -> ToolError {
+    let said = counted.map_or("fits".to_string(), |n| format!("fits (it counted {n})"));
+    ToolError::new(
+        code::TOO_LARGE,
+        format!(
+            "this {what} still came out over the {cap} block-piece limit (the build reached {built}) although the count made before drawing said it {said}, so the count may be wrong for this drawing: no picture was made and no file was written"
+        ),
+        "switch off more layers (layers_off / only_layers) and / or draw more blocks as boxes (blocks_as_boxes: [the names of the blocks with the most references]; read_drawing section \"blocks\" lists the block names) and call again",
+    )
+    .with("blocks_expanded_limit", json!(cap))
+    .with("blocks_expanded_counted", counted.map_or(Value::Null, count_value))
+    .with("blocks_expanded_built", count_value(built))
+    .with("picture_made", json!(false))
+}
+
+/// The refusal of a picture that needs `total` block pieces when one picture draws at most `cap`:
+/// no picture was made and no file was written. What happened, why and how to go on, with the
+/// tables that say what each choice leaves (`boxed` are the blocks the call already draws as boxes;
+/// `budget` is the answer budget the whole refusal is kept within: the entries shown are as many as
+/// fit it when measured, see [`fitted`]).
+pub fn refusal(cap: usize, total: u64, kind: Through, census: &BlockCensus, boxed: &[String], budget: usize) -> ToolError {
+    fitted(census.heaviest.len(), census.layers_off.len(), !boxed.is_empty(), budget, |shown, names| {
+        refusal_shown(cap, total, kind, census, &already_drawn(boxed, names), shown)
+    })
+}
+
+fn refusal_shown(cap: usize, total: u64, kind: Through, census: &BlockCensus, already: &str, shown: Shown) -> ToolError {
+    let ways = ways(cap, total, kind, census, already, shown);
+    let reason = format!(
+        "this picture needs {} block pieces (every copy of a block and every object in it, nested blocks counted) and one picture draws at most {cap}: no picture was made and no file was written",
+        count_text(total)
+    );
+    let next = format!("make the picture complete by one of these, all of which leave the drawing as it is: {}", numbered(&ways));
+    let mut e = ToolError::new(code::TOO_LARGE, reason, next)
+        .with("blocks_expanded_total", count_value(total))
+        .with("blocks_expanded_limit", json!(cap))
+        .with("picture_made", json!(false));
+    let mut fields = json!({});
+    refusal_fields(&mut fields, cap, census, shown);
+    clamped_fields(&mut fields, census);
+    if let Value::Object(o) = fields {
+        for (k, v) in o {
+            e = e.with(&k, v);
         }
     }
+    e
+}
+
+fn numbered(ways: &[String]) -> String {
+    ways.iter().enumerate().map(|(i, w)| format!("({}) {}.", i + 1, w.trim_end_matches('.'))).collect::<Vec<_>>().join(" ")
+}
+
+/// The ways to a complete picture when it needs `total` block pieces and one picture draws at most
+/// `cap`, in words for the agent. Only routes that leave the drawing as it is; each is proved by a
+/// test, and what does not exist is said. Windows are advised only when the largest single object
+/// fits: a build expands an object whole in every window that touches it.
+pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus, boxed: &[String], shown: Shown) -> Vec<String> {
+    ways(cap, total, kind, census, &already_drawn(boxed, true), shown)
+}
+
+fn ways(cap: usize, total: u64, kind: Through, census: &BlockCensus, already: &str, shown: Shown) -> Vec<String> {
+    let mut ways = Vec::new();
+    let too_big = census.largest.as_ref().filter(|l| l.count > cap as u64);
     let single = census.reference_layers.len() == 1 && !census.references_off_table;
+    // Layers.
     if census.layers_off.is_empty() {
         if single {
             ways.push(format!(
@@ -701,14 +937,24 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus)
         let list = census
             .layers_off
             .iter()
-            .map(|l| {
-                let fits = if l.total_if_off <= cap as u64 { ", which fits one build" } else { "" };
-                format!("{} leaves {}{fits}", l.layer, count_text(l.total_if_off))
+            .take(shown.layers)
+            .map(|l| match l.total_if_off {
+                Some(0) => format!("{} leaves 0, an empty picture (no way through)", l.layer),
+                Some(t) => format!("{} leaves {}{}", l.layer, count_text(t), if fits_one(t, cap) { ", which fits one picture" } else { "" }),
+                None => format!("{} saves {} (what would be left cannot be counted)", l.layer, count_text(l.saving)),
             })
             .collect::<Vec<_>>()
             .join("; ");
+        let more = census.layers_off.len().saturating_sub(shown.layers);
+        let more = if more == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {more} more layers are not listed here (layers_that_reduce_more): switch off the ones listed and call again to list the next ones"
+            )
+        };
         ways.push(format!(
-            "switch off the layer the block references are on (layers_off / only_layers); the references on it are then not in the picture, and the count with it off is: {list}. Switching off the layers of the references' contents does not reduce the count (the build takes one expansion for each entity of a block before it looks at the entity's layer)"
+            "switch off the layer the block references are on (layers_off / only_layers); the references on it are then not in the picture, and the block pieces with it off are: {list}{more}. Switching off the layers of the references' contents does not reduce the count (the build takes one piece for each object of a block before it looks at the object's layer)"
         ));
         if single {
             ways.push(format!(
@@ -717,60 +963,244 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus)
             ));
         }
     }
-    ways.push(
-        "reading is not affected by the limit: read_drawing (entities with expand_blocks, takeoff, text, dimensions), search_drawing, measuring and the extents do not expand blocks into a picture, so everything in the drawing can still be read, searched and measured".to_string(),
-    );
-    if too_big.is_some() {
-        if !census.layers_off.iter().any(|l| l.total_if_off <= cap as u64) {
-            ways.push(format!(
-                "no complete picture of this object can be drawn today; what is drawn is the first {cap} expansions in draw order, the rest of its block contents is left out"
-            ));
-        }
+    // Blocks drawn as boxes.
+    if census.heaviest.is_empty() {
+        ways.push(if census.blocks_referenced == 0 {
+            let dimension = if census.largest.as_ref().is_some_and(|l| l.kind == "dimension") {
+                " (a dimension is drawn from its own block, and that block is not drawn as a box)"
+            } else {
+                ""
+            };
+            format!(
+                "blocks_as_boxes cannot shorten this: the picture refers to no block that is still drawn with its contents{already}{dimension}"
+            )
+        } else {
+            format!(
+                "blocks_as_boxes cannot shorten this: the {} block(s) the picture refers to that are still drawn with their contents{already} each cost one piece per copy whether drawn or boxed (they hold nothing that costs more)",
+                census.blocks_referenced
+            )
+        });
     } else {
+        let list = census
+            .heaviest
+            .iter()
+            .take(shown.blocks)
+            .map(|b| match b.total_if_boxed {
+                Some(t) => format!("{} leaves {}{}", b.block, count_text(t), if fits_one(t, cap) { ", which fits one picture" } else { "" }),
+                None => format!("{} saves {} (what would be left cannot be counted)", b.block, count_text(b.saving)),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let n = census.heaviest.len();
+        let listed = shown.blocks.min(n);
+        let more = n - listed;
+        let (more_text, every) = if more == 0 {
+            (String::new(), format!("all {n} listed blocks"))
+        } else {
+            (
+                format!(
+                    "; {more} more are not listed here (heaviest_blocks_more): draw the listed blocks as boxes and call again, and the next ones are listed"
+                ),
+                format!("all {n} (the {listed} listed and {more} more)"),
+            )
+        };
+        let all = if fits_one(census.total_if_listed_boxed, cap) {
+            format!("Drawing {every} as boxes leaves {}, which fits one picture", count_text(census.total_if_listed_boxed))
+        } else {
+            format!(
+                "Drawing {every} as boxes still leaves {}, more than {cap}: boxes alone do not give a complete picture of this drawing, so combine them with layers off or windows",
+                count_text(census.total_if_listed_boxed)
+            )
+        };
+        let pass = "Pass the block names from the top of the list down as far as is needed (blocks_as_boxes: [those names])";
         ways.push(format!(
-            "one file of the whole drawing needs {} expansions in one build and {cap} is the most one build draws, so a complete picture comes as several files (windows or layer passes as above), not one",
-            count_text(total)
+            "draw named blocks as outline boxes (blocks_as_boxes: [block names]{already}): every reference to a named block, at any nesting depth, is drawn as one outline of its extents (a rotated reference gives a rotated rectangle, an array of references one outline for the whole array) on the reference's own layer and colour, instead of everything the reference draws (its contents and its attribute texts), and counts one piece. The heaviest blocks, the biggest saving first, with what is left if that block alone is drawn as boxes: {list}{more_text}. {all}. {pass}"
+        ));
+    }
+    // Windows, tiles and the viewport route.
+    if let Some(l) = too_big {
+        // A dimension is drawn from its own block, which is never drawn as a box (blocks_as_boxes does not apply
+        // to the dimension itself); the blocks that block refers to can be, and the layer it is on can be switched off.
+        let reduces = if l.kind == "dimension" {
+            let shown_names: Vec<&str> = census.heaviest.iter().take(shown.blocks).map(|b| b.block.as_str()).collect();
+            let named: Vec<&str> = census.largest_holds.iter().map(String::as_str).filter(|n| shown_names.contains(n)).collect();
+            if census.largest_holds.is_empty() {
+                "blocks_as_boxes does not apply to the dimension itself and no block inside it is listed in heaviest_blocks, so only switching off the layer it is on can reduce it".to_string()
+            } else {
+                let hidden = census.largest_holds.len() - named.len();
+                let list = match (named.is_empty(), hidden) {
+                    (_, 0) => named.join(", "),
+                    (true, h) => format!("{h} of the blocks not listed here (heaviest_blocks_more)"),
+                    (false, h) => format!("{} and {h} more of the blocks not listed here (heaviest_blocks_more)", named.join(", ")),
+                };
+                format!("blocks_as_boxes does not apply to the dimension itself, but drawing the blocks inside it as boxes reduces it ({list}), and so does switching off the layer it is on")
+            }
+        } else {
+            "only layers or blocks_as_boxes can reduce it".to_string()
+        };
+        ways.push(format!(
+            "windows and tiles cannot complete this: the {} with handle {} (block {}) alone needs {} block pieces, more than the {cap} one picture draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again ({reduces}){}",
+            l.kind,
+            l.handle.hex(),
+            l.block,
+            count_text(l.count),
+            if kind == Through::Pdf { "; a PDF sheet's window only places the drawing on the page, it does not leave out the block references outside it" } else { "" }
+        ));
+    } else {
+        let windows = total.div_ceil((cap as u64).max(1)).max(2);
+        let how_many = if total == COUNT_SATURATED {
+            "this drawing needs more than can be counted, so no number of windows is given".to_string()
+        } else {
+            format!("this drawing needs {total}, so use at least {windows} windows")
+        };
+        match kind {
+            Through::Model => ways.push(format!(
+                "draw it in windows: only objects whose extent reaches the window are expanded and the limit is per picture, so a window (or tile) that needs {cap} or fewer is drawn whole. No single object needs more than {cap}, and {how_many}: render_preview with tiles {{cols, rows}} and output writes every tile that fits to its own file (each tile's answer says its own blocks_expanded_total; a tile over the limit is refused on its own), or export svg / png with window [[x0, y0], [x1, y1]] once per region"
+            )),
+            Through::Layout => ways.push(format!(
+                "a layout is built whole, so a window does not reduce it. Draw the model space its viewports show instead: render_preview with viewport: <handle> (read_drawing section \"layouts\" lists them) and tiles or a window, one picture per tile; each needs {cap} or fewer to be whole. The layout needs {} in one picture",
+                count_text(total)
+            )),
+            Through::Pdf => ways.push(format!(
+                "a PDF sheet is one picture of the whole space and its window only places the drawing on the page, it does not leave out the block references outside it. For the regions of the drawing write SVG or PNG: export svg / png with window [[x0, y0], [x1, y1]] per region, or render_preview with tiles and output. {how_many}; the sheet needs {} in one picture and {cap} is the most a picture draws",
+                count_text(total)
+            )),
+        }
+    }
+    ways.push(
+        "reading is not affected by the limit: read_drawing (entities with expand_blocks, takeoff, text, dimensions), search_drawing, measuring and the extents do not make a picture, so everything in the drawing can still be read, searched and measured".to_string(),
+    );
+    let fits_somewhere = census.layers_off.iter().any(|l| l.total_if_off.is_some_and(|t| fits_one(t, cap)))
+        || (!census.heaviest.is_empty() && fits_one(census.total_if_listed_boxed, cap))
+        || (too_big.is_none() && kind == Through::Model);
+    let unknown = census.layers_off.iter().filter(|l| l.total_if_off.is_none()).count()
+        + census.heaviest.iter().filter(|b| b.total_if_boxed.is_none()).count();
+    let unknown_shown = census.layers_off.iter().take(shown.layers).filter(|l| l.total_if_off.is_none()).count()
+        + census.heaviest.iter().take(shown.blocks).filter(|b| b.total_if_boxed.is_none()).count();
+    if !fits_somewhere && unknown > 0 {
+        // Never "none of these" while a layer or block exists whose remainder could not be counted.
+        let which = if unknown_shown == unknown {
+            format!("for {unknown} of the layers and blocks above")
+        } else {
+            format!("for {unknown} layers or blocks, some not listed here,")
+        };
+        ways.push(format!(
+            "{which} what would be left cannot be counted (it is past what can be worked out), so it is not known whether switching one of them off, or drawing it as boxes, gives a complete picture: try them, and the answer of the next call gives the figures with that change made"
+        ));
+    } else if !fits_somewhere {
+        let combine = if !census.layers_off.is_empty() && !census.heaviest.is_empty() {
+            " They can be combined (for example layers_off together with blocks_as_boxes)."
+        } else {
+            ""
+        };
+        ways.push(format!(
+            "none of these alone gives a complete picture of this drawing in one picture: each way above leaves more than {cap}, leaves nothing, or cannot split it.{combine} The answer of the next call gives the new figures"
         ));
     }
     ways
 }
 
-/// What a PDF export's answer says about block contents, sheet by sheet: each sheet's expansions
-/// asked for and not drawn (`sheets`), the sums of them, and when a sheet passed the limit which
-/// sheets, the largest object and the ways through. The totals add up: `blocks_not_drawn` is the
-/// sum of the sheets' (a sheet's total is the build's own count, or past the limit the count).
-pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
-    let sum = |f: &dyn Fn(&cadcraft_io::SheetBlocks) -> u64| blocks.iter().map(f).fold(0u64, |a, n| if a == COUNT_SATURATED || n == COUNT_SATURATED { COUNT_SATURATED } else { a.saturating_add(n) });
-    let mut note = json!({"blocks_expanded_total": count_value(sum(&|b| b.total))});
-    note["sheets"] = json!(blocks
-        .iter()
-        .map(|b| {
-            let mut e = json!({"sheet": b.sheet, "blocks_expanded_total": count_value(b.total), "blocks_not_drawn": count_value(b.not_drawn())});
-            if b.truncated() {
-                e["blocks_truncated"] = json!(true);
-                truncated_fields(&mut e, b.limit, &b.census);
-            }
-            clamped_fields(&mut e, &b.census);
-            e
-        })
-        .collect::<Vec<_>>());
-    let cut: Vec<&cadcraft_io::SheetBlocks> = blocks.iter().filter(|b| b.truncated()).collect();
-    if let Some(worst) = cut.iter().max_by_key(|b| b.total) {
-        let cap = worst.limit;
-        let over = sum(&|b| b.not_drawn());
-        note["blocks_truncated"] = json!(true);
-        note["blocks_expanded"] = json!(cap);
-        note["blocks_not_drawn"] = count_value(over);
-        note["blocks_truncated_sheets"] = json!(cut.iter().map(|b| b.sheet.clone()).collect::<Vec<_>>());
-        note["warning"] = json!(format!(
-            "block contents past {cap} expanded entities were not drawn on the sheets listed: {} expansions are missing (sheets gives each sheet's own figures)",
-            count_text(over)
-        ));
-        note["ways_through"] = json!(ways_through(cap, worst.total, Through::Pdf, &worst.census));
-        // The details of the sheet that needs the most (every truncated sheet has its own in `sheets`).
-        truncated_fields(&mut note, cap, &worst.census);
-        note["details_of_sheet"] = json!(worst.sheet);
+/// What a PDF export's refusal says: which sheets are over the limit (with their page numbers),
+/// each one's figures, and the ways to a complete file. One file holds every sheet, so one sheet
+/// over the limit means no file for any.
+pub fn pdf_refusal(blocks: &[cadcraft_io::SheetBlocks], boxed: &[String], budget: usize) -> ToolError {
+    let over: Vec<&cadcraft_io::SheetBlocks> = blocks.iter().filter(|b| b.over_limit()).collect();
+    // A sheet the count said fits but whose build went over: the count may be wrong.
+    if let Some(b) = over.iter().find(|b| b.census.total <= b.limit as u64) {
+        return mismatch_error(b.limit, Some(b.census.total), b.total, &format!("PDF sheet {} ({})", b.number, b.sheet));
     }
+    let Some(cap) = over.first().map(|b| b.limit) else {
+        return ToolError::new(
+            code::INTERNAL,
+            "a PDF was refused although no sheet is over the limit",
+            "retry the export; report this if it repeats",
+        );
+    };
+    let list = over.iter().map(|b| format!("sheet {} ({}) needs {}", b.number, b.sheet, count_text(b.total))).collect::<Vec<_>>().join("; ");
+    let reason = format!(
+        "{} of the {} sheet{} of this PDF {} more block pieces (every copy of a block and every object in it, nested blocks counted) than the {cap} one sheet draws: {list}. A PDF is one file and a sheet is never drawn incomplete, so no PDF was written",
+        over.len(),
+        blocks.len(),
+        if blocks.len() == 1 { "" } else { "s" },
+        if over.len() == 1 { "needs" } else { "need" }
+    );
+    let sum = over
+        .iter()
+        .map(|b| b.total)
+        .fold(0u64, |a, n| if a == COUNT_SATURATED || n == COUNT_SATURATED { COUNT_SATURATED } else { a.saturating_add(n) });
+    let Some(worst) = over.iter().max_by_key(|b| b.total) else {
+        return ToolError::new(
+            code::INTERNAL,
+            "a PDF was refused although no sheet is over the limit",
+            "retry the export; report this if it repeats",
+        );
+    };
+    let blocks_max = over.iter().map(|b| b.census.heaviest.len()).max().unwrap_or(0);
+    let layers_max = over.iter().map(|b| b.census.layers_off.len()).max().unwrap_or(0);
+    fitted(blocks_max, layers_max, !boxed.is_empty(), budget, |shown, names| {
+        let already = already_drawn(boxed, names);
+        let ways = ways(cap, worst.total, Through::Pdf, &worst.census, &already, shown);
+        let next = format!(
+            "make every sheet over the limit complete by one of these, all of which leave the drawing as it is (the figures are those of sheet {}, the one that needs the most; sheets_over_limit gives each sheet's own): {}",
+            worst.number,
+            numbered(&ways)
+        );
+        let mut e = ToolError::new(code::TOO_LARGE, reason.clone(), next)
+            .with("blocks_expanded_total", count_value(sum))
+            .with("blocks_expanded_limit", json!(cap))
+            .with("picture_made", json!(false))
+            .with("sheet_numbers_over_limit", json!(over.iter().map(|b| b.number).collect::<Vec<_>>()));
+        let entries: Vec<Value> = over
+            .iter()
+            .map(|b| {
+                let mut v = json!({"sheet_number": b.number, "sheet": b.sheet, "blocks_expanded_total": count_value(b.total)});
+                refusal_fields(&mut v, b.limit, &b.census, shown);
+                v
+            })
+            .collect();
+        e = e.with("sheets_over_limit", json!(entries));
+        e.with(
+            "sheets_within_limit",
+            json!(
+                blocks
+                    .iter()
+                    .filter(|b| !b.over_limit())
+                    .map(|b| json!({"sheet_number": b.number, "sheet": b.sheet, "blocks_expanded_total": count_value(b.total)}))
+                    .collect::<Vec<_>>()
+            ),
+        )
+    })
+}
+
+/// What a PDF export's answer says about block contents when the file was made, sheet by sheet:
+/// each sheet's block pieces, the sums, the blocks drawn as boxes and arrays drawn short.
+pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
+    let sum = |f: &dyn Fn(&cadcraft_io::SheetBlocks) -> u64| {
+        blocks.iter().map(f).fold(0u64, |a, n| if a == COUNT_SATURATED || n == COUNT_SATURATED { COUNT_SATURATED } else { a.saturating_add(n) })
+    };
+    let mut note = json!({"blocks_expanded_total": count_value(sum(&|b| b.total))});
+    note["sheets"] = json!(
+        blocks
+            .iter()
+            .map(|b| {
+                let mut e = json!({"sheet": b.sheet, "sheet_number": b.number, "blocks_expanded_total": count_value(b.total)});
+                boxed_fields(&mut e, &b.census);
+                clamped_fields(&mut e, &b.census);
+                e
+            })
+            .collect::<Vec<_>>()
+    );
+    // The blocks drawn as boxes and the references of each, over every sheet.
+    let mut boxed: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for b in blocks.iter().flat_map(|b| b.census.boxed.iter()) {
+        let n = boxed.entry(b.block.clone()).or_insert(0);
+        *n = if *n == COUNT_SATURATED || b.outlines == COUNT_SATURATED { COUNT_SATURATED } else { n.saturating_add(b.outlines) };
+    }
+    let total = BlockCensus {
+        boxed: boxed.into_iter().map(|(block, references)| cadcraft_engine::render::BoxedRefs { block, outlines: references }).collect(),
+        ..BlockCensus::default()
+    };
+    boxed_fields(&mut note, &total);
     // Arrays drawn short on any sheet.
     let mut seen = std::collections::BTreeSet::new();
     let clamped: Vec<_> = blocks.iter().flat_map(|b| b.census.clamped.iter()).filter(|a| seen.insert(a.handle.0)).cloned().collect();
@@ -778,8 +1208,48 @@ pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
     note
 }
 
+/// The blocks a call asks to draw as boxes (`blocks_as_boxes`: a list of block names), as the drawing spells
+/// them, each once. Anything else is refused: not a list of strings (what was given, the form, an
+/// example), a name that is no block of the drawing (it, the nearest block names, where the full list is);
+/// each says to call again.
+pub fn boxed_blocks(d: &Drawing, a: &Value) -> Result<Vec<String>, ToolError> {
+    let asked = cadcraft_engine::doc::boxed_names(a.get("blocks_as_boxes")).map_err(|e| {
+        ToolError::new(
+            code::INVALID_ARGUMENT,
+            format!("{e}; nothing was drawn and no file was written"),
+            "give blocks_as_boxes as a list of block names, e.g. blocks_as_boxes: [\"Tree\", \"Chair\"] (read_drawing section \"blocks\" lists the names), and call again",
+        )
+    })?;
+    let mut unknown: Vec<String> = Vec::new();
+    for n in &asked {
+        if d.block(n).is_none() && !unknown.contains(n) {
+            unknown.push(n.clone());
+        }
+    }
+    if !unknown.is_empty() {
+        let known: Vec<&str> = d.blocks.values().map(|b| b.name.as_str()).collect();
+        let closest: serde_json::Map<String, Value> =
+            unknown.iter().map(|n| (n.clone(), json!(super::contract::closest(n, known.iter().copied(), 3)))).collect();
+        return Err(ToolError::new(
+            code::NOT_FOUND,
+            format!("{}; nothing was drawn and no file was written", cadcraft_engine::doc::unknown_blocks_message(d, &unknown)),
+            "read_drawing section \"blocks\" lists every block name (anonymous: true for the ones the program names itself; `closest` gives the nearest names): call again with blocks_as_boxes names taken from that list, in any case",
+        )
+        .with("unknown_blocks", json!(unknown))
+        .with("closest", Value::Object(closest)));
+    }
+    cadcraft_engine::doc::checked_boxed_names(d, a.get("blocks_as_boxes"))
+        .map_err(|e| ToolError::new(code::NOT_FOUND, e, "call again with names from read_drawing section \"blocks\""))
+}
+
+/// The answer budget of a call: its `max_bytes` when given, else the server's `max_result_bytes`, never below 1,024 bytes (the same as the runtime trims the answer to).
+pub fn answer_budget(a: &Value, ctx: &Ctx) -> usize {
+    super::contract::answer_bytes(a, ctx.settings.max_result_bytes)
+}
+
 pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>, ToolError> {
     let target = target(d, a)?;
+    let boxed_names = boxed_blocks(d, a)?;
     let mut sw = LayerSwitch::from_args(a);
     sw.off.extend(target.frozen.iter().cloned());
     let (switched, unknown) = if sw.is_empty() {
@@ -804,6 +1274,13 @@ pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>,
         return Err(ToolError::new(code::INVALID_ARGUMENT, "the window has no area", "give two different corners [[x0, y0], [x1, y1]]"));
     }
     let layers = layer_of(dd, &target.space);
+    let boxes = if boxed_names.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(BoxBlocks::new(dd, &boxed_names).map_err(|e| {
+            ToolError::new(code::NOT_FOUND, e, "read_drawing section \"blocks\" lists the block names: call again with names taken from it")
+        })?))
+    };
     let layer_states = dd.layers.iter().map(|l| (l.name.clone(), l.on && !l.frozen)).collect();
     let lineweights = a.get("lineweights").and_then(Value::as_bool).unwrap_or(true);
     Ok(Prepared {
@@ -816,8 +1293,12 @@ pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>,
         unknown_layers: unknown,
         layer_states,
         lineweights,
-        block_cap: cadcraft_engine::render::MAX_BLOCK_EXPANSION,
+        block_cap: block_limit(),
+        budget: answer_budget(a, ctx),
+        boxed_names,
+        boxes,
         layout_census: std::cell::OnceCell::new(),
+        counted: std::cell::Cell::new(None),
     })
 }
 
@@ -876,7 +1357,14 @@ pub fn win_value(w: &Bounds2) -> Value {
 
 /// PNG of the window (a picture for a visual check), as base64.
 /// The PNG of `window` with its size and the block contents expanded ([`Prepared::blocks_note`]).
-pub fn png(p: &Prepared<'_>, window: &Bounds2, width: u32, height: Option<u32>, dark: bool, ctx: &Ctx) -> Result<(Vec<u8>, u32, u32, usize), ToolError> {
+pub fn png(
+    p: &Prepared<'_>,
+    window: &Bounds2,
+    width: u32,
+    height: Option<u32>,
+    dark: bool,
+    ctx: &Ctx,
+) -> Result<(Vec<u8>, u32, u32, usize), ToolError> {
     let picked = p.pick(window, ctx)?;
     png_of(p, &picked, window, width, height, dark, ctx)
 }
