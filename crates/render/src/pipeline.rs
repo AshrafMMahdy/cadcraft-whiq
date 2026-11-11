@@ -1,4 +1,4 @@
-use super::count::{COUNT_SATURATED, ClampedArray, LargestRef, Pass, Stats};
+use super::count::{COUNT_SATURATED, ClampedArray, LargestRef, Pass, Stats, WIDE_SATURATED};
 #[cfg(not(target_arch = "wasm32"))]
 use super::display::append;
 use super::display::{DisplayList, Kind, NO_LAYER, PlotText, VIEWPORT_CONTENT};
@@ -354,31 +354,38 @@ fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus 
         return c;
     }
     let noted = run(Pass { record: true, ..Pass::default() }).1;
-    // What is left after a saving, when the count is a number.
-    let left = |saving: u64| (total != COUNT_SATURATED && saving != COUNT_SATURATED).then(|| total.saturating_sub(saving));
+    // A wide figure as the `u64` the answers carry ("more than can be counted" past it, and when not even the
+    // wide arithmetic held).
+    let narrow = |v: u128| u64::try_from(v).unwrap_or(COUNT_SATURATED);
+    // What is left after a saving: exact in the wide arithmetic (so also where the `u64` total overflowed);
+    // `None` only when not even that could be counted, never a guess.
+    let wide_left = |saving: u128| (noted.wide_total != WIDE_SATURATED && saving != WIDE_SATURATED).then(|| narrow(noted.wide_total.saturating_sub(saving)));
     if let Some(b) = boxes {
-        c.boxed = b.names().map(|n| BoxedRefs { block: n.to_string(), outlines: noted.outlines.get(n).copied().unwrap_or(0) }).collect();
+        c.boxed = b.names().map(|n| BoxedRefs { block: n.to_string(), outlines: narrow(noted.outlines.get(n).copied().unwrap_or(0)) }).collect();
     }
     if total <= cap {
         return c;
     }
+    let mut layers: Vec<(u128, LayerOff)> = Vec::new();
     for (key, saving) in &noted.layer_savings {
         if *saving > 0
             && let Some(name) = stats.layers.get(key)
         {
-            c.layers_off.push(LayerOff { layer: name.clone(), saving: *saving, total_if_off: left(*saving) });
+            layers.push((*saving, LayerOff { layer: name.clone(), saving: narrow(*saving), total_if_off: wide_left(*saving) }));
         }
     }
-    c.layers_off.sort_by(|a, b| b.saving.cmp(&a.saving).then_with(|| a.layer.cmp(&b.layer)));
+    layers.sort_by(|a, b| b.1.saving.cmp(&a.1.saving).then_with(|| b.0.cmp(&a.0)).then_with(|| a.1.layer.cmp(&b.1.layer)));
+    c.layers_off = layers.into_iter().map(|(_, l)| l).collect();
     c.blocks_referenced = noted.savings.len();
-    let mut each: Vec<BlockSaving> = noted
+    let mut each: Vec<(u128, BlockSaving)> = noted
         .savings
         .iter()
         .filter(|(_, saving)| **saving > 0)
-        .map(|(name, saving)| BlockSaving { block: name.clone(), saving: *saving, total_if_boxed: left(*saving) })
+        .map(|(name, saving)| (*saving, BlockSaving { block: name.clone(), saving: narrow(*saving), total_if_boxed: wide_left(*saving) }))
         .collect();
-    // The biggest saving first (a saving that overflowed, "more than can be counted", first).
-    each.sort_by(|a, b| b.saving.cmp(&a.saving).then_with(|| a.block.cmp(&b.block)));
+    // The biggest saving first (a saving that overflowed, "more than can be counted", first, the wider first).
+    each.sort_by(|a, b| b.1.saving.cmp(&a.1.saving).then_with(|| b.0.cmp(&a.0)).then_with(|| a.1.block.cmp(&b.1.block)));
+    let mut each: Vec<BlockSaving> = each.into_iter().map(|(_, b)| b).collect();
     // Boxing more blocks never costs more (a box is one unit, a copy at least one), so the list ends at
     // the first prefix whose blocks together fit, found by halving; when even all of them do not fit,
     // every one is listed.

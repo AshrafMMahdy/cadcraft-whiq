@@ -91,8 +91,23 @@ fn png(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
     // Chord tolerance: a fifth of a pixel.
     let tolerance = (0.2 / (k * est)).max(1e-9);
     let transparency = o.plot_transparency.unwrap_or(page.plot_transparency);
-    let ropts = cadcraft_render::Options { tolerance, lineweights, plot_style_table: table, transparency, ..cadcraft_render::Options::default() };
+    let limit = pdf::block_limit(opts);
+    if let Some(l) = limit {
+        pdf::refuse_if_over(d, space, true, l)?;
+    }
+    let ropts = cadcraft_render::Options {
+        tolerance,
+        lineweights,
+        plot_style_table: table,
+        transparency,
+        max_block_expansion: limit.unwrap_or(cadcraft_render::MAX_BLOCK_EXPANSION),
+        ..cadcraft_render::Options::default()
+    };
     let mut list = cadcraft_render::build_plot(d, space, &ropts);
+    // The count is proven equal to the build; a build that went over anyway is thrown away, never written.
+    if let Some(l) = limit.filter(|l| list.expanded > *l) {
+        return Err(IoError::Format(pdf::too_big_message(&format!("the picture of {}", space.tab_name()), list.expanded as u64, l)));
+    }
     let half = Vec2::new(f64::from(width), f64::from(height)) / (2.0 * k);
     let b = window.unwrap_or(list.bounds);
     let s = if fit { fit_scale(&b, &sheet, &o) } else { 1.0 };
@@ -114,7 +129,12 @@ fn png(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
 
 fn svg(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
     let o = PdfOptions::from_json(opts);
+    let limit = pdf::block_limit(opts);
     let Space::Model = space else {
+        // A layout's SVG is the screen build (do-not-plot layers included): counted as that.
+        if let Some(l) = limit {
+            pdf::refuse_if_over(d, space, false, l)?;
+        }
         let (sheet, page) = sheet(d, space, &o)?;
         let transparency = o.plot_transparency.unwrap_or(page.plot_transparency);
         return Ok(crate::svg::export_window_with(d, space, Some(sheet.bounds()), transparency).into_bytes());
@@ -130,8 +150,21 @@ fn svg(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
     let tolerance = (0.05 / (sheet.unit_mm * est)).max(1e-9);
     let tolerance = if tolerance.is_finite() { tolerance } else { cadcraft_render::Options::default().tolerance };
     let transparency = o.plot_transparency.unwrap_or(page.plot_transparency);
-    let ropts = cadcraft_render::Options { tolerance, lineweights, plot_style_table: table, transparency, ..cadcraft_render::Options::default() };
+    if let Some(l) = limit {
+        pdf::refuse_if_over(d, space, true, l)?;
+    }
+    let ropts = cadcraft_render::Options {
+        tolerance,
+        lineweights,
+        plot_style_table: table,
+        transparency,
+        max_block_expansion: limit.unwrap_or(cadcraft_render::MAX_BLOCK_EXPANSION),
+        ..cadcraft_render::Options::default()
+    };
     let mut list = cadcraft_render::build_plot(d, space, &ropts);
+    if let Some(l) = limit.filter(|l| list.expanded > *l) {
+        return Err(IoError::Format(pdf::too_big_message(&format!("the picture of {}", space.tab_name()), list.expanded as u64, l)));
+    }
     let s = fit_scale(&window.unwrap_or(list.bounds), &sheet, &o);
     cadcraft_render::pen::apply(&mut list, s * sheet.unit_mm);
     Ok(crate::svg::export_list(&list, window).into_bytes())

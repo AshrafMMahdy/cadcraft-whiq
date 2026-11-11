@@ -358,7 +358,7 @@ now either complete or not made.
 3. **PDF.** One file: every sheet is counted before any is drawn; if any sheet is over the limit no PDF is written and
    the refusal names the sheets over it with their page numbers (`sheet_numbers_over_limit`, `sheets_over_limit` with
    each sheet's own figures and tables, `sheets_within_limit`). `io::plot_complete(d, space, opts, limit)` returns
-   `Plot::TooBig(sheets)` or `Plot::Drawn(..)`; `io::plot` (the engine's `plot` hook) is unchanged and still cuts.
+   `Plot::TooBig(sheets)` or `Plot::Drawn(..)`; `io::plot` (the engine's `plot` hook) still cuts when called with no limit, and with the plot option `blockLimit` (set by a session with the picture rule, round 4) it counts what it draws and refuses like `plot_complete`.
 4. **Removed vocabulary.** `blocks_truncated`, `blocks_not_drawn`, `blocks_expanded` (as the limit), `warning`,
    `ways_through` (the field; the text is `next_step`), `blocks_truncated_sheets`, `details_of_sheet`,
    `SheetBlocks::truncated` / `not_drawn`, `io::plot_with_blocks`. No answer describes a cut picture any more.
@@ -403,20 +403,28 @@ never smaller (the answer's note says so).
 
 ### How the heaviest-blocks list is found, and what it costs (measured, round 3)
 
-**Design.** The count walks the block table once (memoised). When the picture is over the limit, or blocks are
-drawn as boxes, one more walk records every reference with its copies and the cost of one copy. Everything per
-block and per layer then comes from that recording by arithmetic and never from a walk per name: the expansions
-form a graph whose edges raise the depth by one; taking away a set of references (a block's references drawn as
-boxes, a layer's references switched off) changes the cost of one copy of every expansion that holds one and of
-those above it, found from the cut upwards, and the top level sums the same. A block that holds itself, or a layer
-whose references hold others on the same layer, cost no more than any other, and the outlines drawn per boxed block
-come from the same recording (the box sites carry the block name). A figure that overflows is "more than can be
-counted": it is listed (first, as the heaviest), it is not walked, and it gets no after-figure; when the total is a
-number every figure is exact. The only counts besides the first two are the few that find how many of the heaviest
-blocks, boxed together, fit (found by halving: about log2(blocks) walks of the objects) and one to state the figure
-with all the listed blocks boxed. A saturated total still lists the blocks that save (with their saving only), so
-n independent overflowing blocks, which fit when boxed together (n pieces), are offered as that. The layer table of
-a census is built once (`Drawing::layer` is a linear scan).
+**Design (round 4; round 3's version walked up through the ancestors of every cut and was still quadratic on two shapes).**
+The count walks the block table once (memoised). When the picture is over the limit, or blocks are drawn as boxes, one
+more walk records every reference by indices only (the layer interned once, the block by address, the expansion by
+index: no string per record; a block that holds no reference on layer 0 does not depend on the layer its reference is
+on, so it is one expansion however many layers refer to it). Everything per block and per layer then comes from that
+recording by arithmetic (`crates/render/src/savings.rs`): references are merged per (holder, what they draw, layer);
+`down(n)`, what one copy of an expansion costs, is made once from the leaves up and `up(n)`, how many copies of it are
+drawn in all, once from the top down. What a name (a block drawn as boxes, a layer switched off) takes off is then a sum
+over that name's OWN references only: each cut reference takes off `up(holder) x (what it costs - what it is replaced
+by - copies x what the same name already removes inside one copy of what it draws)`, i.e. every removed piece is counted
+at the deepest cut on its path, so a cut below a cut of the same name stays exact and nothing is counted twice. What the
+name removes inside one copy of an expansion is a memoised walk that goes only into expansions that hold, somewhere
+below, a reference of that name (a per-expansion set of names, built once, kept only for names held by two or more
+expansions: a name held by one expansion cannot nest). A block can sit beneath itself (a block holding itself, stopped at
+the depth limit), so blocks use the same inner term. The arithmetic is `u128`: a figure that overflows even that is "not
+known" and taints what is computed from it, never a wrong number; what is left after a saving is the wide total minus the
+wide saving, so it is exact where the `u64` total overflowed (a layer that leaves 20 of an overflowing total says
+"leaves 20, which fits"; a remainder past 3.4e38 gets `left_cannot_be_counted: true` and the refusal never says "none of
+these alone" while such an entry exists). A saving past `u64` is "more than can be counted" and sorts first by its wide
+value. The only counts besides the two walks are the few that find how many of the heaviest blocks, boxed together, fit
+(halving: about log2(blocks) walks) and one to state the figure with all the listed blocks boxed. The layer table of a
+census is built once (`Drawing::layer` is a linear scan).
 
 Test `the_refusal_grows_with_the_drawing_not_with_its_square` runs every shape below with a bound, and
 `heaviest_equals_walks` asserts that every figure that is given (block and layer, order, after-figure) equals a real
@@ -448,7 +456,7 @@ these are generated drawings.)
 The value of the limit; the desktop canvas and the plotter and engine `plot` callers (they still keep what the build
 drew; the canvas options only gained the field `blocks_as_boxes: None`); PDF culling by window; streaming output; the
 10,000 columns / rows clamp of a MINSERT (`arrays_clamped` is still said in every answer that draws one short: that is
-a cut picture of another cause, not named in the decision). No timeout, cap or default was added. One check was added behind the count: if a build still goes past the limit although the count said it fits (the equality test says it cannot), no picture is made and the answer says, in words, that the picture came out over the limit although the count said it fits, that the count may be wrong for this drawing, what both figures are, and to switch off more layers and / or draw more blocks as boxes and try again (a PDF sheet the same way, with its number). It changes no result when the count and the build agree; the owner decided it stays.
+a cut picture of another cause, not named in the decision). No timeout, cap or default was added. One check was added behind the count: if a build still goes past the limit although the count said it fits (the equality test says it cannot), no picture is made and the answer says, in words, that the picture came out over the limit although the count said it fits, that the count may be wrong for this drawing, what both figures are, and to switch off more layers and / or draw more blocks as boxes and call again (a PDF sheet the same way, with its number). It changes no result when the count and the build agree; the owner decided it stays.
 
 Tests: render `a_boxed_reference_is_one_outline_of_its_extents_under_its_transform`,
 `a_boxed_block_nested_in_another_is_boxed_at_every_depth`, `the_heaviest_blocks_are_listed_down_to_where_boxing_them_fits`,
@@ -490,3 +498,57 @@ only) `preview::lower_limit`.
   tool, so no picture is counted one way and drawn another. Names are checked as the tools check them.
 * `blocks_as_boxes` is a list of block names only; a string, a number or a list with a non-string is refused naming what
   was given and the form expected. No default stands in for a wrong value.
+
+### Round 4 (blind verification of round 3): what changed
+
+* **`plot` through `edit` counts what the plotter draws.** The count the engine made (the drawing as it stands, as a plot)
+  was not what the hook draws in two cases: `offLayers: true` (the PDF turns layers that are off on before drawing) and
+  an SVG of a layout (`plotter::svg` is the screen build, which includes do-not-plot layers). The engine now hands the
+  rule's limit to the plotter itself (the plot option `blockLimit`, set only by a session with `complete_pictures`, never
+  taken from the caller): `io::plot` counts every sheet as it will draw it and refuses, and the PNG and SVG plotters count
+  as they build (the build's own `expanded` is checked too), so a picture over the limit is refused, never cut, nothing
+  written. The engine's own count stays as the first, stoppable check; it counts no more than the plotter draws, so it
+  never refuses a picture that would fit. Tests: mcp `plot_through_edit_refuses_what_the_plotter_draws_over_the_limit`
+  (limit 100: `offLayers`, the SVG of a layout; the same commands without them still work).
+* **Refusal tables: no walk up through ancestors** (design above). Measured, release, one core, tables only (limit 100):
+
+  | n | one block holds n references to Z (was 0.07 / 0.68 / 10 s at 1k / 4k / 16k) | n separate blocks hold Z once (was 1.1 / 4.3 / 18.4 / 78.8 s at 2k / 4k / 8k / 16k) |
+  |---|---|---|
+  | 1,000 | 0.007 s | 0.014 s |
+  | 2,000 | 0.011 s | 0.031 s |
+  | 4,000 | 0.030 s | 0.064 s |
+  | 8,000 | 0.059 s | 0.167 s |
+  | 16,000 | 0.132 s | 0.367 s |
+
+  Still not linear, said plainly: a layer cut both on a reference to a fat block Z and on a reference inside Z, for n
+  layers with Z holding n references on those n layers (16,000 of each: 0.88 s; 4,000: 0.09 s, about x3.4 per doubling),
+  because the inner term visits Z once per layer and walks Z's n references each time. A real drawing would need that many
+  layers each used both above and inside one block. No cap was added. Tests (`the_tables_of_the_two_quadratic_shapes_grow_in_step_with_the_drawing`:
+  4,000 and 8,000, best of three, 8k under 3 x 4k plus 100 ms; figures equal to the walks at n = 12; `measure_the_tables`, ignored, prints
+  the table above).
+* **Memory of the recording.** A site is 32 bytes of indices. A chain of 16 blocks x 100 references shown from N layers is
+  16 expansions and 1,600 + N records at any N (test `the_recording_does_not_grow_with_the_layers_that_refer_to_a_chain`;
+  when the references inside sit on layer 0 each layer needs its own 15 expansions, as the build's would). Peak memory of
+  the whole census (release, test binary, `ru_maxrss`) for N = 4,000: 16 MB (round 3: 2.5 GB); N = 1,000: 9.9 MB.
+* **The refusal is within the answer budget and says only true things.** The budget is the call's `max_bytes`, else
+  `max_result_bytes`. The whole refusal is measured as it is serialised (the fixed text, the blocks already drawn as boxes,
+  every entry) and the entries shown are the most that fit (the lists grow together, then each alone, by halving; one entry
+  of each is always given). The names of the blocks already drawn as boxes are listed when they fit and counted when they
+  do not. Below the fixed text plus one entry of each list the refusal is that size and no smaller (3,881 bytes with 180
+  character names, 30 boxed names; 4,000 bytes held at every one of 24 rounds). "N more of the M are not listed" now says
+  "all M (the K listed and N more)". A way that leaves nothing (the only reference layer switched off leaves 0) is an
+  empty picture: it is not said to fit and the refusal still says no way alone gives a complete picture. A remainder that
+  could not be counted is said so and is never turned into "none of these". A dimension is not said to be reducible by
+  boxes (its block is drawn from its definition and is never drawn as a box). Tests: mcp
+  `the_refusal_fits_the_answer_budget_whatever_is_in_it`, `a_way_that_leaves_nothing_is_not_a_way_and_no_sentence_is_false`,
+  render `what_is_left_is_exact_when_the_total_overflows`.
+* **Other.** `saveas`, `qsave`, `document.bytes` (and `wblock`) now pass their parameters to the picture rule, so a
+  `blocks_as_boxes` given to them is refused naming the `export` tool instead of ignored (`layout.saveas` writes only drawing
+  files, never a picture). The nearest-block-names code uses the one edit distance the MCP's name matching uses
+  (`doc::edit_distance`, capped at 64 characters). "stopped as asked" says to call again to make the picture; the
+  build-went-over message says "call again". Tests `refused_tile_entries_count_against_the_answer_size` and
+  `a_build_over_the_limit_that_the_count_missed_says_what_to_try` are back (adapted).
+* **Not done:** an `edit` picture command cannot be stopped while the plotter draws or counts: the plot hook is a plain
+  function `fn(&Drawing, &Space, &Value)` and the file writers are the same, so passing the session's stop to them means
+  changing the hook types and every `IoHooks` literal in the tests of three crates. The engine's own count before the hook
+  is stoppable.

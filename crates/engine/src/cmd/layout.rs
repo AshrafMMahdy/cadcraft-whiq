@@ -744,6 +744,10 @@ fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
 
 // ---------- plotting ----------
 
+/// The plot option that carries the picture rule's limit to the plotter (`cadcraft_io::pdf::BLOCK_LIMIT_KEY`; the
+/// engine cannot depend on that crate).
+const PLOT_BLOCK_LIMIT: &str = "blockLimit";
+
 /// Most sheets in one plot (the PDF writer's own limit, `cadcraft_io::pdf::MAX_PAGES`).
 const MAX_PLOT_SHEETS: usize = 256;
 
@@ -835,6 +839,16 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
     };
     let pdf = !opts.get("output").and_then(Value::as_str).is_some_and(|o| !o.eq_ignore_ascii_case("pdf"));
     super::exchange::picture_fits(s, cmd, s.doc()?, &counted.into_iter().map(|c| (c, true)).collect::<Vec<_>>(), p, cmd == "plot" && pdf)?;
+    // The picture rule goes to the plotter itself: it counts what IT draws (layers that are off drawn on
+    // hidden PDF layers with `offLayers`, the screen build of a layout's SVG) and refuses over the limit
+    // instead of cutting. The count above stays as the first, stoppable check. Without a rule the key is
+    // never passed on, whatever the caller gave.
+    if let Some(o) = opts.as_object_mut() {
+        match &s.complete_pictures {
+            Some(rule) => o.insert(PLOT_BLOCK_LIMIT.into(), json!(rule.limit)),
+            None => o.remove(PLOT_BLOCK_LIMIT),
+        };
+    }
     let bytes = hook(s.doc()?, &space, &opts).map_err(|e| bad(cmd, e))?;
     let layout = match &sheets {
         Some(names) => names.first().cloned().unwrap_or_default(),

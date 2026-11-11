@@ -114,24 +114,10 @@ pub fn squash(s: &str) -> String {
     s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
 }
 
-/// Edit distance (insertions, deletions, substitutions), capped for long inputs.
+/// Edit distance (insertions, deletions, substitutions), capped for long inputs (the engine's own, shared
+/// with the block-name matching).
 pub fn distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().take(64).collect();
-    let b: Vec<char> = b.chars().take(64).collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1; b.len() + 1];
-        for (j, cb) in b.iter().enumerate() {
-            let sub = prev.get(j).copied().unwrap_or(0) + usize::from(ca != cb);
-            let del = prev.get(j + 1).copied().unwrap_or(0) + 1;
-            let ins = cur.get(j).copied().unwrap_or(0) + 1;
-            if let Some(slot) = cur.get_mut(j + 1) {
-                *slot = sub.min(del).min(ins);
-            }
-        }
-        prev = cur;
-    }
-    prev.last().copied().unwrap_or(0)
+    cadcraft_engine::doc::edit_distance(a, b)
 }
 
 /// Up to `n` of `candidates` closest to `wanted` (substring matches first, then edit distance).

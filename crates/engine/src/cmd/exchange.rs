@@ -140,7 +140,7 @@ pub(crate) fn picture_fits(s: &Session, cmd: &str, d: &Drawing, spaces: &[(Space
         };
         let n = cadcraft_render::count_space_with(d, space, *plotting, &opts);
         if opts.cancelled() {
-            return Err(bad(cmd, "stopped as asked: no picture was made and no file was written"));
+            return Err(bad(cmd, "stopped as asked: no picture was made and no file was written; call again to make it"));
         }
         if n > rule.limit as u64 {
             let need = if n == cadcraft_render::COUNT_SATURATED { "more than can be counted".to_string() } else { n.to_string() };

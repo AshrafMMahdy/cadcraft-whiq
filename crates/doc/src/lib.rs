@@ -28,7 +28,7 @@ pub use cadcraft_geom as geom;
 pub use constraint::*;
 pub use entity::*;
 mod block_names;
-pub use block_names::{boxed_names, checked_boxed_names, unknown_blocks_message};
+pub use block_names::{boxed_names, checked_boxed_names, edit_distance, unknown_blocks_message};
 pub use extents::{BlockBoundsCache, MAX_BLOCK_DEPTH, block_contents_bounds, entity_bounds, extent_bounds};
 pub use format::Format;
 pub use gdt::*;

@@ -1228,7 +1228,12 @@ fn count_equals_build_with_boxes(d: &Drawing, space: &Space, what: &str) {
 /// is worked out from how often each copy is expanded, not by a walk per block, and must agree with
 /// the walks, also for a block that is part of itself and for layouts.
 fn heaviest_equals_walks(d: &Drawing, space: &Space, what: &str) {
-    let o = Options { max_block_expansion: 1, ..Default::default() };
+    heaviest_equals_walks_at(d, space, what, 1);
+}
+
+/// [`heaviest_equals_walks`] with the limit `cap` (0: the list never ends early).
+fn heaviest_equals_walks_at(d: &Drawing, space: &Space, what: &str, cap: usize) {
+    let o = Options { max_block_expansion: cap, ..Default::default() };
     let c = census_space(d, space, false, &o);
     let mut expected = Vec::new();
     for name in d.blocks.keys() {
@@ -2211,7 +2216,7 @@ fn the_refusal_grows_with_the_drawing_not_with_its_square() {
         let (t, c) = census_time(&overflowing_blocks(1_000, 20, layers), 2_000);
         assert_eq!(c.total, COUNT_SATURATED);
         assert_eq!(c.heaviest.len(), 1_000, "every block is needed to fit");
-        assert!(c.heaviest.iter().all(|h| h.saving == COUNT_SATURATED && h.total_if_boxed.is_none()));
+        assert!(c.heaviest.iter().all(|h| h.saving == COUNT_SATURATED && h.total_if_boxed == Some(COUNT_SATURATED)));
         assert_eq!(c.total_if_listed_boxed, 1_000);
         assert_eq!(c.layers_off.len(), if layers { 1_000 } else { 1 });
         assert!(t < limit, "layers {layers}: {t:?}");
@@ -2222,7 +2227,7 @@ fn the_refusal_grows_with_the_drawing_not_with_its_square() {
     assert_eq!(c.total, COUNT_SATURATED);
     assert!(t < limit, "{t:?}");
     assert_eq!((c.heaviest[0].block.as_str(), c.heaviest[0].saving), ("Cyc", COUNT_SATURATED));
-    assert!(c.heaviest[1..].iter().all(|h| h.saving == 30 && h.total_if_boxed.is_none()), "{:?}", c.heaviest[1]);
+    assert!(c.heaviest[1..].iter().all(|h| h.saving == 30 && h.total_if_boxed == Some(COUNT_SATURATED)), "{:?}", c.heaviest[1]);
     let names: Vec<String> = c.heaviest.iter().map(|h| h.block.clone()).collect();
     let boxed = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(&d, &names).unwrap())), ..uncapped() };
     assert_eq!(census_space(&d, &Space::Model, false, &boxed).total, c.total_if_listed_boxed);
@@ -2253,6 +2258,170 @@ fn the_refusal_grows_with_the_drawing_not_with_its_square() {
     assert!(t.elapsed() < limit, "{:?}", t.elapsed());
     assert_eq!(c.boxed.len(), 1_000);
     assert!(c.boxed.iter().all(|b| b.outlines == 30), "{:?}", c.boxed[0]);
+}
+
+/// A block `name` holding one reference per name in `targets`, on layer `layer(k)` of the k-th.
+fn block_of_refs(name: &str, targets: &[String], layer: impl Fn(usize) -> String) -> cadcraft_doc::Block {
+    let mut b = cadcraft_doc::Block::new(name);
+    for (k, t) in targets.iter().enumerate() {
+        b.entities.push(block_entity(1 + k as u64, Common { layer: layer(k), ..Default::default() }, EntityKind::Insert(insert_struct(t))));
+    }
+    b
+}
+
+/// The first shape that made the tables quadratic: one block `Z` holding `n` references, each to a leaf of
+/// its own on a layer of its own, and one block `Y` holding `n` references to `Z`, shown once.
+fn one_block_holds_n_references_to_z(n: usize) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    let mut leaves = Vec::new();
+    for k in 0..n {
+        d.blocks.insert(format!("Leaf{k}"), std::sync::Arc::new(lines_block(&format!("Leaf{k}"), 1)));
+        d.layers.push(layer_named(&format!("L{k}"), true));
+        leaves.push(format!("Leaf{k}"));
+    }
+    d.layers.push(layer_named("Refs", true));
+    d.blocks.insert("Z".into(), std::sync::Arc::new(block_of_refs("Z", &leaves, |k| format!("L{k}"))));
+    d.blocks.insert("Y".into(), std::sync::Arc::new(block_of_refs("Y", &vec!["Z".to_string(); n], |_| "Refs".into())));
+    d.add(&Space::Model, Common { layer: "Refs".into(), ..Default::default() }, EntityKind::Insert(insert_struct("Y"))).unwrap();
+    d
+}
+
+/// The second: the same `Z`, held once by each of `n` separate blocks `B{k}`, each shown once on a layer of its own.
+fn n_separate_blocks_hold_z_once(n: usize) -> Drawing {
+    let mut d = one_block_holds_n_references_to_z(n);
+    d.model = Default::default();
+    for k in 0..n {
+        d.blocks.insert(format!("B{k}"), std::sync::Arc::new(block_of_refs(&format!("B{k}"), &["Z".to_string()], |_| "Refs".into())));
+        d.layers.push(layer_named(&format!("T{k}"), true));
+        d.add(&Space::Model, Common { layer: format!("T{k}"), ..Default::default() }, EntityKind::Insert(insert_struct(&format!("B{k}")))).unwrap();
+    }
+    d
+}
+
+/// The tables on both shapes agree with a count of each alternative (small), and their cost grows in step
+/// with the drawing, not with its square (measured: 4,000 to 8,000 took 4x before; here the time of 8,000 is
+/// under 3x that of 4,000, with a little slack for a busy machine).
+#[test]
+fn the_tables_of_the_two_quadratic_shapes_grow_in_step_with_the_drawing() {
+    heaviest_equals_walks_at(&one_block_holds_n_references_to_z(12), &Space::Model, "one block holds n references to Z", 0);
+    heaviest_equals_walks_at(&n_separate_blocks_hold_z_once(12), &Space::Model, "n separate blocks hold Z once", 0);
+    type Shape = fn(usize) -> Drawing;
+    for (what, shape) in [("one block holds n references to Z", one_block_holds_n_references_to_z as Shape), ("n separate blocks hold Z once", n_separate_blocks_hold_z_once as Shape)] {
+        // The best of three runs of each size, so a busy machine does not decide.
+        let best = |n: usize| (0..3).map(|_| census_time(&shape(n), 100).0).min().unwrap();
+        let (t4, t8) = (best(4_000), best(8_000));
+        let c = census_time(&shape(8_000), 100).1;
+        assert!(c.layers_off.len() >= 8_000 && !c.heaviest.is_empty(), "{what}");
+        eprintln!("{what}: 4k {t4:?} 8k {t8:?}");
+        assert!(t8 < t4 * 3 + std::time::Duration::from_millis(100), "{what}: 4k {t4:?}, 8k {t8:?}");
+        assert!(t8 < std::time::Duration::from_secs(5), "{what}: 8k {t8:?}");
+    }
+}
+
+/// The measured times of the two shapes (not part of the normal run): `cargo test -p cadcraft-render --release
+/// --lib measure_the_tables -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_the_tables() {
+    for n in [1_000usize, 2_000, 4_000, 8_000, 16_000] {
+        let a = census_time(&one_block_holds_n_references_to_z(n), 100).0;
+        let b = census_time(&n_separate_blocks_hold_z_once(n), 100).0;
+        // The shape that is still quadratic: a layer cut both on a block's reference to Z and on a reference inside Z
+        // (so what it removes inside Z is worked out), with Z holding n references on n layers.
+        let mut d = one_block_holds_n_references_to_z(n);
+        d.model = Default::default();
+        for k in 0..n {
+            d.blocks.insert(format!("B{k}"), std::sync::Arc::new(block_of_refs(&format!("B{k}"), &["Z".to_string()], |_| format!("L{k}"))));
+            d.add(&Space::Model, Common::default(), EntityKind::Insert(insert_struct(&format!("B{k}")))).unwrap();
+        }
+        let c = census_time(&d, 100).0;
+        eprintln!("n = {n}: one block holds n references to Z {a:?}; n separate blocks hold Z once {b:?}; layer cut above and inside a fat Z {c:?}");
+    }
+}
+
+/// A chain of 16 blocks, each holding 100 references to the next (on `inner_layer`), shown `layers` times,
+/// each on a layer of its own.
+fn chain_shown_from_layers(layers: usize, inner_layer: &str) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    for i in 0..16 {
+        let name = format!("C{i}");
+        let blk = if i == 15 {
+            lines_block(&name, 1)
+        } else {
+            block_of_refs(&name, &vec![format!("C{}", i + 1); 100], |_| inner_layer.to_string())
+        };
+        d.blocks.insert(name, std::sync::Arc::new(blk));
+    }
+    for l in 0..layers {
+        d.layers.push(layer_named(&format!("L{l}"), true));
+        d.add(&Space::Model, Common { layer: format!("L{l}"), ..Default::default() }, EntityKind::Insert(insert_struct("C0"))).unwrap();
+    }
+    d.layers.push(layer_named("Inner", true));
+    d
+}
+
+/// What a recording keeps is indices, and a block whose contents do not follow the reference's layer is
+/// one expansion however many layers refer to it: a chain of 16 blocks x 100 references shown from 1,000 layers
+/// is 16 expansions and 1,600 + 1,000 records, like from 10 (when the references inside sit on layer 0, which
+/// they follow, each layer needs its own 15 expansions, and the records grow with N, as the build's would).
+#[test]
+fn the_recording_does_not_grow_with_the_layers_that_refer_to_a_chain() {
+    let sizes = |d: &Drawing| {
+        let table = crate::count::LayerTable::new(d);
+        let mut c = crate::count::Counter::new(d, false, &[], crate::count::Pass { record: true, ..Default::default() }, None, &table, None);
+        for e in d.model.iter() {
+            c.top(e, d.anno_draw(e));
+        }
+        c.recorded_sizes()
+    };
+    assert_eq!(sizes(&chain_shown_from_layers(10, "Inner")), (16, 15 * 100 + 10));
+    assert_eq!(sizes(&chain_shown_from_layers(1_000, "Inner")), (16, 15 * 100 + 1_000));
+    // The same chain with the inner references on layer 0 follows each layer: 16 expansions per layer.
+    assert_eq!(sizes(&chain_shown_from_layers(10, "0")), (151, 15 * 100 * 10 + 10));
+    // And the figures are the same either way (small chain, checked against the walks).
+    let mut small = chain_shown_from_layers(5, "Inner");
+    for i in 0..15 {
+        small.blocks.insert(format!("C{i}"), std::sync::Arc::new(block_of_refs(&format!("C{i}"), &vec![format!("C{}", i + 1); 3], |_| "Inner".into())));
+    }
+    heaviest_equals_walks_at(&small, &Space::Model, "a chain shown from layers", 0);
+}
+
+/// The peak memory of the recording for the chain shown from 4,000 layers (run by hand under `/usr/bin/time -v`):
+/// `cargo test -p cadcraft-render --release --lib measure_the_recording_memory -- --ignored`.
+#[test]
+#[ignore]
+fn measure_the_recording_memory() {
+    let n = std::env::var("CHAIN_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000);
+    let d = chain_shown_from_layers(n, "Inner");
+    let (t, c) = census_time(&d, 100);
+    eprintln!("{n} layers: {t:?}, {} layers, {} heaviest", c.layers_off.len(), c.heaviest.len());
+}
+
+/// A total that overflows the `u64` counts still says what is left when a layer is off, exactly (not by taking a
+/// saving off the overflowed total): a dimension block holding 20 dimensions of itself on layer `Big` and 20
+/// references on layer `Rest`; with `Big` off only the `Rest` pieces are left, and that fits.
+#[test]
+fn what_is_left_is_exact_when_the_total_overflows() {
+    let mut d = Drawing::new_imperial();
+    for l in ["Big", "Rest", "Top"] {
+        d.layers.push(layer_named(l, true));
+    }
+    d.blocks.insert("P".into(), std::sync::Arc::new(lines_block("P", 1)));
+    let mut dim = cadcraft_doc::Block::new("D");
+    for k in 0..20u64 {
+        dim.entities.push(block_entity(1 + k, Common { layer: "Big".into(), ..Default::default() }, dim_with_block("D")));
+        dim.entities.push(block_entity(100 + k, Common { layer: "Rest".into(), ..Default::default() }, EntityKind::Insert(insert_struct("P"))));
+    }
+    d.blocks.insert("D".into(), std::sync::Arc::new(dim));
+    d.add(&Space::Model, Common { layer: "Top".into(), ..Default::default() }, dim_with_block("D")).unwrap();
+    let c = census_time(&d, 1_000).1;
+    assert_eq!(c.total, COUNT_SATURATED);
+    let mut off = d.clone();
+    off.layer_mut("Big").unwrap().on = false;
+    let left = census_space(&off, &Space::Model, false, &uncapped()).total;
+    assert!(left < 1_000, "{left}");
+    let big = c.layers_off.iter().find(|l| l.layer == "Big").unwrap();
+    assert_eq!((big.saving, big.total_if_off), (COUNT_SATURATED, Some(left)));
 }
 
 /// A stop during the tables ends them early (the callers then discard the count).

@@ -62,22 +62,27 @@ pub fn unknown_blocks_message(d: &Drawing, unknown: &[String]) -> String {
 
 /// The `n` block names closest to `wanted` (edit distance on lower-case names).
 fn nearest_blocks(d: &Drawing, wanted: &str, n: usize) -> Vec<String> {
-    let w: Vec<char> = wanted.to_lowercase().chars().collect();
-    let mut scored: Vec<(usize, String)> =
-        d.blocks.values().map(|b| (distance(&w, &b.name.to_lowercase().chars().collect::<Vec<_>>()), b.name.clone())).collect();
+    let w = wanted.to_lowercase();
+    let mut scored: Vec<(usize, String)> = d.blocks.values().map(|b| (edit_distance(&w, &b.name.to_lowercase()), b.name.clone())).collect();
     scored.sort();
     scored.into_iter().take(n).map(|(_, name)| name).collect()
 }
 
-fn distance(a: &[char], b: &[char]) -> usize {
+/// Edit distance (insertions, deletions, substitutions) of two names, capped for long inputs: only the first
+/// 64 characters of each are compared (the one function the MCP's name matching uses too).
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().take(64).collect();
+    let b: Vec<char> = b.chars().take(64).collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1];
+        let mut cur = vec![i + 1; b.len() + 1];
         for (j, cb) in b.iter().enumerate() {
             let sub = prev.get(j).copied().unwrap_or(0) + usize::from(ca != cb);
             let del = prev.get(j + 1).copied().unwrap_or(0) + 1;
             let ins = cur.get(j).copied().unwrap_or(0) + 1;
-            cur.push(sub.min(del).min(ins));
+            if let Some(slot) = cur.get_mut(j + 1) {
+                *slot = sub.min(del).min(ins);
+            }
         }
         prev = cur;
     }

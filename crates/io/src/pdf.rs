@@ -242,10 +242,55 @@ fn window(v: Option<&Value>) -> Option<Bounds2> {
     (w.width() > 0.0 && w.height() > 0.0).then_some(w)
 }
 
+/// The JSON option the engine sets for the picture rule (`Session::complete_pictures`): the most block
+/// pieces one picture draws. With it the plot hooks ([`plot`], [`crate::plotter::plot`]) count what THEY draw
+/// (layers that are off drawn on hidden PDF layers, the screen build of a layout's SVG...) and refuse a picture
+/// over it instead of cutting it. The engine writes the same name (it cannot depend on this crate).
+pub const BLOCK_LIMIT_KEY: &str = "blockLimit";
+
+/// The limit given in `opts` ([`BLOCK_LIMIT_KEY`]), when there is one.
+pub(crate) fn block_limit(opts: &Value) -> Option<usize> {
+    opts.get(BLOCK_LIMIT_KEY).and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// What the plot hooks answer when a picture needs `need` block pieces ([`cadcraft_render::COUNT_SATURATED`]:
+/// more than can be counted) and one draws at most `limit`: nothing was drawn or written, and where a complete
+/// one is made.
+pub(crate) fn too_big_message(what: &str, need: u64, limit: usize) -> String {
+    let need = if need == cadcraft_render::COUNT_SATURATED { "more than can be counted".to_string() } else { need.to_string() };
+    format!(
+        "{what} needs {need} block pieces (every copy of a block and every object in it, nested blocks counted) and one picture draws at most {limit}: no picture was made and no file was written. Make it with the `export` tool instead (arguments: {{\"path\": \"<file>.pdf\" (or .svg / .png), \"space\": \"<layout or model>\", \"blocks_as_boxes\": [\"<block name>\"], \"layers_off\": [\"<layer>\"]}}; or `render_preview` with the same arguments to look at it): its answer lists which blocks to give in blocks_as_boxes and which layers to switch off so the picture is complete, then call it again with them"
+    )
+}
+
+/// For the image and SVG plotters under the picture rule: refuse before drawing when the picture of `space`
+/// (`plotting`: as a plot builds it, else as the screen does) needs more than `limit`.
+pub(crate) fn refuse_if_over(d: &Drawing, space: &Space, plotting: bool, limit: usize) -> Result<()> {
+    let opts = cadcraft_render::Options { max_block_expansion: limit, ..cadcraft_render::Options::default() };
+    let need = cadcraft_render::count_space_with(d, space, plotting, &opts);
+    if need > limit as u64 {
+        return Err(IoError::Format(too_big_message(&format!("the picture of {}", space.tab_name()), need, limit)));
+    }
+    Ok(())
+}
+
 /// Plot with JSON options (the engine's `plot` hook). A sheet that needs more block contents than
-/// [`cadcraft_render::MAX_BLOCK_EXPANSION`] is drawn with the rest left out.
+/// [`cadcraft_render::MAX_BLOCK_EXPANSION`] is drawn with the rest left out, unless `opts` carries
+/// [`BLOCK_LIMIT_KEY`]: then every sheet is counted first (as it is drawn: layers that are off included when
+/// `offLayers` is set) and a sheet over the limit is refused, nothing drawn.
 pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
-    plot_outcome(d, space, opts, None)?.into_drawn().map(|p| p.bytes)
+    let limit = block_limit(opts);
+    match plot_outcome(d, space, opts, limit.map(|l| (l, None)))? {
+        Plot::Drawn(p) => Ok(p.bytes),
+        Plot::TooBig(sheets) => {
+            let over: Vec<&SheetBlocks> = sheets.iter().filter(|b| b.over_limit()).collect();
+            let Some(worst) = over.iter().max_by_key(|b| b.total) else {
+                return Err(IoError::Format("a sheet needs more block contents than one sheet draws".into()));
+            };
+            let more = if over.len() > 1 { format!(" (and {} more sheets are over the limit)", over.len() - 1) } else { String::new() };
+            Err(IoError::Format(too_big_message(&format!("sheet {} ({}){more}", worst.number, worst.sheet), worst.total, limit.unwrap_or(0))))
+        }
+    }
 }
 
 /// The block contents one plotted sheet needs (see [`cadcraft_render::MAX_BLOCK_EXPANSION`]).

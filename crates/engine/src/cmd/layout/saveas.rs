@@ -103,7 +103,7 @@ pub(super) fn run_saveas(s: &mut Session, p: &Value) -> Result<Value> {
     let name = layout_name("layout.saveas", d, &name)?;
     let t = template_of(d, &name)?;
     let hooks = io().ok_or_else(|| bad("layout.saveas", "file formats are not available in this build"))?;
-    super::super::exchange::picture_fits_for_file(s, "layout.saveas", &path, &t, &json!({}))?;
+    super::super::exchange::picture_fits_for_file(s, "layout.saveas", &path, &t, p)?;
     let bytes = (hooks.write)(&t, &path).map_err(|e| bad("layout.saveas", e))?;
     store(&path, &bytes)?;
     let mut r = json!({ "name": name, "path": path, "bytes": bytes.len() });

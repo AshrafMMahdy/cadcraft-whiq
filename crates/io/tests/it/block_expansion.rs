@@ -211,3 +211,42 @@ fn a_complete_plot_stops_when_asked_and_counts_identical_pages_once() {
     };
     assert_eq!(sheets.iter().map(|s| (s.number, s.total)).collect::<Vec<_>>(), vec![(1, 200), (2, 200), (3, 200)]);
 }
+
+/// The plot hooks given the picture rule's limit (`blockLimit`) count what they draw and refuse a picture over
+/// it instead of cutting: a PDF with `offLayers` draws the layer that is off, a layout's SVG is the screen build
+/// (do-not-plot layers included), PNG and model SVG are plot builds. Without the option they are unchanged.
+#[test]
+fn the_plot_hooks_refuse_over_the_limit_they_are_given_and_count_what_they_draw() {
+    use serde_json::json;
+    // 100 copies of a 2-line block (300 pieces) on a layer that is off; a layout with 100 on a do-not-plot layer.
+    let mut d = read(&minsert(10, 10));
+    d.layers.push(cadcraft_doc::Layer { name: "Off".into(), on: false, ..Default::default() });
+    d.layers.push(cadcraft_doc::Layer { name: "NoPlot".into(), on: true, plot: false, ..Default::default() });
+    let e = d.model.iter().next().unwrap().clone();
+    d.model = Default::default();
+    let mut hidden = (*e).clone();
+    hidden.common.layer = "Off".into();
+    d.add(&Space::Model, hidden.common.clone(), hidden.kind.clone()).unwrap();
+    let sheet = Space::Paper(d.layouts[0].name.clone());
+    let mut noplot = (*e).clone();
+    noplot.common.layer = "NoPlot".into();
+    d.add(&sheet, noplot.common.clone(), noplot.kind.clone()).unwrap();
+    let limit = json!({"blockLimit": 50});
+    let with = |o: serde_json::Value| {
+        let mut o = o;
+        o["blockLimit"] = json!(50);
+        o
+    };
+    // offLayers: the layer that is off is drawn on a hidden PDF layer, so it counts (200 > 50).
+    let err = cadcraft_io::plotter::plot(&d, &Space::Model, &with(json!({"offLayers": true}))).unwrap_err().to_string();
+    assert!(err.contains("needs 200 block pieces") && err.contains("at most 50") && err.contains("no file was written"), "{err}");
+    // Not asked: the layer stays off, nothing is drawn, the PDF is made. Without the limit nothing changes.
+    assert!(cadcraft_io::plotter::plot(&d, &Space::Model, &limit).unwrap().starts_with(b"%PDF"));
+    assert!(cadcraft_io::plotter::plot(&d, &Space::Model, &json!({"offLayers": true})).unwrap().starts_with(b"%PDF"));
+    // The SVG of a layout is the screen build: it draws the do-not-plot layer; its PDF does not.
+    let err = cadcraft_io::plotter::plot(&d, &sheet, &with(json!({"output": "svg"}))).unwrap_err().to_string();
+    assert!(err.contains("needs 200 block pieces") && err.contains("call it again"), "{err}");
+    assert!(cadcraft_io::plotter::plot(&d, &sheet, &limit).unwrap().starts_with(b"%PDF"));
+    assert!(cadcraft_io::plotter::plot(&d, &Space::Model, &with(json!({"output": "svg"}))).unwrap().starts_with(b"<svg"));
+    assert!(cadcraft_io::plotter::plot(&d, &Space::Model, &with(json!({"output": "png", "resolution": 50}))).unwrap().starts_with(b"\x89PNG"));
+}

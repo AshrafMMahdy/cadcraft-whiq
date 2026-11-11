@@ -127,12 +127,10 @@ struct Builder<'a> {
     transparency: u8,
 }
 
-/// Upper bound on the block contents drawn per display list (each block reference, MINSERT copy
-/// and entity drawn inside a block counts one). Nested, self-referencing or arrayed block
-/// references in a hostile file would otherwise expand exponentially (`MAX_BLOCK_DEPTH` only
-/// bounds the depth). A build stops expanding at the limit (the canvas and the plotter keep what
-/// was drawn); the MCP picture tools count first and draw no picture, and write no file, for a
+/// Upper bound on the block contents drawn per display list (every block copy and every object in it counts one).
+/// A build stops expanding at it; the MCP picture tools count first and make no picture, and write no file, for a
 /// picture that would need more.
+// AGREED LIMIT (owner, 2026-11-11): 2,000,000 — the most block contents one picture or PDF sheet expands; over it nothing incomplete is made, the tool refuses and names the ways through (layers off, blocks as boxes) — why: an unbounded expansion ran the server out of memory (the SVG export of 4L-13 Round 2) — arbitrary by agreement.
 pub const MAX_BLOCK_EXPANSION: usize = 2_000_000;
 
 impl Builder<'_> {
@@ -310,6 +308,7 @@ mod dim_draw;
 mod display;
 mod draw;
 mod pipeline;
+mod savings;
 mod props;
 mod slices;
 mod text_entity;

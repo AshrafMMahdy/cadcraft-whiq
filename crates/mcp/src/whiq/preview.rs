@@ -670,31 +670,75 @@ fn count_text(n: u64) -> String {
     if n == COUNT_SATURATED { UNCOUNTABLE.to_string() } else { n.to_string() }
 }
 
-/// How many entries of the layer table and of the heaviest list a refusal shows: as many as the answer
-/// budget (`max_result_bytes`) allows, the heaviest first, at least one of each. An entry appears in the
-/// words and in a field, so it counts twice.
+/// How many entries of the layer table and of the heaviest list a refusal shows: as many as fit the
+/// answer budget (`max_result_bytes`, or the call's `max_bytes`) measured on the refusal as it is
+/// serialised, the heaviest first, at least one of each. An entry appears in the words and in a field.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shown {
     pub blocks: usize,
     pub layers: usize,
 }
 
-pub fn shown(census: &BlockCensus, budget: usize) -> Shown {
-    let mut left = budget;
-    let mut take = |costs: &mut dyn Iterator<Item = usize>| {
-        let mut n = 0;
-        for c in costs {
-            if n > 0 && c > left {
-                break;
+impl Shown {
+    /// Every entry of the census.
+    pub fn all(census: &BlockCensus) -> Shown {
+        Shown { blocks: census.heaviest.len(), layers: census.layers_off.len() }
+    }
+}
+
+/// The bytes of an error as it is answered.
+fn serialised(e: &ToolError) -> usize {
+    e.to_value().to_string().len()
+}
+
+/// The refusal `build` makes with as many entries as fit `budget`, found by measuring the serialised refusal
+/// (the fixed text, the names already drawn as boxes, every entry), never by an estimate: the lists grow
+/// together, then each alone, by halving (a measurement is one build of the refusal, the cost of its entries).
+/// `build(shown, names)`: `names` says whether the blocks already drawn as boxes are listed by name (they are
+/// when the refusal still fits with them; otherwise they are counted). At least one entry of each list is
+/// always given (the agent needs a name to act on), so a budget below the fixed text and one entry of each is
+/// exceeded by exactly that much.
+fn fitted(blocks: usize, layers: usize, has_names: bool, budget: usize, build: impl Fn(Shown, bool) -> ToolError) -> ToolError {
+    let first = Shown { blocks: blocks.min(1), layers: layers.min(1) };
+    let names = has_names && serialised(&build(first, true)) <= budget;
+    let fits = |s: Shown| serialised(&build(s, names)) <= budget;
+    // Largest k of `lo..=hi` for which `at(k)` fits (`lo` is taken as fitting).
+    let most = |lo: usize, hi: usize, at: &dyn Fn(usize) -> Shown| {
+        let (mut lo, mut hi) = (lo, hi);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(at(mid)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
             }
-            left = left.saturating_sub(c);
-            n += 1;
         }
-        n
+        lo
     };
-    let blocks = take(&mut census.heaviest.iter().map(|b| 2 * (b.block.len() + 110)));
-    let layers = take(&mut census.layers_off.iter().map(|l| 2 * (l.layer.len() + 110)));
-    Shown { blocks, layers }
+    let k = most(1, blocks.max(layers).max(1), &|k| Shown { blocks: blocks.min(k), layers: layers.min(k) });
+    let mut best = Shown { blocks: blocks.min(k), layers: layers.min(k) };
+    let layers_kept = best.layers;
+    best.blocks = most(best.blocks, blocks, &|k| Shown { blocks: k, layers: layers_kept });
+    let blocks_kept = best.blocks;
+    best.layers = most(best.layers, layers, &|k| Shown { blocks: blocks_kept, layers: k });
+    build(best, names)
+}
+
+/// The words for the blocks the call already draws as boxes: their names, or how many when the names do not fit.
+fn already_drawn(boxed: &[String], names: bool) -> String {
+    if boxed.is_empty() {
+        String::new()
+    } else if names {
+        format!(" (already drawn as boxes in this call: {})", boxed.join(", "))
+    } else {
+        format!(" (already drawn as boxes in this call: {} blocks, the ones named in this call's blocks_as_boxes)", boxed.len())
+    }
+}
+
+/// Whether `left` pieces make a complete picture one picture can draw: a way that leaves nothing is an empty
+/// picture, not a way through.
+fn fits_one(left: u64, cap: usize) -> bool {
+    left > 0 && left <= cap as u64
 }
 
 /// "saves N" / "saves more than can be counted" for a figure.
@@ -713,7 +757,7 @@ fn refusal_fields(note: &mut Value, cap: usize, census: &BlockCensus, shown: Sho
             "kind": l.kind,
             "block": l.block,
             "blocks_expanded_total": count_value(l.count),
-            "fits_one_picture": l.count <= cap as u64,
+            "fits_one_picture": fits_one(l.count, cap),
         });
     }
     let layer_names: Vec<&String> = census.reference_layers.iter().take(shown.layers.max(1)).collect();
@@ -729,9 +773,12 @@ fn refusal_fields(note: &mut Value, cap: usize, census: &BlockCensus, shown: Sho
                 .take(shown.layers)
                 .map(|l| {
                     let mut v = json!({"layer": l.layer, "saves": saves(l.saving)});
-                    if let Some(t) = l.total_if_off {
-                        v["blocks_expanded_total_if_off"] = count_value(t);
-                        v["fits_one_picture"] = json!(t <= cap as u64);
+                    match l.total_if_off {
+                        Some(t) => {
+                            v["blocks_expanded_total_if_off"] = count_value(t);
+                            v["fits_one_picture"] = json!(fits_one(t, cap));
+                        }
+                        None => v["left_cannot_be_counted"] = json!(true),
                     }
                     v
                 })
@@ -749,9 +796,12 @@ fn refusal_fields(note: &mut Value, cap: usize, census: &BlockCensus, shown: Sho
                 .take(shown.blocks)
                 .map(|b| {
                     let mut v = json!({"block": b.block, "saves": saves(b.saving)});
-                    if let Some(t) = b.total_if_boxed {
-                        v["blocks_expanded_total_if_boxed"] = count_value(t);
-                        v["fits_one_picture"] = json!(t <= cap as u64);
+                    match b.total_if_boxed {
+                        Some(t) => {
+                            v["blocks_expanded_total_if_boxed"] = count_value(t);
+                            v["fits_one_picture"] = json!(fits_one(t, cap));
+                        }
+                        None => v["left_cannot_be_counted"] = json!(true),
                     }
                     v
                 })
@@ -763,7 +813,7 @@ fn refusal_fields(note: &mut Value, cap: usize, census: &BlockCensus, shown: Sho
         note["heaviest_blocks_all_boxed"] = json!({
             "blocks": census.heaviest.len(),
             "blocks_expanded_total": count_value(census.total_if_listed_boxed),
-            "fits_one_picture": census.total_if_listed_boxed <= cap as u64
+            "fits_one_picture": fits_one(census.total_if_listed_boxed, cap)
         });
     }
 }
@@ -818,7 +868,7 @@ pub fn mismatch_error(cap: usize, counted: Option<u64>, built: u64, what: &str) 
         format!(
             "this {what} still came out over the {cap} block-piece limit (the build reached {built}) although the count made before drawing said it {said}, so the count may be wrong for this drawing: no picture was made and no file was written"
         ),
-        "switch off more layers (layers_off / only_layers) and / or draw more blocks as boxes (blocks_as_boxes: [the names of the blocks with the most references]; read_drawing section \"blocks\" lists the block names) and try again",
+        "switch off more layers (layers_off / only_layers) and / or draw more blocks as boxes (blocks_as_boxes: [the names of the blocks with the most references]; read_drawing section \"blocks\" lists the block names) and call again",
     )
     .with("blocks_expanded_limit", json!(cap))
     .with("blocks_expanded_counted", counted.map_or(Value::Null, count_value))
@@ -829,10 +879,16 @@ pub fn mismatch_error(cap: usize, counted: Option<u64>, built: u64, what: &str) 
 /// The refusal of a picture that needs `total` block pieces when one picture draws at most `cap`:
 /// no picture was made and no file was written. What happened, why and how to go on, with the
 /// tables that say what each choice leaves (`boxed` are the blocks the call already draws as boxes;
-/// `budget` is the answer budget the lists are shown within).
+/// `budget` is the answer budget the whole refusal is kept within: the entries shown are as many as
+/// fit it when measured, see [`fitted`]).
 pub fn refusal(cap: usize, total: u64, kind: Through, census: &BlockCensus, boxed: &[String], budget: usize) -> ToolError {
-    let shown = shown(census, budget);
-    let ways = ways_through(cap, total, kind, census, boxed, shown);
+    fitted(census.heaviest.len(), census.layers_off.len(), !boxed.is_empty(), budget, |shown, names| {
+        refusal_shown(cap, total, kind, census, &already_drawn(boxed, names), shown)
+    })
+}
+
+fn refusal_shown(cap: usize, total: u64, kind: Through, census: &BlockCensus, already: &str, shown: Shown) -> ToolError {
+    let ways = ways(cap, total, kind, census, already, shown);
     let reason = format!(
         "this picture needs {} block pieces (every copy of a block and every object in it, nested blocks counted) and one picture draws at most {cap}: no picture was made and no file was written",
         count_text(total)
@@ -862,6 +918,10 @@ fn numbered(ways: &[String]) -> String {
 /// test, and what does not exist is said. Windows are advised only when the largest single object
 /// fits: a build expands an object whole in every window that touches it.
 pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus, boxed: &[String], shown: Shown) -> Vec<String> {
+    ways(cap, total, kind, census, &already_drawn(boxed, true), shown)
+}
+
+fn ways(cap: usize, total: u64, kind: Through, census: &BlockCensus, already: &str, shown: Shown) -> Vec<String> {
     let mut ways = Vec::new();
     let too_big = census.largest.as_ref().filter(|l| l.count > cap as u64);
     let single = census.reference_layers.len() == 1 && !census.references_off_table;
@@ -879,8 +939,9 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
             .iter()
             .take(shown.layers)
             .map(|l| match l.total_if_off {
-                Some(t) => format!("{} leaves {}{}", l.layer, t, if t <= cap as u64 { ", which fits one picture" } else { "" }),
-                None => format!("{} saves {}", l.layer, count_text(l.saving)),
+                Some(0) => format!("{} leaves 0, an empty picture (no way through)", l.layer),
+                Some(t) => format!("{} leaves {}{}", l.layer, count_text(t), if fits_one(t, cap) { ", which fits one picture" } else { "" }),
+                None => format!("{} saves {} (what would be left cannot be counted)", l.layer, count_text(l.saving)),
             })
             .collect::<Vec<_>>()
             .join("; ");
@@ -903,10 +964,11 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
         }
     }
     // Blocks drawn as boxes.
-    let already = if boxed.is_empty() { String::new() } else { format!(" (already drawn as boxes in this call: {})", boxed.join(", ")) };
     if census.heaviest.is_empty() {
         ways.push(if census.blocks_referenced == 0 {
-            format!("blocks_as_boxes cannot shorten this: the picture refers to no block that is still drawn with its contents{already}")
+            format!(
+                "blocks_as_boxes cannot shorten this: the picture refers to no block that is still drawn with its contents{already} (a dimension's block is drawn from its definition and is not drawn as a box)"
+            )
         } else {
             format!(
                 "blocks_as_boxes cannot shorten this: the {} block(s) the picture refers to that are still drawn with their contents{already} each cost one piece per copy whether drawn or boxed (they hold nothing that costs more)",
@@ -919,37 +981,47 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
             .iter()
             .take(shown.blocks)
             .map(|b| match b.total_if_boxed {
-                Some(t) => format!("{} leaves {}{}", b.block, t, if t <= cap as u64 { ", which fits one picture" } else { "" }),
-                None => format!("{} saves {}", b.block, count_text(b.saving)),
+                Some(t) => format!("{} leaves {}{}", b.block, count_text(t), if fits_one(t, cap) { ", which fits one picture" } else { "" }),
+                None => format!("{} saves {} (what would be left cannot be counted)", b.block, count_text(b.saving)),
             })
             .collect::<Vec<_>>()
             .join("; ");
         let n = census.heaviest.len();
-        let more = n.saturating_sub(shown.blocks);
-        let more = if more == 0 {
-            String::new()
+        let listed = shown.blocks.min(n);
+        let more = n - listed;
+        let (more_text, every) = if more == 0 {
+            (String::new(), format!("all {n} listed blocks"))
         } else {
-            format!(
-                "; {more} more of the {n} are not listed here (heaviest_blocks_more): draw the listed blocks as boxes and call again, and the next ones are listed"
+            (
+                format!(
+                    "; {more} more are not listed here (heaviest_blocks_more): draw the listed blocks as boxes and call again, and the next ones are listed"
+                ),
+                format!("all {n} (the {listed} listed and {more} more)"),
             )
         };
-        let all = if census.total_if_listed_boxed <= cap as u64 {
-            format!("Drawing all {n} listed blocks as boxes leaves {}, which fits one picture", count_text(census.total_if_listed_boxed))
+        let all = if fits_one(census.total_if_listed_boxed, cap) {
+            format!("Drawing {every} as boxes leaves {}, which fits one picture", count_text(census.total_if_listed_boxed))
         } else {
             format!(
-                "Drawing all {n} listed blocks as boxes still leaves {}, more than {cap}: boxes alone do not give a complete picture of this drawing, so combine them with layers off or windows",
+                "Drawing {every} as boxes still leaves {}, more than {cap}: boxes alone do not give a complete picture of this drawing, so combine them with layers off or windows",
                 count_text(census.total_if_listed_boxed)
             )
         };
         let pass = "Pass the block names from the top of the list down as far as is needed (blocks_as_boxes: [those names])";
         ways.push(format!(
-            "draw named blocks as outline boxes (blocks_as_boxes: [block names]{already}): every reference to a named block, at any nesting depth, is drawn as one outline of its extents (a rotated reference gives a rotated rectangle, an array of references one outline for the whole array) on the reference's own layer and colour, instead of everything the reference draws (its contents and its attribute texts), and counts one piece. The heaviest blocks, the biggest saving first, with what is left if that block alone is drawn as boxes: {list}{more}. {all}. {pass}"
+            "draw named blocks as outline boxes (blocks_as_boxes: [block names]{already}): every reference to a named block, at any nesting depth, is drawn as one outline of its extents (a rotated reference gives a rotated rectangle, an array of references one outline for the whole array) on the reference's own layer and colour, instead of everything the reference draws (its contents and its attribute texts), and counts one piece. The heaviest blocks, the biggest saving first, with what is left if that block alone is drawn as boxes: {list}{more_text}. {all}. {pass}"
         ));
     }
     // Windows, tiles and the viewport route.
     if let Some(l) = too_big {
+        // A dimension's block is drawn from its definition and never as a box: only a layer reduces it.
+        let reduces = if l.kind == "dimension" {
+            "only switching off the layer it is on can reduce it: blocks_as_boxes does not apply to a dimension"
+        } else {
+            "only layers or blocks_as_boxes can reduce it"
+        };
         ways.push(format!(
-            "windows and tiles cannot complete this: the {} with handle {} (block {}) alone needs {} block pieces, more than the {cap} one picture draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again (only layers or blocks_as_boxes can reduce it){}",
+            "windows and tiles cannot complete this: the {} with handle {} (block {}) alone needs {} block pieces, more than the {cap} one picture draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again ({reduces}){}",
             l.kind,
             l.handle.hex(),
             l.block,
@@ -980,12 +1052,24 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
     ways.push(
         "reading is not affected by the limit: read_drawing (entities with expand_blocks, takeoff, text, dimensions), search_drawing, measuring and the extents do not make a picture, so everything in the drawing can still be read, searched and measured".to_string(),
     );
-    let fits_somewhere = census.layers_off.iter().any(|l| l.total_if_off.is_some_and(|t| t <= cap as u64))
-        || (!census.heaviest.is_empty() && census.total_if_listed_boxed <= cap as u64)
+    let fits_somewhere = census.layers_off.iter().any(|l| l.total_if_off.is_some_and(|t| fits_one(t, cap)))
+        || (!census.heaviest.is_empty() && fits_one(census.total_if_listed_boxed, cap))
         || (too_big.is_none() && kind == Through::Model);
-    if !fits_somewhere {
+    let unknown = census.layers_off.iter().filter(|l| l.total_if_off.is_none()).count()
+        + census.heaviest.iter().filter(|b| b.total_if_boxed.is_none()).count();
+    if !fits_somewhere && unknown > 0 {
+        // Never "none of these" while a layer or block exists whose remainder could not be counted.
         ways.push(format!(
-            "none of these alone gives a complete picture of this drawing in one picture: layers off, blocks drawn as boxes and windows each leave more than {cap} or cannot split it. They can be combined (for example layers_off together with blocks_as_boxes); the answer of the next call gives the new figures"
+            "for {unknown} of the layers and blocks above what would be left cannot be counted (it is past what can be worked out), so it is not known whether switching one of them off, or drawing it as boxes, gives a complete picture: try them, and the answer of the next call gives the figures with that change made"
+        ));
+    } else if !fits_somewhere {
+        let combine = if !census.layers_off.is_empty() && !census.heaviest.is_empty() {
+            " They can be combined (for example layers_off together with blocks_as_boxes)."
+        } else {
+            ""
+        };
+        ways.push(format!(
+            "none of these alone gives a complete picture of this drawing in one picture: each way above leaves more than {cap}, leaves nothing, or cannot split it.{combine} The answer of the next call gives the new figures"
         ));
     }
     ways
@@ -1026,37 +1110,41 @@ pub fn pdf_refusal(blocks: &[cadcraft_io::SheetBlocks], boxed: &[String], budget
             "retry the export; report this if it repeats",
         );
     };
-    let share = budget / over.len().max(1);
-    let ways = ways_through(cap, worst.total, Through::Pdf, &worst.census, boxed, shown(&worst.census, share));
-    let next = format!(
-        "make every sheet over the limit complete by one of these, all of which leave the drawing as it is (the figures are those of sheet {}, the one that needs the most; sheets_over_limit gives each sheet's own): {}",
-        worst.number,
-        numbered(&ways)
-    );
-    let mut e = ToolError::new(code::TOO_LARGE, reason, next)
-        .with("blocks_expanded_total", count_value(sum))
-        .with("blocks_expanded_limit", json!(cap))
-        .with("picture_made", json!(false))
-        .with("sheet_numbers_over_limit", json!(over.iter().map(|b| b.number).collect::<Vec<_>>()));
-    let entries: Vec<Value> = over
-        .iter()
-        .map(|b| {
-            let mut v = json!({"sheet_number": b.number, "sheet": b.sheet, "blocks_expanded_total": count_value(b.total)});
-            refusal_fields(&mut v, b.limit, &b.census, shown(&b.census, share));
-            v
-        })
-        .collect();
-    e = e.with("sheets_over_limit", json!(entries));
-    e.with(
-        "sheets_within_limit",
-        json!(
-            blocks
-                .iter()
-                .filter(|b| !b.over_limit())
-                .map(|b| json!({"sheet_number": b.number, "sheet": b.sheet, "blocks_expanded_total": count_value(b.total)}))
-                .collect::<Vec<_>>()
-        ),
-    )
+    let blocks_max = over.iter().map(|b| b.census.heaviest.len()).max().unwrap_or(0);
+    let layers_max = over.iter().map(|b| b.census.layers_off.len()).max().unwrap_or(0);
+    fitted(blocks_max, layers_max, !boxed.is_empty(), budget, |shown, names| {
+        let already = already_drawn(boxed, names);
+        let ways = ways(cap, worst.total, Through::Pdf, &worst.census, &already, shown);
+        let next = format!(
+            "make every sheet over the limit complete by one of these, all of which leave the drawing as it is (the figures are those of sheet {}, the one that needs the most; sheets_over_limit gives each sheet's own): {}",
+            worst.number,
+            numbered(&ways)
+        );
+        let mut e = ToolError::new(code::TOO_LARGE, reason.clone(), next)
+            .with("blocks_expanded_total", count_value(sum))
+            .with("blocks_expanded_limit", json!(cap))
+            .with("picture_made", json!(false))
+            .with("sheet_numbers_over_limit", json!(over.iter().map(|b| b.number).collect::<Vec<_>>()));
+        let entries: Vec<Value> = over
+            .iter()
+            .map(|b| {
+                let mut v = json!({"sheet_number": b.number, "sheet": b.sheet, "blocks_expanded_total": count_value(b.total)});
+                refusal_fields(&mut v, b.limit, &b.census, shown);
+                v
+            })
+            .collect();
+        e = e.with("sheets_over_limit", json!(entries));
+        e.with(
+            "sheets_within_limit",
+            json!(
+                blocks
+                    .iter()
+                    .filter(|b| !b.over_limit())
+                    .map(|b| json!({"sheet_number": b.number, "sheet": b.sheet, "blocks_expanded_total": count_value(b.total)}))
+                    .collect::<Vec<_>>()
+            ),
+        )
+    })
 }
 
 /// What a PDF export's answer says about block contents when the file was made, sheet by sheet:
@@ -1129,6 +1217,11 @@ pub fn boxed_blocks(d: &Drawing, a: &Value) -> Result<Vec<String>, ToolError> {
         .map_err(|e| ToolError::new(code::NOT_FOUND, e, "call again with names from read_drawing section \"blocks\""))
 }
 
+/// The answer budget of a call: its `max_bytes` when given, else the server's `max_result_bytes`.
+pub fn answer_budget(a: &Value, ctx: &Ctx) -> usize {
+    a.get("max_bytes").and_then(Value::as_u64).map_or(ctx.settings.max_result_bytes, |b| usize::try_from(b).unwrap_or(usize::MAX))
+}
+
 pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>, ToolError> {
     let target = target(d, a)?;
     let boxed_names = boxed_blocks(d, a)?;
@@ -1176,7 +1269,7 @@ pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>,
         layer_states,
         lineweights,
         block_cap: block_limit(),
-        budget: ctx.settings.max_result_bytes,
+        budget: answer_budget(a, ctx),
         boxed_names,
         boxes,
         layout_census: std::cell::OnceCell::new(),
