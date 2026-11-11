@@ -187,13 +187,17 @@ fn run_export(s: &mut Session, p: &Value) -> Result<Value> {
         _ => {}
     }
     let bytes = (hooks.write)(s.doc()?, &format!("export.{format}")).map_err(|e| bad("export", e))?;
-    match path {
+    let mut r = match path {
         Some(path) => {
             write_file("export", path, &bytes)?;
-            Ok(json!({ "path": path, "format": format, "bytes": bytes.len(), "message": format!("Exported to {path}") }))
+            json!({ "path": path, "format": format, "bytes": bytes.len(), "message": format!("Exported to {path}") })
         }
-        None => Ok(json!({ "data": base64_encode(&bytes), "format": format, "bytes": bytes.len() })),
+        None => json!({ "data": base64_encode(&bytes), "format": format, "bytes": bytes.len() }),
+    };
+    if matches!(format.as_str(), "dxf" | "dwg") {
+        super::file::note_boxes_not_used(p, &mut r);
     }
+    Ok(r)
 }
 
 // ---------- IMPORT ----------

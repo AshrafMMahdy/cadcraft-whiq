@@ -104,7 +104,7 @@ pub fn definitions() -> Vec<Value> {
         json!({"name": "list_commands", "description": "The CADCraft commands edit can run: id, label, aliases and parameter docs; filter by a substring.",
             "inputSchema": {"type": "object", "properties": {"filter": {"type": "string"}, "limit": {"type": "integer"}}}, "annotations": ro}),
         json!({"name": "save_drawing", "description": "Save the drawing as DWG or DXF (by the extension; version 2000–2018). Without a path: its own name in the write root. A file already there is kept as OLD_<name> unless overwrite: true.",
-            "inputSchema": {"type": "object", "properties": {"document": doc, "path": {"type": "string"}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"}, "overwrite": {"type": "boolean"}}},
+            "inputSchema": {"type": "object", "properties": {"document": doc, "path": {"type": "string"}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"}, "overwrite": {"type": "boolean"}, "blocks_as_boxes": {"type": ["string", "array"], "description": "Not used by a drawing file: it applies only when a picture or PDF is made, and the answer says so"}}},
             "annotations": writes}),
         json!({"name": "close_drawing", "description": "Close a drawing. Unsaved changes are refused unless discard: true.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "discard": {"type": "boolean"}}}, "annotations": writes}),
@@ -753,7 +753,13 @@ impl Engine {
                 ));
             }
         }
-        Ok(Reply::json(json!({"document": doc.handle, "format": fmt, "saved": saved})))
+        let mut v = json!({"document": doc.handle, "format": fmt, "saved": saved});
+        // A drawing file is saved complete: `blocks_as_boxes` applies to pictures only, and the answer says it was not used.
+        if matches!(fmt.as_str(), "dxf" | "dwg") && a.get("blocks_as_boxes").is_some_and(|b| !b.is_null()) {
+            v["blocks_as_boxes_used"] = json!(false);
+            v["blocks_as_boxes_note"] = json!(cadcraft_engine::BOXES_NOT_USED);
+        }
+        Ok(Reply::json(v))
     }
 
     fn save(&mut self, a: &Value, ctx: &Ctx) -> Result<Reply, ToolError> {
@@ -790,7 +796,7 @@ impl Engine {
         let text =
             p.to_str().ok_or_else(|| ToolError::new(code::INVALID_ARGUMENT, "the path is not valid Unicode", "use another file name"))?.to_string();
         let mut params = json!({"path": text});
-        for k in ["version", "binary"] {
+        for k in ["version", "binary", "blocks_as_boxes"] {
             if let Some(v) = a.get(k).filter(|v| !v.is_null()) {
                 params[k] = v.clone();
             }
@@ -815,6 +821,10 @@ impl Engine {
         let mut v = doc.info(ctx.roots());
         v["saved"] = json!([saved_entry(ctx.roots(), &p, usize::try_from(bytes).unwrap_or(0), &ext, kept.as_ref())]);
         v["version"] = r["version"].clone();
+        if r.get("blocks_as_boxes_note").is_some() {
+            v["blocks_as_boxes_used"] = json!(false);
+            v["blocks_as_boxes_note"] = json!(cadcraft_engine::BOXES_NOT_USED);
+        }
         Ok(Reply::json(v))
     }
 
@@ -2500,7 +2510,8 @@ mod tests {
         assert!(e.next_step.contains("Big leaves 20, which fits one picture") && !e.next_step.contains("none of these"), "{}", e.next_step);
         // A dimension is not reduced by boxes; a block reference is.
         assert!(
-            e.next_step.contains("blocks_as_boxes does not apply to a dimension") && !e.next_step.contains("only layers or blocks_as_boxes can reduce it"),
+            e.next_step.contains("blocks_as_boxes does not apply to the dimension itself and no block inside it is listed in heaviest_blocks, so only switching off the layer it is on can reduce it")
+                && !e.next_step.contains("only layers or blocks_as_boxes can reduce it"),
             "{}",
             e.next_step
         );
@@ -2543,6 +2554,108 @@ mod tests {
         let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|f| f.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(names, vec!["keep.svg".to_string()], "{names:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dimension past the limit: `blocks_as_boxes` does not apply to the dimension itself, but when blocks inside
+    /// its block are listed in `heaviest_blocks`, drawing those as boxes reduces it (the sentence says so and names
+    /// them); when none is, only the layer can. And the wording about a dimension appears only with a dimension.
+    #[test]
+    fn the_dimension_sentences_are_true_with_and_without_blocks_inside_it() {
+        use cadcraft_engine::doc::Handle;
+        use cadcraft_engine::render::{BlockCensus, BlockSaving, LargestRef};
+        let dim = LargestRef { handle: Handle(0x2A), kind: "dimension", block: "D".into(), count: 6_000_001 };
+        let p = BlockSaving { block: "P".into(), saving: 5_999_999, total_if_boxed: Some(2) };
+        let q = BlockSaving { block: "Q".into(), saving: 10, total_if_boxed: Some(5_999_991) };
+        // Block P inside the dimension, listed: "P leaves 2" and boxing it reduces the dimension.
+        let inside = BlockCensus {
+            total: 6_000_001,
+            largest: Some(dim.clone()),
+            heaviest: vec![p.clone(), q.clone()],
+            total_if_listed_boxed: 1,
+            largest_holds: vec!["P".into()],
+            ..Default::default()
+        };
+        let e = preview::refusal(300, 6_000_001, preview::Through::Model, &inside, &[], 1_000_000);
+        assert!(e.next_step.contains("P leaves 2"), "{}", e.next_step);
+        assert!(
+            e.next_step.contains("blocks_as_boxes does not apply to the dimension itself, but drawing the blocks inside it as boxes reduces it (P), and so does switching off the layer it is on"),
+            "{}",
+            e.next_step
+        );
+        assert!(!e.next_step.contains("only switching off the layer it is on can reduce it"), "{}", e.next_step);
+        // The same block beyond the entries shown: said as "not listed here".
+        let hidden = preview::ways_through(300, 6_000_001, preview::Through::Model, &inside, &[], preview::Shown { blocks: 0, layers: 0 }).join(" ");
+        assert!(hidden.contains("reduces it (1 of the blocks not listed here (heaviest_blocks_more))"), "{hidden}");
+        // Nothing inside the dimension is listed: only the layer can reduce it.
+        let outside = BlockCensus { largest_holds: Vec::new(), ..inside.clone() };
+        let e = preview::refusal(300, 6_000_001, preview::Through::Model, &outside, &[], 1_000_000);
+        assert!(
+            e.next_step.contains("blocks_as_boxes does not apply to the dimension itself and no block inside it is listed in heaviest_blocks, so only switching off the layer it is on can reduce it"),
+            "{}",
+            e.next_step
+        );
+        // The parenthesis about a dimension only when a dimension is the largest object.
+        let none = |largest| BlockCensus { total: 900, largest, ..Default::default() };
+        let e = preview::refusal(300, 900, preview::Through::Model, &none(Some(dim)), &[], 1_000_000);
+        assert!(e.next_step.contains("(a dimension is drawn from its own block, and that block is not drawn as a box)"), "{}", e.next_step);
+        let e = preview::refusal(300, 900, preview::Through::Model, &none(None), &[], 1_000_000);
+        assert!(e.next_step.contains("refers to no block") && !e.next_step.contains("a dimension is drawn") && !e.next_step.contains("definition"), "{}", e.next_step);
+    }
+
+    /// "for N of the layers and blocks above" counts only what is shown; with entries the budget did not show it
+    /// says "N layers or blocks, some not listed here".
+    #[test]
+    fn the_cannot_be_counted_sentence_counts_only_what_is_shown() {
+        use cadcraft_engine::render::{BlockCensus, LayerOff};
+        let layers: Vec<LayerOff> = (0..3).map(|k| LayerOff { layer: format!("L{k}"), saving: u64::MAX, total_if_off: None }).collect();
+        let c = BlockCensus { total: u64::MAX, reference_layers: vec!["L0".into(), "L1".into()], layers_off: layers, ..Default::default() };
+        let all = preview::ways_through(300, u64::MAX, preview::Through::Layout, &c, &[], preview::Shown { blocks: 0, layers: 3 }).join(" ");
+        assert!(all.contains("for 3 of the layers and blocks above what would be left cannot be counted"), "{all}");
+        let part = preview::ways_through(300, u64::MAX, preview::Through::Layout, &c, &[], preview::Shown { blocks: 0, layers: 1 }).join(" ");
+        assert!(part.contains("for 3 layers or blocks, some not listed here, what would be left cannot be counted"), "{part}");
+    }
+
+    /// `blocks_as_boxes` given to a save of a drawing file is not refused (the save is valid) but the answer says it
+    /// was not used and why.
+    #[test]
+    fn a_blocks_as_boxes_given_to_a_drawing_file_save_says_it_was_not_used() {
+        install_io();
+        let (mut e, c, dir) = forest();
+        let note = cadcraft_engine::BOXES_NOT_USED;
+        assert!(note.contains("applies only when a picture or PDF is made") && note.contains("saved complete"), "{note}");
+        let s = &mut e.docs.list[0].session;
+        for (cmd, params) in [
+            ("saveas", json!({"path": dir.join("s.dxf").to_string_lossy(), "blocks_as_boxes": ["Tree"]})),
+            ("qsave", json!({"path": dir.join("s2.dxf").to_string_lossy(), "blocks_as_boxes": ["Tree"]})),
+            ("document.bytes", json!({"format": "dxf", "blocks_as_boxes": ["Tree"]})),
+            ("export", json!({"path": dir.join("x.dxf").to_string_lossy(), "blocks_as_boxes": ["Tree"]})),
+        ] {
+            let r = s.execute(cmd, &params).unwrap_or_else(|e| panic!("{cmd}: {e}"));
+            assert_eq!((r["blocks_as_boxes_used"].clone(), r["blocks_as_boxes_note"].as_str()), (json!(false), Some(note)), "{cmd}: {r}");
+        }
+        // Without it, nothing is said.
+        let r = s.execute("document.bytes", &json!({"format": "dxf"})).unwrap();
+        assert!(r.get("blocks_as_boxes_note").is_none(), "{r}");
+        // The tools: save_drawing and export to dxf / dwg.
+        let r = e.call("save_drawing", &json!({"path": "t.dxf", "blocks_as_boxes": ["Tree"]}), &c).unwrap().value;
+        assert_eq!((r["blocks_as_boxes_used"].clone(), r["blocks_as_boxes_note"].as_str()), (json!(false), Some(note)), "{r}");
+        for f in ["t2.dxf", "t3.dwg"] {
+            let r = e.call("export", &json!({"path": f, "blocks_as_boxes": ["Tree"]}), &c).unwrap().value;
+            assert_eq!((r["blocks_as_boxes_used"].clone(), r["blocks_as_boxes_note"].as_str()), (json!(false), Some(note)), "{f}: {r}");
+        }
+        let r = e.call("export", &json!({"path": "t4.dxf"}), &c).unwrap().value;
+        assert!(r.get("blocks_as_boxes_note").is_none(), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The answer budget the refusals are kept within has the same floor the runtime trims the answer to.
+    #[test]
+    fn the_answer_budget_has_the_runtime_floor() {
+        let c = ctx(None, true);
+        assert_eq!(preview::answer_budget(&json!({"max_bytes": 10}), &c), 1024);
+        assert_eq!(preview::answer_budget(&json!({"max_bytes": 5_000}), &c), 5_000);
+        assert_eq!(preview::answer_budget(&json!({}), &c), c.settings.max_result_bytes);
+        assert_eq!(super::super::contract::answer_bytes(&json!({"max_bytes": 10}), 77), 1024);
     }
 
     /// A name in `blocks_as_boxes` that is no block of the drawing is refused in words naming it

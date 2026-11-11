@@ -966,8 +966,13 @@ fn ways(cap: usize, total: u64, kind: Through, census: &BlockCensus, already: &s
     // Blocks drawn as boxes.
     if census.heaviest.is_empty() {
         ways.push(if census.blocks_referenced == 0 {
+            let dimension = if census.largest.as_ref().is_some_and(|l| l.kind == "dimension") {
+                " (a dimension is drawn from its own block, and that block is not drawn as a box)"
+            } else {
+                ""
+            };
             format!(
-                "blocks_as_boxes cannot shorten this: the picture refers to no block that is still drawn with its contents{already} (a dimension's block is drawn from its definition and is not drawn as a box)"
+                "blocks_as_boxes cannot shorten this: the picture refers to no block that is still drawn with its contents{already}{dimension}"
             )
         } else {
             format!(
@@ -1014,11 +1019,24 @@ fn ways(cap: usize, total: u64, kind: Through, census: &BlockCensus, already: &s
     }
     // Windows, tiles and the viewport route.
     if let Some(l) = too_big {
-        // A dimension's block is drawn from its definition and never as a box: only a layer reduces it.
+        // A dimension is drawn from its own block, which is never drawn as a box (blocks_as_boxes does not apply
+        // to the dimension itself); the blocks that block refers to can be, and the layer it is on can be switched off.
         let reduces = if l.kind == "dimension" {
-            "only switching off the layer it is on can reduce it: blocks_as_boxes does not apply to a dimension"
+            let shown_names: Vec<&str> = census.heaviest.iter().take(shown.blocks).map(|b| b.block.as_str()).collect();
+            let named: Vec<&str> = census.largest_holds.iter().map(String::as_str).filter(|n| shown_names.contains(n)).collect();
+            if census.largest_holds.is_empty() {
+                "blocks_as_boxes does not apply to the dimension itself and no block inside it is listed in heaviest_blocks, so only switching off the layer it is on can reduce it".to_string()
+            } else {
+                let hidden = census.largest_holds.len() - named.len();
+                let list = match (named.is_empty(), hidden) {
+                    (_, 0) => named.join(", "),
+                    (true, h) => format!("{h} of the blocks not listed here (heaviest_blocks_more)"),
+                    (false, h) => format!("{} and {h} more of the blocks not listed here (heaviest_blocks_more)", named.join(", ")),
+                };
+                format!("blocks_as_boxes does not apply to the dimension itself, but drawing the blocks inside it as boxes reduces it ({list}), and so does switching off the layer it is on")
+            }
         } else {
-            "only layers or blocks_as_boxes can reduce it"
+            "only layers or blocks_as_boxes can reduce it".to_string()
         };
         ways.push(format!(
             "windows and tiles cannot complete this: the {} with handle {} (block {}) alone needs {} block pieces, more than the {cap} one picture draws, and a build expands every object that reaches its window whole, so every window or tile that touches it hits the limit again ({reduces}){}",
@@ -1057,10 +1075,17 @@ fn ways(cap: usize, total: u64, kind: Through, census: &BlockCensus, already: &s
         || (too_big.is_none() && kind == Through::Model);
     let unknown = census.layers_off.iter().filter(|l| l.total_if_off.is_none()).count()
         + census.heaviest.iter().filter(|b| b.total_if_boxed.is_none()).count();
+    let unknown_shown = census.layers_off.iter().take(shown.layers).filter(|l| l.total_if_off.is_none()).count()
+        + census.heaviest.iter().take(shown.blocks).filter(|b| b.total_if_boxed.is_none()).count();
     if !fits_somewhere && unknown > 0 {
         // Never "none of these" while a layer or block exists whose remainder could not be counted.
+        let which = if unknown_shown == unknown {
+            format!("for {unknown} of the layers and blocks above")
+        } else {
+            format!("for {unknown} layers or blocks, some not listed here,")
+        };
         ways.push(format!(
-            "for {unknown} of the layers and blocks above what would be left cannot be counted (it is past what can be worked out), so it is not known whether switching one of them off, or drawing it as boxes, gives a complete picture: try them, and the answer of the next call gives the figures with that change made"
+            "{which} what would be left cannot be counted (it is past what can be worked out), so it is not known whether switching one of them off, or drawing it as boxes, gives a complete picture: try them, and the answer of the next call gives the figures with that change made"
         ));
     } else if !fits_somewhere {
         let combine = if !census.layers_off.is_empty() && !census.heaviest.is_empty() {
@@ -1217,9 +1242,9 @@ pub fn boxed_blocks(d: &Drawing, a: &Value) -> Result<Vec<String>, ToolError> {
         .map_err(|e| ToolError::new(code::NOT_FOUND, e, "call again with names from read_drawing section \"blocks\""))
 }
 
-/// The answer budget of a call: its `max_bytes` when given, else the server's `max_result_bytes`.
+/// The answer budget of a call: its `max_bytes` when given, else the server's `max_result_bytes`, never below 1,024 bytes (the same as the runtime trims the answer to).
 pub fn answer_budget(a: &Value, ctx: &Ctx) -> usize {
-    a.get("max_bytes").and_then(Value::as_u64).map_or(ctx.settings.max_result_bytes, |b| usize::try_from(b).unwrap_or(usize::MAX))
+    super::contract::answer_bytes(a, ctx.settings.max_result_bytes)
 }
 
 pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>, ToolError> {

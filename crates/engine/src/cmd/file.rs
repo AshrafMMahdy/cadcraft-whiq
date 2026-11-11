@@ -529,6 +529,9 @@ fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let lost = not_saved_as(s.doc()?, version);
     let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts, p)?;
     let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
+    if is_drawing_file(format!("drawing.{fmt}")) {
+        note_boxes_not_used(p, &mut r);
+    }
     if drops_unknown(format!("drawing.{fmt}")) {
         report_not_saved(s, &mut r, &lost);
     }
@@ -595,6 +598,21 @@ fn report_not_saved(s: &mut Session, r: &mut Value, lost: &std::collections::BTr
     }
 }
 
+/// What a save of a drawing file says when it was given `blocks_as_boxes`.
+pub const BOXES_NOT_USED: &str =
+    "blocks_as_boxes was not used: it applies only when a picture or PDF is made, and the drawing file is saved complete";
+
+/// A save of a drawing file (DXF, DWG) given `blocks_as_boxes` is valid, but the option applies to pictures only:
+/// say in the answer that it was not used, and why.
+pub fn note_boxes_not_used(p: &Value, r: &mut Value) {
+    if p.get("blocks_as_boxes").is_some_and(|v| !v.is_null())
+        && let Some(o) = r.as_object_mut()
+    {
+        o.insert("blocks_as_boxes_used".into(), json!(false));
+        o.insert("blocks_as_boxes_note".into(), json!(BOXES_NOT_USED));
+    }
+}
+
 /// Save, then report the entities the file couldn't keep (nothing is dropped silently).
 fn save_reporting(s: &mut Session, p: &Value, run: fn(&mut Session, &Value) -> Result<Value>) -> Result<Value> {
     // What the file will hold depends on the version it is saved as (the data store from 2013).
@@ -602,6 +620,9 @@ fn save_reporting(s: &mut Session, p: &Value, run: fn(&mut Session, &Value) -> R
     let version = save_options("save", p).ok().and_then(|o| o.version).unwrap_or_else(|| drawing_version(s, &path));
     let lost = s.doc().map(|d| not_saved_as(d, version)).unwrap_or_default();
     let mut r = run(s, p)?;
+    if r.get("path").and_then(Value::as_str).is_some_and(is_drawing_file) {
+        note_boxes_not_used(p, &mut r);
+    }
     if r.get("path").and_then(Value::as_str).is_some_and(drops_unknown) {
         report_not_saved(s, &mut r, &lost);
     }

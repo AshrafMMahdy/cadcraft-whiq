@@ -813,7 +813,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
     let view_height = window.map(|w| w.height()).unwrap_or(0.0);
     let census = match pre.census {
         Some(c) => c,
-        None => cadcraft_render::census_space(d, space, true, &ropts),
+        None => cadcraft_render::census_space_total(d, space, true, &ropts),
     };
     let list = cadcraft_render::build_plot(d, space, &cadcraft_render::Options { tolerance, view_height, ..ropts });
     // A build that was stopped is a partial list: the sheet is not used.

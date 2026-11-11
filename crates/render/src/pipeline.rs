@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use super::count::{COUNT_SATURATED, ClampedArray, LargestRef, Pass, Stats, WIDE_SATURATED};
 #[cfg(not(target_arch = "wasm32"))]
 use super::display::append;
@@ -327,6 +328,43 @@ pub struct BlockCensus {
     pub total_if_listed_boxed: u64,
     /// The blocks the picture is asked to draw as boxes, with the references of each that are drawn.
     pub boxed: Vec<BoxedRefs>,
+    /// When the largest object is a dimension that is past the limit: the blocks of `heaviest` that its block
+    /// refers to, at any depth (drawing those as boxes reduces the dimension; the dimension's own block is
+    /// never drawn as a box).
+    pub largest_holds: Vec<String>,
+}
+
+/// The blocks of `c.heaviest` that the dimension block `c.largest` refers to at any depth.
+fn dimension_holds(d: &Drawing, mut c: BlockCensus, opts: &Options) -> BlockCensus {
+    let Some(l) = c.largest.as_ref().filter(|l| l.kind == "dimension" && l.count > opts.max_block_expansion as u64) else { return c };
+    if c.heaviest.is_empty() {
+        return c;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut found: HashSet<String> = HashSet::new();
+    let mut todo: Vec<&str> = vec![l.block.as_str()];
+    while let Some(name) = todo.pop() {
+        let Some(blk) = d.block(name) else { continue };
+        if !seen.insert(blk.name.as_str()) {
+            continue;
+        }
+        for e in blk.entities.iter() {
+            let inner = match &e.kind {
+                EntityKind::Insert(i) => Some(i.block.as_str()),
+                EntityKind::MLeader(m) => m.block.as_ref().map(|i| i.block.as_str()),
+                EntityKind::Dimension(dm) => dm.block.as_deref(),
+                _ => None,
+            };
+            if let Some(n) = inner {
+                if let Some(b) = d.block(n) {
+                    found.insert(b.name.clone());
+                }
+                todo.push(n);
+            }
+        }
+    }
+    c.largest_holds = c.heaviest.iter().filter(|b| found.contains(&b.block)).map(|b| b.block.clone()).collect();
+    c
 }
 
 /// Count with `run` (the walk of the build's top-level objects under a [`Pass`]: the count and what it
@@ -334,7 +372,7 @@ pub struct BlockCensus {
 /// everything per block and per layer comes from it by arithmetic (what each layer switched off and each
 /// block drawn as boxes leaves, the outlines drawn). The only counts besides those two are the few that
 /// find how many of the heaviest blocks, boxed together, make the picture fit.
-fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus {
+fn census_of(opts: &Options, tables: bool, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus {
     let (total, stats) = run(Pass::default());
     let mut c = BlockCensus {
         total,
@@ -347,10 +385,11 @@ fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus 
         blocks_referenced: 0,
         total_if_listed_boxed: 0,
         boxed: Vec::new(),
+        largest_holds: Vec::new(),
     };
     let cap = opts.max_block_expansion as u64;
     let boxes = opts.blocks_as_boxes.as_deref().filter(|b| !b.is_empty());
-    if total <= cap && boxes.is_none() {
+    if (total <= cap || !tables) && boxes.is_none() {
         return c;
     }
     let noted = run(Pass { record: true, ..Pass::default() }).1;
@@ -363,7 +402,7 @@ fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus 
     if let Some(b) = boxes {
         c.boxed = b.names().map(|n| BoxedRefs { block: n.to_string(), outlines: narrow(noted.outlines.get(n).copied().unwrap_or(0)) }).collect();
     }
-    if total <= cap {
+    if total <= cap || !tables {
         return c;
     }
     let mut layers: Vec<(u128, LayerOff)> = Vec::new();
@@ -421,11 +460,11 @@ fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus 
 /// set.
 pub fn census_entities(d: &Drawing, ents: &[&Entity], plotting: bool, opts: &Options) -> BlockCensus {
     let table = super::count::LayerTable::new(d);
-    census_of(opts, |pass| {
+    dimension_holds(d, census_of(opts, true, |pass| {
         let mut counter = super::count::Counter::new(d, plotting, &[], pass, opts.blocks_as_boxes.as_deref(), &table, opts.cancel.as_deref());
         let n = ents.iter().map(|e| counter.top(e, d.anno_draw(e))).fold(0, u64::saturating_add);
         (n, counter.into_stats())
-    })
+    }), opts)
 }
 
 /// [`count_expansions`] with the notes: for [`build`] (`plotting` false) or [`build_plot`]
@@ -433,7 +472,15 @@ pub fn census_entities(d: &Drawing, ents: &[&Entity], plotting: bool, opts: &Opt
 /// contents. Counted from the block table without building.
 pub fn census_space(d: &Drawing, space: &Space, plotting: bool, opts: &Options) -> BlockCensus {
     let table = super::count::LayerTable::new(d);
-    census_of(opts, |pass| walk_space(d, space, plotting, opts, &table, pass))
+    dimension_holds(d, census_of(opts, true, |pass| walk_space(d, space, plotting, opts, &table, pass)), opts)
+}
+
+/// [`census_space`] without the tables past the limit (which layers to switch off, which blocks to draw as
+/// boxes): the total, the largest object, the layers, the arrays drawn short and the references drawn as
+/// boxes only, for a caller that never shows the tables.
+pub fn census_space_total(d: &Drawing, space: &Space, plotting: bool, opts: &Options) -> BlockCensus {
+    let table = super::count::LayerTable::new(d);
+    census_of(opts, false, |pass| walk_space(d, space, plotting, opts, &table, pass))
 }
 
 /// The block expansions of a build of `space` with `opts` (its limit, blocks drawn as boxes, its

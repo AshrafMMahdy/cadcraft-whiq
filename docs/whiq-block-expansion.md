@@ -552,3 +552,44 @@ only) `preview::lower_limit`.
   function `fn(&Drawing, &Space, &Value)` and the file writers are the same, so passing the session's stop to them means
   changing the hook types and every `IoHooks` literal in the tests of three crates. The engine's own count before the hook
   is stoppable.
+
+### Round 5 (small exact fixes)
+
+* **The refusal tables can be stopped.** `savings::derive` takes the build's stop flag and checks it per holder list while
+  the references are merged, per node in the `down`, `up` and name-set passes, and per name (layer, block, boxed block) in
+  the final loops; never per inner item. A stopped census is one to discard, as a stopped count is: the callers already
+  check the flag after it and answer "stopped as asked ... call again to make it". (Measured before: up to 21 s without
+  a stop on extreme drawings.) The plot hook that is not `complete_only` (`io/src/pdf.rs`, the census made by `sheet()` for
+  a sheet that is drawn) needed only the total, the largest object, the layers, the arrays drawn short and the outlines,
+  and showed no table, yet worked the tables out past the limit: it now calls `census_space_total`, which gives those and
+  never the tables. (The `complete_only` count keeps the tables: a sheet over the limit is refused with them.)
+* **A dimension, said truly.** `blocks_as_boxes` never applies to the dimension itself (it is drawn from its own block).
+  When its block refers to blocks that are in the heaviest list, drawing those as boxes does reduce it, and the refusal
+  says so and names them (`BlockCensus::largest_holds`: the blocks of the list that the largest dimension's block refers
+  to at any depth); when none is, it says that only the layer it is on can reduce it. Where the budget leaves such a block
+  out of the entries shown, it says "N of the blocks not listed here (heaviest_blocks_more)". The earlier sentence "only
+  switching off the layer it is on can reduce it" was false for a dimension whose block holds references.
+* **Wording.** "a dimension is drawn from its own block, and that block is not drawn as a box" is said only when the
+  largest object is a dimension (it used to be added to every "no block to box" answer, and said "drawn from its
+  definition"). "for N of the layers and blocks above" counts only the entries shown; when the budget left some out it
+  says "for N layers or blocks, some not listed here,".
+* **`blocks_as_boxes` given to a save of a drawing file** (`saveas`, `qsave`, `document.bytes`, `save_drawing`, `export`
+  to dxf / dwg) is not refused (the save is valid) and no longer ignored silently: the answer carries
+  `blocks_as_boxes_used: false` and `blocks_as_boxes_note`: "blocks_as_boxes was not used: it applies only when a picture
+  or PDF is made, and the drawing file is saved complete". `save_drawing` now lists `blocks_as_boxes` in its arguments
+  for this (it was dropped as an unknown argument before).
+* **One answer budget.** `answer_budget` and the runtime's trim of the answer both take the call's `max_bytes` (never
+  below 1,024 bytes) from `contract::answer_bytes`; the refusal's budget used to lack the floor.
+
+### Known cost
+
+Past the limit the refusal works out its tables, and for some shapes that is slow and memory-hungry (under the limit none
+of this runs). Measured, release build, one core:
+
+* A drawing over the limit with thousands of layers, each referencing a deep chain of blocks whose inner references are on
+  layer 0 (so each layer needs its own expansions of the whole chain): a chain 16 deep with 100 references per level,
+  referenced from 4,000 layers: 5.2 s and 300 MB; from 16,000 layers: 21 s and 1.5 GB.
+* The admitted quadratic shape (a layer cut both on each reference to a fat block and inside it): 1.28 s at 16,000
+  layers, 16.6 s at 64,000.
+
+The stop flag now ends the tables in these cases (above); no cap was put on them.

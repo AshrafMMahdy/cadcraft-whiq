@@ -2480,3 +2480,55 @@ fn refusal_shapes() {
         println!("{names} boxed names on the success path: {:?}", t.elapsed());
     }
 }
+
+/// The tables of a past-the-limit drawing stop when the stop flag is set (a stopped census is one to discard),
+/// `census_space_total` gives the total with no tables, and a dimension past the limit says which of the heaviest
+/// blocks its own block refers to.
+#[test]
+fn the_tables_stop_and_the_total_has_none_and_a_dimension_names_the_blocks_inside_it() {
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("P".into(), std::sync::Arc::new(lines_block("P", 3)));
+    d.blocks.insert("Q".into(), std::sync::Arc::new(lines_block("Q", 3)));
+    let mut dim = cadcraft_doc::Block::new("D");
+    dim.entities.push(block_entity(1, Common::default(), insert_of("P")));
+    dim.entities.push(block_entity(2, Common::default(), insert_of("P")));
+    d.blocks.insert("D".into(), std::sync::Arc::new(dim));
+    d.add(&Space::Model, Common::default(), dim_with_block("D")).unwrap();
+    d.add(&Space::Model, Common::default(), insert_of("Q")).unwrap();
+    let opts = Options { max_block_expansion: 5, ..Default::default() };
+    let full = census_space(&d, &Space::Model, false, &opts);
+    assert!(full.total > 5 && !full.heaviest.is_empty() && !full.layers_off.is_empty(), "{full:?}");
+    let names: Vec<&str> = full.heaviest.iter().map(|b| b.block.as_str()).collect();
+    assert!(names.contains(&"P") && names.contains(&"Q"), "{names:?}");
+    // The dimension's block refers to P, not to Q.
+    assert_eq!(full.largest.as_ref().map(|l| l.kind), Some("dimension"));
+    assert_eq!(full.largest_holds, vec!["P".to_string()]);
+    // The total alone: the same total, no tables.
+    let lean = census_space_total(&d, &Space::Model, false, &opts);
+    assert_eq!(lean.total, full.total);
+    assert!(lean.heaviest.is_empty() && lean.layers_off.is_empty() && lean.largest_holds.is_empty() && lean.blocks_referenced == 0, "{lean:?}");
+    // A stop set before the count: no tables come out of it.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stopped = Options { max_block_expansion: 5, cancel: Some(stop), ..Default::default() };
+    assert!(stopped.cancelled());
+    let c = census_space(&d, &Space::Model, false, &stopped);
+    assert!(c.heaviest.is_empty() && c.layers_off.is_empty(), "{c:?}");
+    // And the tables themselves stop: a recording worked out with the flag set gives nothing.
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    let table = super::count::LayerTable::new(&d);
+    let mut counter = super::count::Counter::new(
+        &d,
+        false,
+        &[],
+        super::count::Pass { record: true, ..Default::default() },
+        None,
+        &table,
+        Some(&flag),
+    );
+    for e in d.model.iter() {
+        counter.top(e, d.anno_draw(e));
+    }
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let stats = counter.into_stats();
+    assert!(stats.savings.is_empty() && stats.layer_savings.is_empty(), "stopped tables are empty");
+}

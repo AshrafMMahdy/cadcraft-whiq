@@ -21,6 +21,7 @@
 //! everything computed from it ("not known"), never a wrong number.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::count::{Node, Recorded, Target, WIDE_SATURATED as SAT, wadd as add};
 
@@ -153,7 +154,11 @@ impl Graph<'_> {
     }
 }
 
-pub(crate) fn derive(rec: &Recorded) -> Derived {
+/// The tables from the recorded references. Stops early when `cancel` is set (checked per node and per name):
+/// what comes back then is partial and the caller discards it, as it does a stopped count.
+pub(crate) fn derive(rec: &Recorded, cancel: Option<&AtomicBool>) -> Derived {
+    let stopped = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+    let none = || Derived { total: 0, blocks: HashMap::new(), layers: HashMap::new(), outlines: HashMap::new() };
     let nodes = rec.nodes.as_slice();
     // The references, summed per (holder, what it draws, layer).
     let mut at: HashMap<(u32, Target, u32), usize> = HashMap::new();
@@ -161,6 +166,9 @@ pub(crate) fn derive(rec: &Recorded) -> Derived {
     let lists = std::iter::once((None, rec.top.as_slice()))
         .chain(nodes.iter().enumerate().map(|(i, n)| (Some(u32::try_from(i).unwrap_or(u32::MAX)), n.sites.as_slice())));
     for (parent, sites) in lists {
+        if stopped() {
+            return none();
+        }
         for s in sites {
             let slot = *at.entry((parent.unwrap_or(u32::MAX), s.target, s.layer)).or_insert_with(|| {
                 let block = match s.target {
@@ -188,6 +196,9 @@ pub(crate) fn derive(rec: &Recorded) -> Derived {
     let mut g = Graph { nodes, items, held, down: vec![0; nodes.len()], up: vec![0; nodes.len()], rows: vec![Vec::new(); nodes.len()] };
     // down(n): bottom up.
     for &n in order.iter().rev() {
+        if stopped() {
+            return none();
+        }
         let mut d = u128::from(nodes.get(n as usize).map_or(0, |x| x.base));
         for f in g.held.get(n as usize).into_iter().flatten().filter_map(|&i| g.items.get(i as usize)) {
             d = add(d, g.cost(f));
@@ -206,6 +217,9 @@ pub(crate) fn derive(rec: &Recorded) -> Derived {
         }
     }
     for &n in &order {
+        if stopped() {
+            return none();
+        }
         let mine = up.get(n as usize).copied().unwrap_or(0);
         for f in g.held.get(n as usize).into_iter().flatten().filter_map(|&i| g.items.get(i as usize)) {
             if let Target::Node(c) = f.target
@@ -255,6 +269,9 @@ pub(crate) fn derive(rec: &Recorded) -> Derived {
     if bits > 0 {
         let words = bits.div_ceil(64);
         for &n in order.iter().rev() {
+            if stopped() {
+                return none();
+            }
             let mut row = vec![0u64; words];
             let set = |row: &mut Vec<u64>, b: usize| {
                 if let Some(w) = row.get_mut(b / 64) {
@@ -284,16 +301,25 @@ pub(crate) fn derive(rec: &Recorded) -> Derived {
     let mut memo: HashMap<u32, u128> = HashMap::new();
     let mut layers = HashMap::new();
     for (l, cut) in &by_layer {
+        if stopped() {
+            return none();
+        }
         let name = rec.layers.get(*l as usize).cloned().unwrap_or_default();
         layers.insert(name, g.removal(Name::Layer(*l), layer_bit.get(l).copied(), cut, &mut memo));
     }
     let mut blocks = HashMap::new();
     for (b, cut) in &by_block {
+        if stopped() {
+            return none();
+        }
         let name = rec.blocks.get(b).cloned().unwrap_or_default();
         blocks.insert(name, g.removal(Name::Block(*b), block_bit.get(b).copied(), cut, &mut memo));
     }
     let mut outlines = HashMap::new();
     for (b, list) in &by_boxed {
+        if stopped() {
+            return none();
+        }
         let mut sum = 0u128;
         for f in list.iter().filter_map(|&i| g.items.get(i as usize)) {
             if matches!(f.target, Target::Box { outline: true, .. }) {

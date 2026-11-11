@@ -64,6 +64,12 @@ pub mod code {
 /// Results above this many bytes of JSON are trimmed.
 pub const MAX_RESULT_BYTES: usize = 256 * 1024;
 
+/// The answer budget of a call: its `max_bytes` when given, else `default`, and never below 1,024 bytes.
+/// The runtime trims the answer to it and the refusals are kept within it: both take it from here.
+pub fn answer_bytes(args: &Value, default: usize) -> usize {
+    args.get("max_bytes").and_then(Value::as_u64).map_or(default, |b| usize::try_from(b).unwrap_or(usize::MAX)).max(1024)
+}
+
 /// A tool failure the caller can act on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolError {

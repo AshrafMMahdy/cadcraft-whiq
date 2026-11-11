@@ -297,7 +297,7 @@ impl<'a> Counter<'a> {
     pub(crate) fn into_stats(mut self) -> Stats {
         if self.record {
             let rec = Recorded { top: self.sites, nodes: self.nodes, layers: self.layer_names, blocks: self.block_names };
-            let got = super::savings::derive(&rec);
+            let got = super::savings::derive(&rec, self.cancel);
             self.stats.savings = got.blocks;
             self.stats.layer_savings = got.layers;
             self.stats.outlines = got.outlines;

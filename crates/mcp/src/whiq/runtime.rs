@@ -1068,11 +1068,7 @@ fn worker_loop(shared: &Shared, rx: mpsc::Receiver<Work>) {
                     progress: shared.progress.clone(),
                     caller: args.get("caller").and_then(Value::as_str).map(str::to_string),
                 };
-                let max = args
-                    .get("max_bytes")
-                    .and_then(Value::as_u64)
-                    .map_or(shared.config.settings.max_result_bytes, |b| usize::try_from(b).unwrap_or(usize::MAX))
-                    .max(1024);
+                let max = contract::answer_bytes(&args, shared.config.settings.max_result_bytes);
                 let from = match args.get("continue_from") {
                     Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
                     Some(Value::String(s)) => s.trim().parse().unwrap_or(0),
