@@ -20,7 +20,7 @@
 //! A reference to a block drawn as a box ([`BoxBlocks`](super::BoxBlocks), plus the blocks of a
 //! [`Pass`] being tried) costs one unit however big the block is, as the build takes one for it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cadcraft_doc::{AnnoDraw, Drawing, Entity, EntityKind, Handle, MAX_BLOCK_DEPTH};
@@ -71,13 +71,13 @@ pub(crate) struct Stats {
     /// The blocks the drawn references (not those drawn as boxes) refer to: the lower-case name
     /// is the key, the block's own spelling the value.
     pub blocks: BTreeMap<String, String>,
-    /// Only from a pass that records ([`Pass::record`]): for each block (its own spelling) what
-    /// the count falls by when every reference to it is drawn as a box, worked out from how often
-    /// each block copy is expanded, without a walk per block. Exact for a block that is not
-    /// (indirectly) part of itself; the blocks that are are in `cyclic`, and when the sums overflowed
-    /// or nothing was recorded `savings_unknown` is set.
-    pub savings: HashMap<String, u64>,
-    pub cyclic: BTreeSet<String>,
+    /// Only from a pass that records ([`Pass::record`]): for each block (its own spelling) what the
+    /// count falls by when every reference to it is drawn as a box, and for each layer (lower case)
+    /// what it falls by when that layer is switched off, worked out from how often each block copy is
+    /// expanded without a walk per block or layer. `None`: that figure overflowed (the walk of its own
+    /// is the way to it). When nothing was recorded `savings_unknown` is set.
+    pub savings: HashMap<String, Option<u64>>,
+    pub layer_savings: HashMap<String, Option<u64>>,
     pub savings_unknown: bool,
 }
 
@@ -111,14 +111,12 @@ impl Stats {
         for (k, v) in other.blocks {
             self.blocks.entry(k).or_insert(v);
         }
-        for (k, v) in other.savings {
-            let sum = self.savings.entry(k).or_insert(0);
-            match sum.checked_add(v) {
-                Some(t) => *sum = t,
-                None => self.savings_unknown = true,
+        for (mine, theirs) in [(&mut self.savings, other.savings), (&mut self.layer_savings, other.layer_savings)] {
+            for (k, v) in theirs {
+                let sum = mine.entry(k).or_insert(Some(0));
+                *sum = add(*sum, v);
             }
         }
-        self.cyclic.extend(other.cyclic);
         self.savings_unknown |= other.savings_unknown;
     }
 }
@@ -170,11 +168,21 @@ struct NodeKey {
 struct Site {
     /// The block a block reference refers to (its own spelling); `None` for a dimension's block.
     block: Option<String>,
-    child: NodeKey,
+    /// The layer the reference is drawn on (lower case).
+    layer: String,
+    /// The expansion the reference makes (`None`: a box, which expands nothing).
+    child: Option<NodeKey>,
     /// Copies drawn (cells of an array).
     copies: u64,
     /// What one copy costs.
     one: u64,
+}
+
+/// A layer of the table as the walk uses it.
+struct LayerInfo {
+    visible: bool,
+    plot: bool,
+    name: String,
 }
 
 /// What counting needs to know of the build it stands for.
@@ -192,6 +200,7 @@ pub(crate) struct Counter<'a> {
     extra_boxes: HashSet<&'a str>,
     /// Tally the boxes drawn for this block instead of counting expansions.
     tally: Option<&'a str>,
+    layers: HashMap<String, Option<LayerInfo>>,
     /// Record the references met, to work out [`Stats::savings`].
     record: bool,
     /// The references met in the contents being counted now (the top level when none is open).
@@ -226,6 +235,7 @@ impl<'a> Counter<'a> {
             extra_boxes: pass.extra_boxes.iter().map(String::as_str).collect(),
             tally: pass.tally,
             record: pass.record,
+            layers: HashMap::new(),
             sites: Vec::new(),
             nodes: HashMap::new(),
             cancel,
@@ -275,10 +285,9 @@ impl<'a> Counter<'a> {
             self.stats.savings_unknown = true;
             return self.stats;
         }
-        let (savings, cyclic, ok) = block_savings(&self.sites, &self.nodes);
-        self.stats.savings = savings;
-        self.stats.cyclic = cyclic;
-        self.stats.savings_unknown = !ok;
+        let (blocks, layers) = savings(&self.sites, &self.nodes);
+        self.stats.savings = blocks;
+        self.stats.layer_savings = layers;
         self.stats
     }
 
@@ -288,13 +297,24 @@ impl<'a> Counter<'a> {
     }
 
     /// Whether `e` is drawn at all inside a reference on `block_layer` (see `resolve_common`).
-    fn drawn(&self, e: &Entity, block_layer: Option<&str>) -> bool {
+    fn drawn(&mut self, e: &Entity, block_layer: Option<&str>) -> bool {
         if self.d.is_hidden_object(e.handle) || !e.common.visible {
             return false;
         }
         let name = Self::layer_of(e, block_layer);
-        self.d.layer(name).is_none_or(|l| l.visible() && (!self.plotting || l.plot))
+        let plotting = self.plotting;
+        self.layer_info(name).is_none_or(|l| l.visible && (!plotting || l.plot))
             && !self.frozen.iter().chain(self.off).any(|f| f.eq_ignore_ascii_case(name))
+    }
+
+    /// What the walk needs of the layer `name` (the layer table is searched once per name, not once per
+    /// object: a drawing can have thousands of layers).
+    fn layer_info(&mut self, name: &str) -> Option<&LayerInfo> {
+        if !self.layers.contains_key(name) {
+            let info = self.d.layer(name).map(|l| LayerInfo { visible: l.visible(), plot: l.plot, name: l.name.clone() });
+            self.layers.insert(name.to_string(), info);
+        }
+        self.layers.get(name).and_then(Option::as_ref)
     }
 
     /// The layer layer-0 objects inside the reference `e` take (see `sub_ctx`).
@@ -303,11 +323,11 @@ impl<'a> Counter<'a> {
     }
 
     fn note_layer(&mut self, name: &str) {
-        let Some(l) = self.d.layer(name) else {
+        let Some(found) = self.layer_info(name).map(|l| l.name.clone()) else {
             self.stats.off_table = true;
             return;
         };
-        self.stats.layers.entry(l.name.to_ascii_lowercase()).or_insert_with(|| l.name.clone());
+        self.stats.layers.entry(found.to_ascii_lowercase()).or_insert(found);
     }
 
     fn entity(&mut self, e: &Entity, depth: usize, block_layer: Option<&str>) -> u64 {
@@ -347,7 +367,7 @@ impl<'a> Counter<'a> {
             }
         };
         if let Some(child) = node {
-            self.sites.push(Site { block: None, child, copies: 1, one: n });
+            self.sites.push(Site { block: None, layer: Self::layer_of(e, block_layer).to_ascii_lowercase(), child: Some(child), copies: 1, one: n });
         }
         n
     }
@@ -360,10 +380,15 @@ impl<'a> Counter<'a> {
         let Some(blk) = d.block(&ins.block) else { return 0 };
         self.note_layer(Self::layer_of(e, block_layer));
         if self.boxed(&blk.name) {
+            if self.record {
+                // A box costs one piece and expands nothing; it is still a reference on its layer.
+                self.sites.push(Site { block: None, layer: Self::layer_of(e, block_layer).to_ascii_lowercase(), child: None, copies: 1, one: 1 });
+            }
             // One outline for the whole reference (an array included): one unit, contents not walked.
             return match self.tally {
                 None => 1,
-                Some(t) if t == blk.name => 1,
+                // Only the outlines that are drawn (a block with nothing in it draws none).
+                Some(t) if t == blk.name => u64::from(self.boxes.is_some_and(|b| b.outline(&blk.name, ins, blk.base.xy(), depth).is_some())),
                 Some(_) => 0,
             };
         }
@@ -400,7 +425,13 @@ impl<'a> Counter<'a> {
             }
         };
         if let Some(child) = node {
-            self.sites.push(Site { block: Some(blk.name.clone()), child, copies, one });
+            self.sites.push(Site {
+                block: Some(blk.name.clone()),
+                layer: Self::layer_of(e, block_layer).to_ascii_lowercase(),
+                child: Some(child),
+                copies,
+                one,
+            });
         }
         copies.saturating_mul(one)
     }
@@ -419,69 +450,185 @@ fn reference_of(e: &Entity) -> Option<(&'static str, String)> {
     }
 }
 
-/// What drawing all the references to a block as boxes takes off the count, for every block met,
-/// and the blocks that are part of themselves; `false` when a sum overflowed (then nothing here can
-/// be used). `top` are the references of the top-level objects, `nodes` the references inside each
-/// block expansion.
-fn block_savings(top: &[Site], nodes: &HashMap<NodeKey, (String, Vec<Site>)>) -> (HashMap<String, u64>, BTreeSet<String>, bool) {
-    let mut ok = true;
-    let mut mult: HashMap<NodeKey, u64> = HashMap::new();
-    let mut saving: HashMap<String, u64> = HashMap::new();
-    // `parent` expansions of the contents holding `sites`: each reference adds its copies to how
-    // often its block is expanded, and its saving is `parent x (copies x one copy - 1)`.
-    let mut visit = |parent: u64, sites: &[Site], mult: &mut HashMap<NodeKey, u64>| {
-        for s in sites {
-            match parent.checked_mul(s.copies).and_then(|c| c.checked_add(mult.get(&s.child).copied().unwrap_or(0))) {
-                Some(t) => {
-                    mult.insert(s.child.clone(), t);
-                }
-                None => ok = false,
-            }
-            if let Some(b) = &s.block {
-                let each = s.copies.checked_mul(s.one).map(|c| c.saturating_sub(1));
-                match each.and_then(|e| e.checked_mul(parent)).and_then(|v| v.checked_add(saving.get(b).copied().unwrap_or(0))) {
-                    Some(t) => {
-                        saving.insert(b.clone(), t);
-                    }
-                    None => ok = false,
-                }
-            }
-        }
-    };
-    visit(1, top, &mut mult);
-    // Depth grows by one along every reference, so by depth every expansion is reached after all
-    // the expansions that hold a reference to it.
+fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    a?.checked_add(b?)
+}
+
+fn mul(a: Option<u64>, b: u64) -> Option<u64> {
+    a?.checked_mul(b)
+}
+
+/// A reference of the walk with its place in the graph of block expansions.
+struct Flat<'a> {
+    /// The expansion that holds it (`None`: a top-level object).
+    parent: Option<usize>,
+    child: Option<usize>,
+    block: Option<&'a str>,
+    layer: &'a str,
+    copies: u64,
+    one: u64,
+}
+
+/// What the count falls by when all the references to a block are drawn as boxes, for every block met,
+/// and when all the references on a layer are switched off, for every layer met, from how often each
+/// block copy is expanded, with no walk per block or layer. `top` are the references of the top-level
+/// objects, `nodes` those inside each block expansion.
+///
+/// Expansions are nodes of a graph whose edges (the references) raise the depth by one, so by depth every
+/// node comes after all that hold a reference to it. `mult[n]` is how often the node is expanded. A
+/// cut (a block's references, a layer's references) takes off, for each of its references, the
+/// expansions of the holding node times `copies x one copy - 1` (a box costs one; a layer switched off
+/// costs nothing). That is exact when no cut reference sits inside an expansion that another of them
+/// replaces; when one does (a block holding itself, a layer's reference holding another on the layer,
+/// as layer 0 contents do) the expansions that pass through a cut reference are taken away first
+/// (`through`, found over the nodes below the cut only), so the cost of a cut is that of the part of the
+/// graph below it, not of the drawing.
+fn savings(top: &[Site], nodes: &HashMap<NodeKey, (String, Vec<Site>)>) -> (HashMap<String, Option<u64>>, HashMap<String, Option<u64>>) {
     let mut keys: Vec<&NodeKey> = nodes.keys().collect();
     keys.sort_by_key(|k| k.depth);
-    for k in keys {
-        let m = mult.get(k).copied().unwrap_or(0);
-        if let Some((_, sites)) = nodes.get(k) {
-            visit(m, sites, &mut mult);
+    let idx: HashMap<&NodeKey, usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let mut flat: Vec<Flat> = Vec::new();
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); keys.len()];
+    let mut block_of: Vec<&str> = Vec::with_capacity(keys.len());
+    let mut lists: Vec<(Option<usize>, &[Site])> = vec![(None, top)];
+    for (i, k) in keys.iter().enumerate() {
+        let (block, sites) = nodes.get(*k).map(|(b, v)| (b.as_str(), v.as_slice())).unwrap_or(("", &[]));
+        block_of.push(block);
+        lists.push((Some(i), sites));
+    }
+    for (parent, sites) in lists {
+        for s in sites {
+            let child = match &s.child {
+                Some(k) => match idx.get(k) {
+                    Some(&c) => Some(c),
+                    None => continue,
+                },
+                None => None,
+            };
+            if child.is_some()
+                && let Some(o) = parent.and_then(|p| out.get_mut(p))
+            {
+                o.push(flat.len());
+            }
+            flat.push(Flat { parent, child, block: s.block.as_deref(), layer: &s.layer, copies: s.copies, one: s.one });
         }
     }
-    // The blocks that are part of themselves, however deep: their copies are not independent.
-    let mut ids: HashMap<String, usize> = HashMap::new();
-    let mut edges: Vec<Vec<usize>> = Vec::new();
-    let mut id_of = |n: &str, edges: &mut Vec<Vec<usize>>| -> usize {
-        if let Some(i) = ids.get(n) {
-            return *i;
+    // How often each expansion happens.
+    let mut mult: Vec<Option<u64>> = vec![Some(0); keys.len()];
+    for f in flat.iter().filter(|f| f.parent.is_none()) {
+        if let Some(m) = f.child.and_then(|c| mult.get_mut(c)) {
+            *m = add(*m, Some(f.copies));
         }
-        edges.push(Vec::new());
-        ids.insert(n.to_string(), edges.len() - 1);
-        edges.len() - 1
-    };
-    for (block, sites) in nodes.values() {
-        let from = id_of(block, &mut edges);
-        for b in sites.iter().filter_map(|s| s.block.as_deref()) {
-            let to = id_of(b, &mut edges);
-            if let Some(e) = edges.get_mut(from) {
-                e.push(to);
+    }
+    for i in 0..keys.len() {
+        let here = mult.get(i).copied().flatten();
+        for &fi in out.get(i).map(Vec::as_slice).unwrap_or_default() {
+            if let Some(f) = flat.get(fi)
+                && let Some(m) = f.child.and_then(|c| mult.get_mut(c))
+            {
+                *m = add(*m, mul(here, f.copies));
             }
         }
     }
-    let by_id: HashMap<usize, &String> = ids.iter().map(|(n, i)| (*i, n)).collect();
-    let cyclic = on_a_cycle(&edges).into_iter().filter_map(|i| by_id.get(&i).map(|n| (*n).clone())).collect();
-    (saving, cyclic, ok)
+    let times = |f: &Flat| -> Option<u64> {
+        match f.parent {
+            None => Some(1),
+            Some(p) => mult.get(p).copied().flatten(),
+        }
+    };
+    let cost = |f: &Flat, layer: bool| -> Option<u64> {
+        if f.one == COUNT_SATURATED {
+            return None;
+        }
+        f.copies.checked_mul(f.one).map(|c| if layer { c } else { c.saturating_sub(1) })
+    };
+    // The saving of the cut `which` (indices into `flat`): its references switched off (`layer`) or
+    // drawn as boxes. `nested`: a cut reference may sit below another of the cut.
+    let saving = |which: &[usize], layer: bool, nested: bool, is_cut: &dyn Fn(&Flat) -> bool| -> Option<u64> {
+        let mut through: HashMap<usize, Option<u64>> = HashMap::new();
+        if nested {
+            // The expansions below the cut and how often each is reached through a cut reference.
+            let mut cone: std::collections::BTreeSet<usize> = which.iter().filter_map(|&i| flat.get(i)).filter_map(|f| f.child).collect();
+            let mut stack: Vec<usize> = cone.iter().copied().collect();
+            while let Some(n) = stack.pop() {
+                for &fi in out.get(n).map(Vec::as_slice).unwrap_or_default() {
+                    if let Some(c) = flat.get(fi).and_then(|f| f.child)
+                        && cone.insert(c)
+                    {
+                        stack.push(c);
+                    }
+                }
+            }
+            for f in which.iter().filter_map(|&i| flat.get(i)) {
+                if let Some(c) = f.child {
+                    let t = through.entry(c).or_insert(Some(0));
+                    *t = add(*t, mul(times(f), f.copies));
+                }
+            }
+            for &n in &cone {
+                let here = through.get(&n).copied().flatten();
+                for &fi in out.get(n).map(Vec::as_slice).unwrap_or_default() {
+                    if let Some(f) = flat.get(fi)
+                        && !is_cut(f)
+                        && let Some(c) = f.child
+                    {
+                        let t = through.entry(c).or_insert(Some(0));
+                        *t = add(*t, mul(here, f.copies));
+                    }
+                }
+            }
+        }
+        let mut sum = Some(0u64);
+        for f in which.iter().filter_map(|&i| flat.get(i)) {
+            let held = match f.parent {
+                Some(p) => through.get(&p).copied().unwrap_or(Some(0)),
+                None => Some(0),
+            };
+            let once = times(f).zip(held).and_then(|(a, h)| a.checked_sub(h));
+            sum = add(sum, once.zip(cost(f, layer)).and_then(|(o, c)| o.checked_mul(c)));
+        }
+        sum
+    };
+    let mut by_block: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_layer: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, f) in flat.iter().enumerate() {
+        if let Some(b) = f.block {
+            by_block.entry(b).or_default().push(i);
+        }
+        by_layer.entry(f.layer).or_default().push(i);
+    }
+    // The blocks that are part of themselves, however deep (the only ones whose references nest).
+    let mut ids: HashMap<&str, usize> = HashMap::new();
+    let mut edges: Vec<Vec<usize>> = Vec::new();
+    for f in &flat {
+        if let (Some(p), Some(to)) = (f.parent, f.block) {
+            let from = block_of.get(p).copied().unwrap_or("");
+            let mut intern = |n| match ids.get(n) {
+                Some(i) => *i,
+                None => {
+                    edges.push(Vec::new());
+                    ids.insert(n, edges.len() - 1);
+                    edges.len() - 1
+                }
+            };
+            let a = intern(from);
+            let b = intern(to);
+            if let Some(e) = edges.get_mut(a) {
+                e.push(b);
+            }
+        }
+    }
+    let on_cycle: std::collections::HashSet<usize> = on_a_cycle(&edges).into_iter().collect();
+    let mut blocks = HashMap::new();
+    for (b, which) in &by_block {
+        let nested = ids.get(b).is_some_and(|i| on_cycle.contains(i));
+        blocks.insert(b.to_string(), saving(which, false, nested, &|f: &Flat| f.block == Some(*b)));
+    }
+    let mut layers = HashMap::new();
+    for (l, which) in &by_layer {
+        layers.insert(l.to_string(), saving(which, true, true, &|f: &Flat| f.layer == *l));
+    }
+    (blocks, layers)
 }
 
 /// The vertices of the graph `edges` (adjacency lists) that lie on a cycle (a self edge or a

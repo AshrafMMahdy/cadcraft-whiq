@@ -105,6 +105,38 @@ pub(super) fn deliver_file(cmd: &str, path: &str, bytes: &[u8], hook: Option<sup
     deliver(&name, mime, bytes).map_err(|e| bad(cmd, format!("{name}: {e}")))
 }
 
+// ---------- COMPLETE PICTURES ----------
+
+/// With [`Session::complete_pictures`] on, refuse (before anything is drawn or written) a picture of one
+/// of `spaces` (`true`: as a plot builds it, else as the screen build) that needs more block pieces than
+/// one picture draws. `boxed` are the block names of a `blocks_as_boxes` parameter, which count one
+/// piece each. The refusal says what happened and where a complete picture can be made.
+pub(crate) fn picture_fits(s: &Session, cmd: &str, spaces: &[(Space, bool)], p: &Value) -> Result<()> {
+    let Some(limit) = s.complete_pictures else { return Ok(()) };
+    let d = s.doc()?;
+    let names: Vec<String> = match p.get("blocks_as_boxes") {
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        Some(Value::String(n)) => vec![n.clone()],
+        _ => Vec::new(),
+    };
+    let boxes = if names.is_empty() { None } else { cadcraft_render::BoxBlocks::new(d, &names).ok().map(Arc::new) };
+    for (space, plotting) in spaces {
+        let opts = cadcraft_render::Options { max_block_expansion: limit, blocks_as_boxes: boxes.clone(), ..Default::default() };
+        let n = cadcraft_render::census_space(d, space, *plotting, &opts).total;
+        if n > limit as u64 {
+            let need = if n == cadcraft_render::COUNT_SATURATED { "more than can be counted".to_string() } else { n.to_string() };
+            return Err(bad(
+                cmd,
+                format!(
+                    "the picture of {} needs {need} block pieces (every copy of a block and every object in it, nested blocks counted) and one picture draws at most {limit}: no picture was made and no file was written. Make it with the `export` tool instead (arguments: {{\"path\": \"<file>.pdf\" (or .svg / .png), \"space\": \"<layout or model>\", \"blocks_as_boxes\": [\"<block name>\"], \"layers_off\": [\"<layer>\"]}}; or `render_preview` with the same arguments to look at it): its answer lists which blocks to give in blocks_as_boxes and which layers to switch off so the picture is complete, then call it again with them",
+                    space.tab_name()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------- EXPORT ----------
 
 fn run_export(s: &mut Session, p: &Value) -> Result<Value> {
@@ -116,6 +148,12 @@ fn run_export(s: &mut Session, p: &Value) -> Result<Value> {
     };
     if !EXPORT_FORMATS.contains(&format.as_str()) {
         return Err(bad("export", "`format` must be dxf, dwg, svg, png or pdf (or give a `path` with one of those extensions)"));
+    }
+    // svg and png are built as the screen is (plotting off), a pdf as a plot is.
+    match format.as_str() {
+        "svg" | "png" => picture_fits(s, "export", &[(Space::Model, false)], p)?,
+        "pdf" => picture_fits(s, "export", &[(Space::Model, true)], p)?,
+        _ => {}
     }
     let bytes = (hooks.write)(s.doc()?, &format!("export.{format}")).map_err(|e| bad("export", e))?;
     match path {
@@ -305,6 +343,7 @@ fn plot_scale(b: &Bounds2, sheet: &Sheet, fit: bool, scale: Option<f64>) -> f64 
 
 fn run_preview(s: &mut Session, p: &Value) -> Result<Value> {
     let space = plot_space("preview", s, p)?;
+    picture_fits(s, "preview", &[(space.clone(), true)], p)?;
     let d = s.doc()?;
     let mut page = match space.layout() {
         Some(n) => d.layout(n).map(|l| l.page.clone()).unwrap_or_default(),
@@ -412,6 +451,9 @@ fn run_publish(s: &mut Session, p: &Value) -> Result<Value> {
     if sheets.len() > MAX_SHEETS {
         return Err(bad("publish", format!("at most {MAX_SHEETS} sheets can be published at once")));
     }
+    // Every sheet is counted before any file is written: one sheet over the limit and none is published.
+    let spaces: Vec<(Space, bool)> = sheets.iter().map(|n| (if n == "Model" { Space::Model } else { Space::Paper(n.clone()) }, true)).collect();
+    picture_fits(s, "publish", &spaces, p)?;
     let base = str_param(p, "path").map(|path| {
         let pb = std::path::Path::new(path);
         let stem = pb.file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Drawing".into());
@@ -516,6 +558,9 @@ fn run_pdfbook(s: &mut Session, p: &Value) -> Result<Value> {
     if books.is_empty() {
         return Err(bad("pdfbook", format!("no closed polylines {frame_height} mm high (sheet frames) in model space")));
     }
+    // Every page of every book is a sheet of the whole of model space (a plot window does not leave out
+    // what is outside it): counted before any file is written.
+    picture_fits(s, "pdfbook", &[(Space::Model, true)], p)?;
     let target = str_param(p, "path").map(str::to_string).or_else(|| s.state().ok().and_then(|st| st.path.clone()));
     let pb = target.as_deref().map(std::path::Path::new);
     let dir = pb.and_then(std::path::Path::parent).map(std::path::Path::to_path_buf).unwrap_or_default();

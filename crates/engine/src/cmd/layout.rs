@@ -827,6 +827,13 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
             None => o.remove("plotTransparency"),
         };
     }
+    // As the plotter takes them: `pages` plot model space, else `layouts` those sheets, else `space`.
+    let counted: Vec<Space> = match (&p.get("pages"), &sheets) {
+        (Some(_), _) => vec![Space::Model],
+        (None, Some(names)) => names.iter().map(|n| if n.eq_ignore_ascii_case("model") { Space::Model } else { Space::Paper(n.clone()) }).collect(),
+        (None, None) => vec![space.clone()],
+    };
+    super::exchange::picture_fits(s, cmd, &counted.into_iter().map(|c| (c, true)).collect::<Vec<_>>(), p)?;
     let bytes = hook(s.doc()?, &space, &opts).map_err(|e| bad(cmd, e))?;
     let layout = match &sheets {
         Some(names) => names.first().cloned().unwrap_or_default(),

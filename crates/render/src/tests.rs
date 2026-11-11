@@ -1201,16 +1201,23 @@ fn count_equals_build_with_boxes(d: &Drawing, space: &Space, what: &str) {
     let mut sets: Vec<Vec<String>> = names.iter().map(|n| vec![n.clone()]).collect();
     sets.push(names.clone());
     for set in sets {
-        let boxes = std::sync::Arc::new(BoxBlocks::new(d, &set));
+        let boxes = std::sync::Arc::new(BoxBlocks::new(d, &set).unwrap());
         let o = Options { blocks_as_boxes: Some(boxes), ..uncapped() };
         let built = build(d, space, &o);
         let c = census_space(d, space, false, &o);
         assert_eq!(c.total, built.expanded as u64, "{what}: boxes {set:?}");
         let plot = build_plot(d, space, &o).expanded as u64;
         assert_eq!(count_space_with(d, space, true, &o), plot, "{what}: boxes {set:?} (plot)");
+        // A subset of the objects (what a tile or an export slice builds): the count of those objects is
+        // what `build_entities` expands.
+        if matches!(space, Space::Model) {
+            let subset: Vec<&cadcraft_doc::Entity> = d.model.iter().map(|e| e.as_ref()).step_by(3).collect();
+            let built = build_entities(d, subset.iter().copied(), &o).expanded as u64;
+            assert_eq!(census_entities(d, &subset, false, &o).total, built, "{what}: boxes {set:?} (subset)");
+        }
         if matches!(what, "nested" | "layers and arrays" | "self reference") {
             let outlines = built.prims.iter().filter(|p| p.kind == Kind::Polyline && p.len == 5).count() as u64;
-            assert_eq!(c.boxed.iter().map(|b| b.references).sum::<u64>(), outlines, "{what}: boxes {set:?}");
+            assert_eq!(c.boxed.iter().map(|b| b.outlines).sum::<u64>(), outlines, "{what}: boxes {set:?}");
             assert_eq!(c.boxed.len(), set.len(), "{what}");
         }
     }
@@ -1225,7 +1232,7 @@ fn heaviest_equals_walks(d: &Drawing, space: &Space, what: &str) {
     let c = census_space(d, space, false, &o);
     let mut expected = Vec::new();
     for name in d.blocks.keys() {
-        let boxed = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(d, std::slice::from_ref(name)))), ..uncapped() };
+        let boxed = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(d, std::slice::from_ref(name)).unwrap())), ..uncapped() };
         let after = census_space(d, space, false, &boxed).total;
         if after < c.total {
             expected.push((name.clone(), after));
@@ -1235,6 +1242,22 @@ fn heaviest_equals_walks(d: &Drawing, space: &Space, what: &str) {
     let got: Vec<(String, u64)> = c.heaviest.iter().map(|h| (h.block.clone(), h.total_if_boxed)).collect();
     // The list ends where boxing all of it fits (never at a limit of 1 here, unless one block saves everything).
     assert_eq!(got, expected, "{what}");
+    // The layers: what the census says switching each reference layer off leaves is what a count with it
+    // off says.
+    let mut layers_expected = Vec::new();
+    for l in &c.reference_layers {
+        let mut off = d.clone();
+        if let Some(layer) = off.layer_mut(l) {
+            layer.on = false;
+        }
+        let after = census_space(&off, space, false, &uncapped()).total;
+        if after < c.total {
+            layers_expected.push((l.clone(), after));
+        }
+    }
+    layers_expected.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let layers_got: Vec<(String, u64)> = c.layers_off.iter().map(|l| (l.layer.clone(), l.total_if_off)).collect();
+    assert_eq!(layers_got, layers_expected, "{what} (layers)");
 }
 
 fn count_space_with(d: &Drawing, space: &Space, plotting: bool, o: &Options) -> u64 {
@@ -1893,7 +1916,7 @@ fn insert_struct(block: &str) -> cadcraft_doc::Insert {
 
 fn boxed_options(d: &Drawing, names: &[&str]) -> Options {
     let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-    Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(d, &names))), ..uncapped() }
+    Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(d, &names).unwrap())), ..uncapped() }
 }
 
 fn near(a: Vec2, x: f64, y: f64) -> bool {
@@ -1985,9 +2008,9 @@ fn a_boxed_block_nested_in_another_is_boxed_at_every_depth() {
     assert_eq!(list.prims.len(), 2);
     let c = census_space(&d, &Space::Model, false, &o);
     assert_eq!(c.total, 10);
-    let mut tally: Vec<(String, u64)> = c.boxed.iter().map(|b| (b.block.clone(), b.references)).collect();
+    let mut tally: Vec<(String, u64)> = c.boxed.iter().map(|b| (b.block.clone(), b.outlines)).collect();
     tally.sort();
-    assert_eq!(tally, vec![("Empty".to_string(), 2), ("Inner".to_string(), 2)]);
+    assert_eq!(tally, vec![("Empty".to_string(), 0), ("Inner".to_string(), 2)]);
     // Inner's box is (0..10, 0..4) around base (2, 1): in Inner's frame x in -2..8, y in -1..3; turned a
     // quarter (x' = -y, y' = x) and moved by (5, 0): x in 2..6, y in -2..8; then by the Outer's insertion point.
     let q = list.points(&list.prims[0]);
@@ -2087,4 +2110,172 @@ fn refusal_cost() {
             c.total_if_listed_boxed
         );
     }
+}
+
+/// `n` blocks `S0`..`S{n-1}`, each a line and `selfs` references to itself, each referred to `refs`
+/// times from model space (`Cyc` extra: see the saturating shape).
+fn self_referencing_blocks(n: usize, selfs: usize, refs: usize) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    for b in 0..n {
+        let name = format!("S{b}");
+        let mut blk = lines_block(&name, 1);
+        for k in 0..selfs {
+            blk.entities.push(block_entity(100 + k as u64, Common::default(), EntityKind::Insert(insert_struct(&name))));
+        }
+        d.blocks.insert(name.clone(), std::sync::Arc::new(blk));
+        for r in 0..refs {
+            let mut i = insert_struct(&name);
+            i.insert = Vec3::new(r as f64 * 10.0, b as f64 * 10.0, 0.0);
+            d.add(&Space::Model, Common::default(), EntityKind::Insert(i)).unwrap();
+        }
+    }
+    d
+}
+
+fn census_time(d: &Drawing, cap: usize) -> (std::time::Duration, BlockCensus) {
+    let t = std::time::Instant::now();
+    let c = census_space(d, &Space::Model, false, &Options { max_block_expansion: cap, ..Default::default() });
+    (t.elapsed(), c)
+}
+
+/// The refusal's tables cost about as much as the drawing is big, not its square: blocks that refer to
+/// themselves (each a cycle of its own), a saturated total with one block that overflows, and thousands
+/// of layers; and the figures are still what a count says. (Before: 2,000 self-referencing blocks took 43 s.)
+#[test]
+fn the_refusal_grows_with_the_drawing_not_with_its_square() {
+    // The figures are exact on a small one (cycles: the nested path).
+    let small = self_referencing_blocks(30, 2, 1);
+    heaviest_equals_walks(&small, &Space::Model, "self referencing blocks");
+    // Time: 2,000 self-referencing blocks, each referred to once.
+    let (t, c) = census_time(&self_referencing_blocks(2_000, 2, 1), 100);
+    assert!(c.total > 100 && !c.heaviest.is_empty());
+    assert!(t < std::time::Duration::from_secs(10), "{t:?}");
+    // 4,000 blocks x 30 references plus one block holding 20 references to itself: the total saturates.
+    let mut d = self_referencing_blocks(4_000, 0, 30);
+    let mut cyc = lines_block("Cyc", 1);
+    for k in 0..20u64 {
+        cyc.entities.push(block_entity(100 + k, Common::default(), EntityKind::Insert(insert_struct("Cyc"))));
+    }
+    d.blocks.insert("Cyc".into(), std::sync::Arc::new(cyc));
+    d.add(&Space::Model, Common::default(), EntityKind::Insert(insert_struct("Cyc"))).unwrap();
+    let (t, c) = census_time(&d, 1_000);
+    assert_eq!(c.total, COUNT_SATURATED);
+    assert!(t < std::time::Duration::from_secs(10), "{t:?}");
+    // Boxing Cyc alone leaves the 120,000 others' pieces + 1: that is what a walk says too.
+    let boxed = Options { blocks_as_boxes: Some(std::sync::Arc::new(BoxBlocks::new(&d, &["Cyc".to_string()]).unwrap())), ..uncapped() };
+    let after = census_space(&d, &Space::Model, false, &boxed).total;
+    assert_eq!(c.heaviest.iter().map(|h| (h.block.as_str(), h.total_if_boxed)).collect::<Vec<_>>(), vec![("Cyc", after)]);
+    // 3,000 layers of references, layer 0 contents following them.
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("Tree".into(), std::sync::Arc::new(lines_block("Tree", 4)));
+    for l in 0..3_000 {
+        d.layers.push(layer_named(&format!("L{l}"), true));
+        for r in 0..100 {
+            let mut i = insert_struct("Tree");
+            i.insert = Vec3::new(r as f64 * 10.0, l as f64 * 10.0, 0.0);
+            d.add(&Space::Model, Common { layer: format!("L{l}"), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+        }
+    }
+    let (t, c) = census_time(&d, 1_000);
+    assert_eq!(c.layers_off.len(), 3_000);
+    assert_eq!(c.layers_off[0].total_if_off, 300_000 * 5 / 2 * 2 - 500);
+    assert!(t < std::time::Duration::from_secs(10), "{t:?}");
+}
+
+/// A stop during the tables ends them early (the callers then discard the count).
+#[test]
+fn a_stop_ends_the_heaviest_pass() {
+    let d = self_referencing_blocks(6_000, 0, 20);
+    let (full, _) = census_time(&d, 100);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let o = Options { max_block_expansion: 100, cancel: Some(cancel.clone()), ..Default::default() };
+    let flag = cancel.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(full / 4);
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let t = std::time::Instant::now();
+    let _ = census_space(&d, &Space::Model, false, &o);
+    let stopped = t.elapsed();
+    let _ = stopper.join();
+    assert!(stopped < full.mul_f64(0.9), "{stopped:?} against {full:?}");
+}
+
+/// `cargo test -p cadcraft-render refusal_shapes --release -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn refusal_shapes() {
+    for n in [250, 1_000, 2_000, 4_000, 20_000] {
+        let (t, c) = census_time(&self_referencing_blocks(n, 2, 1), 100);
+        println!("{n} self-referencing blocks: {t:?} ({} listed)", c.heaviest.len());
+    }
+    let mut d = self_referencing_blocks(4_000, 0, 30);
+    let mut cyc = lines_block("Cyc", 1);
+    for k in 0..20u64 {
+        cyc.entities.push(block_entity(100 + k, Common::default(), EntityKind::Insert(insert_struct("Cyc"))));
+    }
+    d.blocks.insert("Cyc".into(), std::sync::Arc::new(cyc));
+    d.add(&Space::Model, Common::default(), EntityKind::Insert(insert_struct("Cyc"))).unwrap();
+    println!("4000 blocks x 30 + saturating Cyc: {:?}", census_time(&d, 1_000).0);
+    for layers in [1_000, 5_000, 20_000] {
+        let mut d = Drawing::new_imperial();
+        d.blocks.insert("Tree".into(), std::sync::Arc::new(lines_block("Tree", 4)));
+        for l in 0..layers {
+            d.layers.push(layer_named(&format!("L{l}"), true));
+            for r in 0..(300_000 / layers) {
+                let mut i = insert_struct("Tree");
+                i.insert = Vec3::new(r as f64 * 10.0, l as f64 * 10.0, 0.0);
+                d.add(&Space::Model, Common { layer: format!("L{l}"), ..Default::default() }, EntityKind::Insert(i)).unwrap();
+            }
+        }
+        println!("{layers} reference layers ({} objects): {:?}", d.model.len(), census_time(&d, 1_000).0);
+    }
+}
+
+/// The cases where a box is easy to get wrong still agree with the build: a mirrored reference, a zero
+/// scale, a non-uniformly scaled rotated MINSERT nested under a ByBlock reference (its outline takes
+/// the parent's colour, not the layer's), a 12,000-column array of a block that holds a boxed MINSERT
+/// (the array is drawn with 10,000), counted and built over the whole drawing and over a subset.
+#[test]
+fn boxes_agree_with_the_build_for_odd_references() {
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("Inner".into(), std::sync::Arc::new(box_block("Inner")));
+    // Outer: a 3 x 2 array of Inner, scaled (2, 0.5), turned 0.7, colour ByBlock.
+    let mut outer = cadcraft_doc::Block::new("Outer");
+    let mut i = insert_struct("Inner");
+    i.scale = Vec3::new(2.0, 0.5, 1.0);
+    i.rotation = 0.7;
+    (i.cols, i.rows, i.col_spacing, i.row_spacing) = (3, 2, 15.0, 9.0);
+    outer.entities.push(block_entity(1, Common { color: Color::ByBlock, ..Default::default() }, EntityKind::Insert(i)));
+    d.blocks.insert("Outer".into(), std::sync::Arc::new(outer));
+    // Row: a block holding a MINSERT of Inner; an array of 12,000 Rows.
+    let mut row = cadcraft_doc::Block::new("Row");
+    let mut m = insert_struct("Inner");
+    (m.cols, m.rows, m.col_spacing, m.row_spacing) = (3, 3, 12.0, 6.0);
+    row.entities.push(block_entity(1, Common::default(), EntityKind::Insert(m)));
+    d.blocks.insert("Row".into(), std::sync::Arc::new(row));
+    let red = Common { color: Color::Index(1), ..Default::default() };
+    let mut mirrored = insert_struct("Inner");
+    mirrored.scale = Vec3::new(-1.0, 2.0, 1.0);
+    mirrored.rotation = 0.4;
+    d.add(&Space::Model, Common::default(), EntityKind::Insert(mirrored)).unwrap();
+    let mut zero = insert_struct("Inner");
+    zero.scale = Vec3::new(0.0, 0.0, 1.0);
+    d.add(&Space::Model, Common::default(), EntityKind::Insert(zero)).unwrap();
+    d.add(&Space::Model, red, EntityKind::Insert(insert_struct("Outer"))).unwrap();
+    let mut big = insert_struct("Row");
+    (big.cols, big.col_spacing) = (12_000, 50.0);
+    d.add(&Space::Model, Common::default(), EntityKind::Insert(big)).unwrap();
+    count_equals_build_with_boxes(&d, &Space::Model, "odd references");
+    heaviest_equals_walks(&d, &Space::Model, "odd references");
+    // Inner boxed: the red Outer's nested outlines (6 cells) are red, not the layer's colour.
+    let o = boxed_options(&d, &["Inner"]);
+    let list = build(&d, &Space::Model, &o);
+    let red_outlines = list.prims.iter().filter(|p| p.kind == Kind::Polyline && p.len == 5 && p.color == Rgb(255, 0, 0)).count();
+    assert_eq!(red_outlines, 1, "the MINSERT of Inner inside Outer is one outline, in the parent's colour");
+    let c = census_space(&d, &Space::Model, false, &o);
+    // 2 top-level + 1 in Outer + 10,000 Rows (12,000 clamped), each holding one MINSERT outline.
+    assert_eq!(c.boxed.iter().map(|b| b.outlines).sum::<u64>(), 2 + 1 + 10_000);
+    // The zero-scale reference draws an outline of a point, not nothing and not a crash.
+    assert!(list.prims.iter().any(|p| p.kind == Kind::Polyline && p.len == 5));
 }

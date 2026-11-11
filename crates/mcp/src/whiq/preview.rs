@@ -365,6 +365,8 @@ pub struct Prepared<'a> {
     /// What counting a layout's block expansions found: the whole layout is built for every tile,
     /// so it is counted once per call.
     layout_census: std::cell::OnceCell<BlockCensus>,
+    /// What the last count before drawing said (for the message when the build disagrees).
+    counted: std::cell::Cell<Option<u64>>,
 }
 
 impl Prepared<'_> {
@@ -404,6 +406,7 @@ impl Prepared<'_> {
             space => self.layout_census.get_or_init(|| cadcraft_engine::render::census_space(d, space, false, &opts)).clone(),
         };
         ctx.check()?;
+        self.counted.set(Some(c.total));
         Ok(c)
     }
 
@@ -424,18 +427,10 @@ impl Prepared<'_> {
         if matches!(self.target.space, Space::Model) { Through::Model } else { Through::Layout }
     }
 
-    /// The error for a build that went past the limit although the count said it fits: the picture
-    /// is incomplete, so it is not used. (The count is proven equal to the build; this keeps a count
-    /// that is wrong from ever producing an incomplete picture.)
+    /// The error for a build that went past the limit although the count said it fits: no picture is
+    /// made, and the agent is told what to try next.
     fn over_error(&self, built: usize) -> ToolError {
-        ToolError::new(
-            code::FAILED,
-            format!(
-                "the picture needed more than the {} block pieces one picture draws (the build took {built}) although the count made before it said it fits; the picture was thrown away and no file was written",
-                self.block_cap
-            ),
-            "call again with some layers off (layers_off / only_layers) or with blocks_as_boxes naming the blocks with the most references, or with a window",
-        )
+        mismatch_error(self.block_cap, self.counted.get(), built as u64, "picture")
     }
 
     /// What every answer that drew a picture says about block contents: the block pieces the build
@@ -701,9 +696,9 @@ fn boxed_fields(note: &mut Value, census: &BlockCensus) {
         return;
     }
     note["blocks_drawn_as_boxes"] =
-        json!(census.boxed.iter().map(|b| json!({"block": b.block, "references": count_value(b.references)})).collect::<Vec<_>>());
+        json!(census.boxed.iter().map(|b| json!({"block": b.block, "outlines_drawn": count_value(b.outlines)})).collect::<Vec<_>>());
     note["blocks_drawn_as_boxes_note"] = json!(
-        "every reference to these blocks is drawn as ONE outline of its extents (the block's extents under the reference's transform; an array of references is one outline of the whole array) on the reference's own layer and colour, instead of its contents; the drawing itself is not changed"
+        "every reference to these blocks is drawn as ONE outline of its extents (the block's extents under the reference's transform; an array of references is one outline of the whole array) on the reference's own layer and colour, instead of everything the reference draws: its contents AND its attribute texts are not drawn. outlines_drawn is how many outlines were drawn (a block with nothing visible in it draws none). The outline covers the block as the drawing's extents measure it: layers that are off or frozen in the drawing are left out, but layers frozen only in one layout viewport, and layers marked do-not-plot in a PDF, are not subtracted (the extents are taken once per block), so there the outline can be larger than what the block would draw, never smaller. The drawing itself is not changed"
     );
 }
 
@@ -732,6 +727,24 @@ fn clamped_fields(note: &mut Value, census: &BlockCensus) {
         census.clamped.len(),
         if census.clamped.len() == 1 { " is" } else { "s are" }
     ));
+}
+
+/// The answer when a build reached `built` block pieces, past the `cap` one picture draws, although the
+/// count made before drawing (`counted`) said it fits: the count may be wrong for this drawing. No
+/// picture is made and no file is written; the way on is the same as for a refusal.
+pub fn mismatch_error(cap: usize, counted: Option<u64>, built: u64, what: &str) -> ToolError {
+    let said = counted.map_or("fits".to_string(), |n| format!("fits (it counted {n})"));
+    ToolError::new(
+        code::TOO_LARGE,
+        format!(
+            "this {what} still came out over the {cap} block-piece limit (the build reached {built}) although the count made before drawing said it {said}, so the count may be wrong for this drawing: no picture was made and no file was written"
+        ),
+        "switch off more layers (layers_off / only_layers) and / or draw more blocks as boxes (blocks_as_boxes: [the names of the blocks with the most references]; read_drawing section \"blocks\" lists the block names) and try again",
+    )
+    .with("blocks_expanded_limit", json!(cap))
+    .with("blocks_expanded_counted", counted.map_or(Value::Null, count_value))
+    .with("blocks_expanded_built", count_value(built))
+    .with("picture_made", json!(false))
 }
 
 /// The refusal of a picture that needs `total` block pieces when one picture draws at most `cap`:
@@ -802,9 +815,14 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
     // Blocks drawn as boxes.
     let already = if boxed.is_empty() { String::new() } else { format!(" (already drawn as boxes in this call: {})", boxed.join(", ")) };
     if census.heaviest.is_empty() {
-        ways.push(format!(
-            "blocks_as_boxes cannot shorten this: no block that is still drawn with its contents{already} is referred to by what the picture draws"
-        ));
+        ways.push(if census.blocks_referenced == 0 {
+            format!("blocks_as_boxes cannot shorten this: the picture refers to no block that is still drawn with its contents{already}")
+        } else {
+            format!(
+                "blocks_as_boxes cannot shorten this: the {} block(s) the picture refers to that are still drawn with their contents{already} each cost one piece per copy whether drawn or boxed (they hold nothing that costs more)",
+                census.blocks_referenced
+            )
+        });
     } else {
         let list = census
             .heaviest
@@ -815,7 +833,11 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
             })
             .collect::<Vec<_>>()
             .join("; ");
-        let example = census.heaviest.iter().map(|b| json!(b.block).to_string()).collect::<Vec<_>>().join(", ");
+        let first_alone = census.heaviest.first().filter(|b| b.total_if_boxed <= cap as u64);
+        let pass = match first_alone {
+            Some(b) => format!("Example: blocks_as_boxes: [{}]", json!(b.block)),
+            None => "Pass the block names from the top of heaviest_blocks down as far as is needed (blocks_as_boxes: [those names])".to_string(),
+        };
         let all = if census.total_if_listed_boxed <= cap as u64 {
             format!("Drawing all of the listed blocks as boxes leaves {}, which fits one picture", count_text(census.total_if_listed_boxed))
         } else {
@@ -825,7 +847,7 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
             )
         };
         ways.push(format!(
-            "draw named blocks as outline boxes (blocks_as_boxes: [block names]{already}): every reference to a named block, at any nesting depth, is drawn as one outline of its extents (a rotated reference gives a rotated rectangle, an array of references one outline for the whole array) on the reference's own layer and colour, instead of its contents, and counts one piece. The heaviest blocks, the biggest saving first, with what is left if that block alone is drawn as boxes: {list}. {all}. Example: blocks_as_boxes: [{example}]"
+            "draw named blocks as outline boxes (blocks_as_boxes: [block names]{already}): every reference to a named block, at any nesting depth, is drawn as one outline of its extents (a rotated reference gives a rotated rectangle, an array of references one outline for the whole array) on the reference's own layer and colour, instead of everything the reference draws (its contents and its attribute texts), and counts one piece. The heaviest blocks, the biggest saving first, with what is left if that block alone is drawn as boxes: {list}. {all}. {pass}"
         ));
     }
     // Windows, tiles and the viewport route.
@@ -878,7 +900,17 @@ pub fn ways_through(cap: usize, total: u64, kind: Through, census: &BlockCensus,
 /// over the limit means no file for any.
 pub fn pdf_refusal(blocks: &[cadcraft_io::SheetBlocks], boxed: &[String]) -> ToolError {
     let over: Vec<&cadcraft_io::SheetBlocks> = blocks.iter().filter(|b| b.over_limit()).collect();
-    let cap = over.first().map_or(cadcraft_engine::render::MAX_BLOCK_EXPANSION, |b| b.limit);
+    // A sheet the count said fits but whose build went over: the count may be wrong.
+    if let Some(b) = over.iter().find(|b| b.census.total <= b.limit as u64) {
+        return mismatch_error(b.limit, Some(b.census.total), b.total, &format!("PDF sheet {} ({})", b.number, b.sheet));
+    }
+    let Some(cap) = over.first().map(|b| b.limit) else {
+        return ToolError::new(
+            code::INTERNAL,
+            "a PDF was refused although no sheet is over the limit",
+            "retry the export; report this if it repeats",
+        );
+    };
     let list = over.iter().map(|b| format!("sheet {} ({}) needs {}", b.number, b.sheet, count_text(b.total))).collect::<Vec<_>>().join("; ");
     let reason = format!(
         "{} of the {} sheet{} of this PDF {} more block pieces (every copy of a block and every object in it, nested blocks counted) than the {cap} one sheet draws: {list}. A PDF is one file and a sheet is never drawn incomplete, so no PDF was written",
@@ -891,11 +923,17 @@ pub fn pdf_refusal(blocks: &[cadcraft_io::SheetBlocks], boxed: &[String]) -> Too
         .iter()
         .map(|b| b.total)
         .fold(0u64, |a, n| if a == COUNT_SATURATED || n == COUNT_SATURATED { COUNT_SATURATED } else { a.saturating_add(n) });
-    let worst = over.iter().max_by_key(|b| b.total);
-    let ways = worst.map(|w| ways_through(cap, w.total, Through::Pdf, &w.census, boxed)).unwrap_or_default();
+    let Some(worst) = over.iter().max_by_key(|b| b.total) else {
+        return ToolError::new(
+            code::INTERNAL,
+            "a PDF was refused although no sheet is over the limit",
+            "retry the export; report this if it repeats",
+        );
+    };
+    let ways = ways_through(cap, worst.total, Through::Pdf, &worst.census, boxed);
     let next = format!(
         "make every sheet over the limit complete by one of these, all of which leave the drawing as it is (the figures are those of sheet {}, the one that needs the most; sheets_over_limit gives each sheet's own): {}",
-        worst.map_or(0, |w| w.number),
+        worst.number,
         numbered(&ways)
     );
     let mut e = ToolError::new(code::TOO_LARGE, reason, next)
@@ -946,10 +984,10 @@ pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
     let mut boxed: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for b in blocks.iter().flat_map(|b| b.census.boxed.iter()) {
         let n = boxed.entry(b.block.clone()).or_insert(0);
-        *n = if *n == COUNT_SATURATED || b.references == COUNT_SATURATED { COUNT_SATURATED } else { n.saturating_add(b.references) };
+        *n = if *n == COUNT_SATURATED || b.outlines == COUNT_SATURATED { COUNT_SATURATED } else { n.saturating_add(b.outlines) };
     }
     let total = BlockCensus {
-        boxed: boxed.into_iter().map(|(block, references)| cadcraft_engine::render::BoxedRefs { block, references }).collect(),
+        boxed: boxed.into_iter().map(|(block, references)| cadcraft_engine::render::BoxedRefs { block, outlines: references }).collect(),
         ..BlockCensus::default()
     };
     boxed_fields(&mut note, &total);
@@ -964,7 +1002,13 @@ pub fn pdf_blocks_note(blocks: &[cadcraft_io::SheetBlocks]) -> Value {
 /// comma-separated string), as the drawing spells them, each once. A name that is no block of the
 /// drawing is refused in words naming it.
 pub fn boxed_blocks(d: &Drawing, a: &Value) -> Result<Vec<String>, ToolError> {
-    let asked = names(a.get("blocks_as_boxes"));
+    let asked = cadcraft_io::boxed_names_json(a.get("blocks_as_boxes")).map_err(|e| {
+        ToolError::new(
+            code::INVALID_ARGUMENT,
+            format!("{e}; nothing was drawn and no file was written"),
+            "give blocks_as_boxes as a list of block names, e.g. blocks_as_boxes: [\"Tree\", \"Chair\"] (read_drawing section \"blocks\" lists the names), and call again",
+        )
+    })?;
     let mut out: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
     let mut seen_unknown = std::collections::HashSet::new();
@@ -996,7 +1040,7 @@ pub fn boxed_blocks(d: &Drawing, a: &Value) -> Result<Vec<String>, ToolError> {
             if unknown.len() == 1 { "is" } else { "are" },
             unknown.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
         ),
-        "read_drawing section \"blocks\" lists the block names (anonymous: true for the ones the program names itself); give a name as listed, in any case",
+        "read_drawing section \"blocks\" lists every block name (anonymous: true for the ones the program names itself; `closest` gives the nearest names): call again with blocks_as_boxes names taken from that list, in any case",
     )
     .with("unknown_blocks", json!(unknown))
     .with("closest", Value::Object(closest)))
@@ -1029,7 +1073,13 @@ pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>,
         return Err(ToolError::new(code::INVALID_ARGUMENT, "the window has no area", "give two different corners [[x0, y0], [x1, y1]]"));
     }
     let layers = layer_of(dd, &target.space);
-    let boxes = (!boxed_names.is_empty()).then(|| std::sync::Arc::new(BoxBlocks::new(dd, &boxed_names)));
+    let boxes = if boxed_names.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(BoxBlocks::new(dd, &boxed_names).map_err(|e| {
+            ToolError::new(code::NOT_FOUND, e, "read_drawing section \"blocks\" lists the block names: call again with names taken from it")
+        })?))
+    };
     let layer_states = dd.layers.iter().map(|l| (l.name.clone(), l.on && !l.frozen)).collect();
     let lineweights = a.get("lineweights").and_then(Value::as_bool).unwrap_or(true);
     Ok(Prepared {
@@ -1046,6 +1096,7 @@ pub fn prepare<'a>(d: &'a Drawing, a: &Value, ctx: &Ctx) -> Result<Prepared<'a>,
         boxed_names,
         boxes,
         layout_census: std::cell::OnceCell::new(),
+        counted: std::cell::Cell::new(None),
     })
 }
 

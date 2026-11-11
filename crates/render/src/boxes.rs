@@ -30,13 +30,13 @@ struct Entry {
 }
 
 impl BoxBlocks {
-    /// The boxes for `names` (compared with the drawing's block names ignoring case; a name that
-    /// is no block of `d` is left out, and a name given twice counts once).
-    pub fn new(d: &Drawing, names: &[String]) -> BoxBlocks {
+    /// The boxes for `names` (compared with the drawing's block names ignoring case; a name given
+    /// twice counts once). A name that is no block of `d` is an error naming it: nothing is ignored.
+    pub fn new(d: &Drawing, names: &[String]) -> Result<BoxBlocks, String> {
         let mut entries: Vec<Entry> = Vec::new();
         let mut cache = BlockBoundsCache::default();
         for n in names {
-            let Some(blk) = d.block(n) else { continue };
+            let Some(blk) = d.block(n) else { return Err(format!("`{n}` is not a block of this drawing")) };
             if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&blk.name)) {
                 continue;
             }
@@ -44,7 +44,7 @@ impl BoxBlocks {
             entries.push(Entry { name: blk.name.clone(), depth_bounds });
         }
         let index = entries.iter().enumerate().map(|(i, e)| (e.name.clone(), i)).collect();
-        BoxBlocks { entries, index }
+        Ok(BoxBlocks { entries, index })
     }
 
     /// The blocks drawn as boxes, by name.

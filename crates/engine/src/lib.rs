@@ -78,6 +78,11 @@ pub fn build_version() -> &'static str {
 pub struct Session {
     pub docs: Vec<DocState>,
     pub active: usize,
+    /// `Some(limit)`: a command that writes a picture (PDF, PNG, SVG: `plot`, `export`, `publish`,
+    /// `pdfbook`, `preview`) first counts the block pieces it would draw and, when a sheet needs more
+    /// than `limit`, writes nothing and says so, instead of drawing the sheet with the block contents
+    /// past the limit left out. Off (`None`) in the desktop app; the MCP server turns it on.
+    pub complete_pictures: Option<usize>,
     /// Monotonic count of changes to the open drawings and the active one. A screenshot queued
     /// across a switch is rejected even when a later switch returns to the same drawing.
     pub doc_epoch: u64,
@@ -165,6 +170,7 @@ impl Session {
         Session {
             docs: Vec::new(),
             active: 0,
+            complete_pictures: None,
             doc_epoch: 0,
             settings: Settings::default(),
             running: None,

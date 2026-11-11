@@ -104,7 +104,7 @@ fn block_survey() {
 fn a_pdf_plot_reports_its_block_expansions() {
     use cadcraft_io::Plot;
     let d = read(&minsert(3, 2));
-    let Plot::Drawn(plotted) = cadcraft_io::plot_complete(&d, &Space::Model, &serde_json::json!({}), MAX_BLOCK_EXPANSION).unwrap() else {
+    let Plot::Drawn(plotted) = cadcraft_io::plot_complete(&d, &Space::Model, &serde_json::json!({}), MAX_BLOCK_EXPANSION, None).unwrap() else {
         panic!("too big")
     };
     assert!(plotted.bytes.starts_with(b"%PDF"));
@@ -138,7 +138,7 @@ fn a_complete_pdf_plot_past_the_limit_makes_no_file() {
     let Plot::Drawn(p) = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[Space::Model], &boxed).unwrap() else { panic!("still too big") };
     assert!(p.bytes.starts_with(b"%PDF"));
     assert_eq!((p.blocks[0].total, p.blocks[0].census.boxed.len()), (1, 1));
-    assert_eq!(p.blocks[0].census.boxed[0].references, 1);
+    assert_eq!(p.blocks[0].census.boxed[0].outlines, 1);
     // The real limit draws it whole.
     let whole = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[Space::Model], &cadcraft_io::PdfOptions { complete_only: true, ..Default::default() })
         .unwrap();
@@ -146,8 +146,8 @@ fn a_complete_pdf_plot_past_the_limit_makes_no_file() {
     assert_eq!(whole.blocks[0].total, 200);
     // Through the JSON entry point with a lowered limit: the same refusal, with the sheet's page number.
     let json = serde_json::json!({"blocks_as_boxes": ["A"]});
-    assert!(matches!(cadcraft_io::plot_complete(&d, &Space::Model, &json, 50).unwrap(), Plot::Drawn(_)));
-    let Plot::TooBig(s) = cadcraft_io::plot_complete(&d, &Space::Model, &serde_json::json!({}), 50).unwrap() else { panic!("a file was made") };
+    assert!(matches!(cadcraft_io::plot_complete(&d, &Space::Model, &json, 50, None).unwrap(), Plot::Drawn(_)));
+    let Plot::TooBig(s) = cadcraft_io::plot_complete(&d, &Space::Model, &serde_json::json!({}), 50, None).unwrap() else { panic!("a file was made") };
     assert_eq!((s[0].number, s[0].total, s[0].limit), (1, 200, 50));
     // The engine's hook (not `complete_only`) still draws a cut sheet past a lowered limit, as before.
     let cut =
@@ -195,4 +195,19 @@ fn a_pdf_of_several_sheets_with_one_over_the_limit_makes_no_file() {
     // Without the sheet over the limit the file is made.
     let ok = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[spaces[0].clone(), spaces[1].clone(), spaces[3].clone()], &o).unwrap();
     assert!(matches!(ok, Plot::Drawn(_)));
+}
+
+/// A stop ends the count of a complete plot with an error (no file), and `pages` of one space are
+/// counted once, each page still named with its own number.
+#[test]
+fn a_complete_plot_stops_when_asked_and_counts_identical_pages_once() {
+    use cadcraft_io::Plot;
+    let d = read(&minsert(10, 10));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    assert!(cadcraft_io::plot_complete(&d, &Space::Model, &serde_json::json!({}), 50, Some(stop)).is_err());
+    let pages: Vec<serde_json::Value> = (0..3).map(|k| serde_json::json!({"window": [[0, 0], [10 + k, 10]]})).collect();
+    let Plot::TooBig(sheets) = cadcraft_io::plot_complete(&d, &Space::Model, &serde_json::json!({"pages": pages}), 50, None).unwrap() else {
+        panic!("a file was made")
+    };
+    assert_eq!(sheets.iter().map(|s| (s.number, s.total)).collect::<Vec<_>>(), vec![(1, 200), (2, 200), (3, 200)]);
 }

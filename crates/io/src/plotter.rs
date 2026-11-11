@@ -23,6 +23,12 @@ pub const MAX_PNG_PIXELS: f64 = 40.0e6;
 /// layout).
 pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
     pdf::validate_plot_offset_json(opts)?;
+    let boxed = pdf::validate_blocks_as_boxes(d, opts)?;
+    if !boxed.is_empty() && opts.get("output").and_then(Value::as_str).is_some_and(|o| !o.eq_ignore_ascii_case("pdf")) {
+        return Err(IoError::Format(
+            "`blocks_as_boxes` is drawn by the PDF plot, not by png or svg plots; the export and render_preview tools draw it for svg and png".into(),
+        ));
+    }
     if matches!(space, Space::Model)
         && opts.get("output").and_then(Value::as_str).is_some_and(|output| output.eq_ignore_ascii_case("svg"))
         && opts.get("center").and_then(Value::as_bool) == Some(false)

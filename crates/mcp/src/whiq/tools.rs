@@ -77,7 +77,7 @@ pub fn definitions() -> Vec<Value> {
                 "space": space, "layer": {"type": ["string", "array"]}, "window": window, "expand_blocks": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1}, "format": {"type": "string", "enum": ["json", "markdown"]}},
                 "required": ["query"]},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first. One picture draws at most 2,000,000 block pieces (every copy of a block and every object in it, nested blocks counted). A picture that would need more is NOT made: no picture comes back and no file is written (a file already at the output path is left as it is). The answer is a refusal (code too_large) saying how many block pieces the picture needs (blocks_expanded_total), the limit (blocks_expanded_limit) and the ways to a complete picture that leave the drawing as it is, each with what it leaves and whether that fits one picture: layers_that_reduce (the layer the block references are on switched off, with layers_off / only_layers; reference_layers lists them), heaviest_blocks (the heaviest blocks by name, the biggest saving first, each with what is left if that block is drawn as outline boxes, listed down to the point where drawing all of them as boxes fits, and heaviest_blocks_all_boxed; when even every block as boxes does not fit, all of them are listed and it says so), windows or tiles where they help, and largest_object when one object alone needs more than the limit (windows cannot split it: only layers or boxes reduce it). Every figure is worked out before anything is drawn. With tiles each tile is its own picture: the tiles that fit are drawn (and written with output) and a tile over the limit has picture_made: false and its own refusal in refused; with only one picture asked for, the refusal is the call's error. A picture under the limit is drawn whole and says blocks_expanded_total. blocks_as_boxes: [block names] (names as read_drawing section \"blocks\" lists them, any case; a name that is not a block of the drawing is refused) draws every reference to a named block, at any nesting depth, as ONE outline of its extents (the block's extents under the reference's transform: a rotated reference gives a rotated rectangle; an array of references, a MINSERT, is one outline of the whole array) on the reference's own layer and colour instead of its contents, and counts one block piece; the answer names blocks_drawn_as_boxes (each block and how many references were drawn as a box). The drawing itself is never changed. Field types: blocks_expanded_total, largest_object.blocks_expanded_total, layers_that_reduce[].blocks_expanded_total_if_off and heaviest_blocks[].blocks_expanded_total_if_boxed (and heaviest_blocks_all_boxed.blocks_expanded_total) are each a JSON number up to 2^53, a decimal string above 2^53 (JSON clients lose precision there), or the words \"more than can be counted (nested references multiply past 1.8e19)\" when the count overflows (then no number of windows is given); blocks_expanded_limit is the limit (a number). A window or a tile is a picture of its own that expands only the objects reaching it, so a drawing with more block content than that comes whole as tiles (tiles with output, one file each), as layer passes (layers_off / only_layers: the layer the block references are on, not the layers of their contents) or with its heaviest blocks drawn as boxes. One object (a MINSERT, a block holding a whole plan) that alone needs more than the limit is expanded whole in every window touching it. Reading, search, measuring and extents never make a picture and are not limited. A layout is built whole, so draw the model space its viewports show (viewport: handle) in tiles instead. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
+        json!({"name": "render_preview", "description": "The Preview renderer: vector SVG of model space, a layout (space: name) or a layout viewport's model view (viewport: handle) — the extents or a window, split into tiles for big drawings (tiles: {cols, rows}; tile: [col, row] for one), layers switched with layers_off / layers_on / only_layers. Each primitive's layer is in <g data-layer> so a viewer can hide layers too. format: png gives a picture (an image block) for a visual check. Answers tiles while they fit the answer (continue_from for the rest; never cut inside a tile); output writes them to files instead; path opens a drawing first. One picture draws at most 2,000,000 block pieces (every copy of a block and every object in it, nested blocks counted). A picture that would need more is NOT made: no picture comes back and no file is written (a file already at the output path is left as it is). The answer is a refusal (code too_large) saying how many block pieces the picture needs (blocks_expanded_total), the limit (blocks_expanded_limit) and the ways to a complete picture that leave the drawing as it is, each with what it leaves and whether that fits one picture: layers_that_reduce (the layer the block references are on switched off, with layers_off / only_layers; reference_layers lists them), heaviest_blocks (the heaviest blocks by name, the biggest saving first, each with what is left if that block is drawn as outline boxes, listed down to the point where drawing all of them as boxes fits, and heaviest_blocks_all_boxed; when even every block as boxes does not fit, all of them are listed and it says so), windows or tiles where they help, and largest_object when one object alone needs more than the limit (windows cannot split it: only layers or boxes reduce it). Every figure is worked out before anything is drawn. With tiles each tile is its own picture: the tiles that fit are drawn (and written with output) and a tile over the limit has picture_made: false and its own refusal in refused; with only one picture asked for, the refusal is the call's error. A picture under the limit is drawn whole and says blocks_expanded_total. blocks_as_boxes: [block names] (names as read_drawing section \"blocks\" lists them, any case; a name that is not a block of the drawing is refused) draws every reference to a named block, at any nesting depth, as ONE outline of its extents (the block's extents under the reference's transform: a rotated reference gives a rotated rectangle; an array of references, a MINSERT, is one outline of the whole array) on the reference's own layer and colour instead of everything the reference draws (its contents AND its attribute texts are not drawn), and counts one block piece; the answer names blocks_drawn_as_boxes (each block and outlines_drawn, how many outlines were drawn: a block with nothing visible in it draws none) with a note on what the outline covers (layers that are off or frozen in the drawing are left out; layers frozen only in one layout viewport, or marked do-not-plot in a PDF, are not subtracted, so there the outline can be larger than what the block would draw, never smaller). The drawing itself is never changed. Field types: blocks_expanded_total, largest_object.blocks_expanded_total, layers_that_reduce[].blocks_expanded_total_if_off and heaviest_blocks[].blocks_expanded_total_if_boxed (and heaviest_blocks_all_boxed.blocks_expanded_total) are each a JSON number up to 2^53, a decimal string above 2^53 (JSON clients lose precision there), or the words \"more than can be counted (nested references multiply past 1.8e19)\" when the count overflows (then no number of windows is given); blocks_expanded_limit is the limit (a number). A window or a tile is a picture of its own that expands only the objects reaching it, so a drawing with more block content than that comes whole as tiles (tiles with output, one file each), as layer passes (layers_off / only_layers: the layer the block references are on, not the layers of their contents) or with its heaviest blocks drawn as boxes. One object (a MINSERT, a block holding a whole plan) that alone needs more than the limit is expanded whole in every window touching it. Reading, search, measuring and extents never make a picture and are not limited. A layout is built whole, so draw the model space its viewports show (viewport: handle) in tiles instead. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "path": {"type": "string", "description": "Open this drawing first"},
                 "space": {"type": "string"}, "viewport": {"type": ["string", "integer"]}, "window": window,
                 "tiles": {"type": ["object", "array", "integer"]}, "tile": {"type": "array"},
@@ -87,7 +87,7 @@ pub fn definitions() -> Vec<Value> {
                 "background": {"type": "string", "enum": ["light", "dark"]}, "lineweights": {"type": "boolean"},
                 "output": {"type": "string", "description": "Write the SVG/PNG file(s) here (tiles get -c<col>r<row>) instead of answering them"}}},
             "annotations": ro, "_meta": {"whiq/files": {"read": ["path"], "opens": true}}}),
-        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG is written to the file in slices as it is made: model space in slices of objects in draw order, and a paper-space layout the same (its own objects and each viewport's model-space contents in draw order, each viewport's clip applied), so a big layout is not held whole in memory. One picture draws at most 2,000,000 block pieces (every copy of a block and every object in it, nested blocks counted). An svg / png / pdf that would need more is NOT made: no file is written (a file already at the path is left as it is, not renamed) and the answer is a refusal (code too_large) saying how many block pieces it needs (blocks_expanded_total), the limit (blocks_expanded_limit) and the ways to a complete one that leave the drawing as it is, each with what it leaves and whether that fits one picture: layers_that_reduce (the layer the block references are on switched off, layers_off / only_layers), heaviest_blocks (the heaviest blocks by name, the biggest saving first, each with what is left if that block is drawn as outline boxes, down to the point where drawing all of them as boxes fits, with heaviest_blocks_all_boxed; when even every block as boxes does not fit all are listed and it says so), a window per region (svg / png) where windows help, and largest_object when one object alone needs more than the limit (windows cannot split it). Every figure is worked out before anything is drawn. A PDF is one file: a sheet is one picture of the whole space (its window only places it on the page, it does not leave out block references outside it), and if any sheet is over the limit no PDF is written and the answer names the sheets over the limit with their page numbers (sheet_numbers_over_limit, sheets_over_limit with each sheet's own figures). With several spaces (svg / png of space: all) a space over the limit says so in its own entry and the others are written. blocks_as_boxes: [block names] (svg, png and pdf; names as read_drawing section \"blocks\" lists them, any case; a name that is not a block of the drawing is refused) draws every reference to a named block, at any nesting depth, as ONE outline of its extents (the block's extents under the reference's transform: a rotated reference gives a rotated rectangle; an array of references, a MINSERT, is one outline of the whole array) on the reference's own layer and colour instead of its contents, and counts one block piece; the answer names blocks_drawn_as_boxes (each block and how many references were drawn as a box). The drawing itself is never changed. A picture under the limit is drawn whole and says blocks_expanded_total. Field types: blocks_expanded_total, largest_object.blocks_expanded_total, layers_that_reduce[].blocks_expanded_total_if_off and heaviest_blocks[].blocks_expanded_total_if_boxed (and heaviest_blocks_all_boxed.blocks_expanded_total) are each a JSON number up to 2^53, a decimal string above 2^53 (JSON clients lose precision there), or the words \"more than can be counted (nested references multiply past 1.8e19)\" when the count overflows (then no number of windows is given); blocks_expanded_limit is the limit (a number). Ways to a complete picture: export svg / png once per window (a window expands only the objects reaching it, each export is its own picture), layers_off / only_layers for a pass per layer set (the layer the block references are on), or blocks_as_boxes; one object that alone needs more than the limit is not split by windows. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
+        json!({"name": "export", "description": "Write the drawing in another format: dxf (version 2000–2018, binary: true for binary DXF), dwg (2000–2018), pdf (model, a layout, a list or all layouts — one page each; paper, scale, window, lineweights), svg (one file per space), png. DWG→DXF, DWG/DXF→PDF and →SVG. A file already there is kept as OLD_<name> unless overwrite: true. SVG is written to the file in slices as it is made: model space in slices of objects in draw order, and a paper-space layout the same (its own objects and each viewport's model-space contents in draw order, each viewport's clip applied), so a big layout is not held whole in memory. One picture draws at most 2,000,000 block pieces (every copy of a block and every object in it, nested blocks counted). An svg / png / pdf that would need more is NOT made: no file is written (a file already at the path is left as it is, not renamed) and the answer is a refusal (code too_large) saying how many block pieces it needs (blocks_expanded_total), the limit (blocks_expanded_limit) and the ways to a complete one that leave the drawing as it is, each with what it leaves and whether that fits one picture: layers_that_reduce (the layer the block references are on switched off, layers_off / only_layers), heaviest_blocks (the heaviest blocks by name, the biggest saving first, each with what is left if that block is drawn as outline boxes, down to the point where drawing all of them as boxes fits, with heaviest_blocks_all_boxed; when even every block as boxes does not fit all are listed and it says so), a window per region (svg / png) where windows help, and largest_object when one object alone needs more than the limit (windows cannot split it). Every figure is worked out before anything is drawn. A PDF is one file: a sheet is one picture of the whole space (its window only places it on the page, it does not leave out block references outside it), and if any sheet is over the limit no PDF is written and the answer names the sheets over the limit with their page numbers (sheet_numbers_over_limit, sheets_over_limit with each sheet's own figures). With several spaces (svg / png of space: all) a space over the limit says so in its own entry and the others are written. blocks_as_boxes: [block names] (svg, png and pdf; names as read_drawing section \"blocks\" lists them, any case; a name that is not a block of the drawing is refused) draws every reference to a named block, at any nesting depth, as ONE outline of its extents (the block's extents under the reference's transform: a rotated reference gives a rotated rectangle; an array of references, a MINSERT, is one outline of the whole array) on the reference's own layer and colour instead of everything the reference draws (its contents AND its attribute texts are not drawn), and counts one block piece; the answer names blocks_drawn_as_boxes (each block and outlines_drawn, how many outlines were drawn: a block with nothing visible in it draws none) with a note on what the outline covers (layers that are off or frozen in the drawing are left out; layers frozen only in one layout viewport, or marked do-not-plot in a PDF, are not subtracted, so there the outline can be larger than what the block would draw, never smaller). The drawing itself is never changed. A picture under the limit is drawn whole and says blocks_expanded_total. Field types: blocks_expanded_total, largest_object.blocks_expanded_total, layers_that_reduce[].blocks_expanded_total_if_off and heaviest_blocks[].blocks_expanded_total_if_boxed (and heaviest_blocks_all_boxed.blocks_expanded_total) are each a JSON number up to 2^53, a decimal string above 2^53 (JSON clients lose precision there), or the words \"more than can be counted (nested references multiply past 1.8e19)\" when the count overflows (then no number of windows is given); blocks_expanded_limit is the limit (a number). Ways to a complete picture: export svg / png once per window (a window expands only the objects reaching it, each export is its own picture), layers_off / only_layers for a pass per layer set (the layer the block references are on), or blocks_as_boxes; one object that alone needs more than the limit is not split by windows. A block array (MINSERT) is drawn with at most 10,000 columns and 10,000 rows: an answer says arrays_clamped when one was drawn short.",
             "inputSchema": {"type": "object", "properties": {"document": doc, "source": {"type": "string", "description": "Open this drawing first"}, "path": {"type": "string", "description": "The file to write (its extension picks the format)"},
                 "format": {"type": "string", "enum": ["dxf", "dwg", "pdf", "svg", "png"]}, "version": {"type": ["string", "integer"]}, "binary": {"type": "boolean"},
                 "space": {"type": ["string", "array"], "description": "model (default), a layout, a list, or all"}, "window": window,
@@ -459,6 +459,13 @@ impl Engine {
         let mut extra = Vec::new();
         let mut used = 0usize;
         let mut next = None;
+        // A layout is built whole for every tile: one that is over the limit is refused once for the call,
+        // not once per tile.
+        if !matches!(prep.target.space, Space::Model)
+            && let Some(refused) = prep.refusal(&prep.census(&prep.window, None, ctx)?)
+        {
+            return Err(refused);
+        }
         let mut each = || -> Result<(), ToolError> {
             for (k, (cr, win)) in tiles.iter().enumerate().skip(from) {
                 ctx.check()?;
@@ -475,6 +482,16 @@ impl Engine {
                     }
                     t["picture_made"] = json!(false);
                     t["refused"] = refused.to_value();
+                    // Like any other entry it counts against the answer's size (when the tiles are
+                    // answered, not written to files).
+                    let size = t.to_string().len();
+                    if output.is_none() {
+                        if !out.is_empty() && used + size > budget {
+                            next = Some(k);
+                            break;
+                        }
+                        used += size;
+                    }
                     out.push(t);
                     ctx.step(1);
                     continue;
@@ -633,10 +650,14 @@ impl Engine {
                 }
                 // Every sheet is counted before any is drawn; one over the limit and no file is made.
                 let plotted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cadcraft_io::plot_complete(d, &space, &Value::Object(o), preview::block_limit())
+                    cadcraft_io::plot_complete(d, &space, &Value::Object(o), preview::block_limit(), Some(ctx.cancel.clone()))
                 }))
                 .map_err(|_| ToolError::new(code::FAILED, "the PDF writer failed on this drawing", "try one layout, or a window"))?
-                .map_err(|e| ToolError::new(code::INVALID_ARGUMENT, e.to_string(), "check space, paper, scale and window"))?;
+                .map_err(|e| match ctx.check() {
+                    // A stop ends the count (the plotter answers an error): say it was stopped.
+                    Err(stopped) => stopped,
+                    Ok(()) => ToolError::new(code::INVALID_ARGUMENT, e.to_string(), "check space, paper, scale, window and blocks_as_boxes"),
+                })?;
                 let plotted = match plotted {
                     cadcraft_io::Plot::Drawn(p) => p,
                     cadcraft_io::Plot::TooBig(sheets) => return Err(preview::pdf_refusal(&sheets, &boxed)),
@@ -1228,6 +1249,9 @@ impl Engine {
 fn edit_ops(doc: &mut Doc, before: &Before, all: &[Value], atomic: bool, ctx: &Ctx) -> Result<Reply, ToolError> {
     let mut results = Vec::new();
     let mut failed_at = None;
+    // A command that writes a picture (plot, export, publish, pdfbook, preview) draws it complete or
+    // writes nothing, as the picture tools do.
+    doc.session.complete_pictures = Some(preview::block_limit());
     for (k, op) in all.iter().enumerate() {
         if ctx.cancelled() {
             rollback(doc, before);
@@ -1926,11 +1950,11 @@ mod tests {
         let r = e.call("render_preview", &json!({"blocks_as_boxes": ["tree"]}), &c).unwrap().value;
         let tile = &r["tiles"][0];
         assert_eq!(tile["blocks_expanded_total"], json!(4));
-        assert_eq!(tile["blocks_drawn_as_boxes"], json!([{"block": "Tree", "references": 4}]));
+        assert_eq!(tile["blocks_drawn_as_boxes"], json!([{"block": "Tree", "outlines_drawn": 4}]));
         let svg = tile["svg"].as_str().unwrap();
         assert_eq!(polylines(svg), 4, "one outline per reference, the array one");
         let r = e.call("export", &json!({"path": "boxed.svg", "blocks_as_boxes": "Tree"}), &c).unwrap().value;
-        assert_eq!(r["saved"][0]["blocks_drawn_as_boxes"], json!([{"block": "Tree", "references": 4}]));
+        assert_eq!(r["saved"][0]["blocks_drawn_as_boxes"], json!([{"block": "Tree", "outlines_drawn": 4}]));
         assert_eq!(std::fs::read_to_string(dir.join("boxed.svg")).unwrap(), svg);
         for f in ["boxed.png", "boxed.pdf"] {
             let r = e.call("export", &json!({"path": f, "blocks_as_boxes": ["Tree"]}), &c).unwrap().value;
@@ -1939,7 +1963,7 @@ mod tests {
         }
         // The pdf answer names the blocks too.
         let r = e.call("export", &json!({"path": "boxed2.pdf", "blocks_as_boxes": ["Tree"]}), &c).unwrap().value;
-        assert_eq!(r["saved"][0]["blocks_drawn_as_boxes"], json!([{"block": "Tree", "references": 4}]));
+        assert_eq!(r["saved"][0]["blocks_drawn_as_boxes"], json!([{"block": "Tree", "outlines_drawn": 4}]));
 
         // Still over after a choice: refused again with the figures that choice leaves.
         let _tighter = preview::lower_limit(3);
@@ -1951,6 +1975,219 @@ mod tests {
         assert_eq!(err.extra["layers_that_reduce"][0], json!({"layer": "Small", "blocks_expanded_total_if_off": 1, "fits_one_picture": true}));
         assert_eq!(err.extra["layers_that_reduce"][1], json!({"layer": "Refs", "blocks_expanded_total_if_off": 3, "fits_one_picture": true}));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file format hooks the engine's own picture commands need (the host installs them; once).
+    fn install_io() {
+        use cadcraft_engine::cmd::file::{IoHooks, set_io};
+        set_io(IoHooks {
+            read: |b, n| cadcraft_io::read(b, n).map_err(|e| e.to_string()),
+            write: |d, n| cadcraft_io::write(d, n).map_err(|e| e.to_string()),
+            plot: Some(|d, s, o| cadcraft_io::plot(d, s, o).map_err(|e| e.to_string())),
+        });
+    }
+
+    /// Every picture-making command reached through `edit` follows the rule of the picture tools: over
+    /// the limit nothing is written (a file already there is untouched) and the refusal says what
+    /// happened and where a complete picture is made; under the limit they still work.
+    #[test]
+    fn the_picture_commands_of_edit_write_nothing_over_the_limit() {
+        install_io();
+        let (mut e, c, dir) = forest();
+        let _limit = preview::lower_limit(300);
+        // A frame for pdfbook: a closed polyline 420 x 297.
+        edit(&mut e, &c, json!({"ops": [{"op": "add", "type": "pline", "points": [[0, 0], [420, 0], [420, 297], [0, 297]], "closed": true}]}))
+            .unwrap();
+        std::fs::write(dir.join("plan.svg"), "earlier").unwrap();
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        let cmds = [
+            ("export", json!({"path": "x.svg"})),
+            ("export", json!({"path": "x.png"})),
+            ("export", json!({"path": "plan.svg"})),
+            ("export", json!({"path": "x.pdf"})),
+            ("plot", json!({"layout": "Model", "path": "x.pdf"})),
+            ("plot", json!({"layout": "Model", "output": "png", "path": "x2.png"})),
+            ("plot", json!({"layouts": ["Model"], "path": "x3.pdf"})),
+            ("publish", json!({"path": "pub", "layouts": ["Model"]})),
+            ("pdfbook", json!({"path": "book.pdf"})),
+            ("preview", json!({"layout": "Model"})),
+            ("pngout", json!({"path": "o.png"})),
+            ("jpgout", json!({"path": "o.jpg"})),
+            ("bmpout", json!({"path": "o.bmp"})),
+        ];
+        for (cmd, params) in cmds {
+            let err = e
+                .call("edit", &json!({"ops": [{"op": "command", "command": cmd, "params": params}]}), &c)
+                .map(|_| ())
+                .expect_err(&format!("{cmd} {params} made a picture"));
+            let known = cadcraft_engine::find_command(cmd).is_some();
+            let text = format!("{} {}", err.reason, err.next_step);
+            if known {
+                assert!(
+                    text.contains("block pieces")
+                        && text.contains("no file was written")
+                        && text.contains("`export` tool")
+                        && text.contains("blocks_as_boxes")
+                        && text.contains("call it again"),
+                    "{cmd}: {text}"
+                );
+            } else {
+                assert!(text.contains("unknown command"), "{cmd}: {text}");
+            }
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("plan.svg")).unwrap(), "earlier");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before, "no file was written");
+        // Under the limit (the real one) the same commands work.
+        drop(_limit);
+        let r = e.call("edit", &json!({"ops": [{"op": "command", "command": "export", "params": {"path": "ok.svg"}}]}), &c);
+        assert!(r.is_ok() && dir.join("ok.svg").is_file(), "{:?}", r.map(|_| ()).err().map(|x| x.text()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A layout over the limit is refused once for the call (it is built whole for every tile), before
+    /// any tile or file; its slices are not written either.
+    #[test]
+    fn a_layout_over_the_limit_is_refused_once_before_any_tile() {
+        let dir = scratch("layout-refused");
+        let c = ctx(Some(dir.clone()), true);
+        let mut e = Engine::default();
+        e.call("new_drawing", &json!({}), &c).unwrap();
+        *e.docs.list[0].session.doc_mut().unwrap() = layout_drawing();
+        let _limit = preview::lower_limit(300);
+        std::fs::write(dir.join("l.svg"), "earlier").unwrap();
+        for args in [
+            json!({"space": "Layout1"}),
+            json!({"space": "Layout1", "tiles": {"cols": 3, "rows": 3}}),
+            json!({"space": "Layout1", "tiles": {"cols": 3, "rows": 3}, "output": "t.svg"}),
+        ] {
+            let err = e.call("render_preview", &args, &c).map(|_| ()).unwrap_err();
+            assert_eq!(err.code, code::TOO_LARGE, "{args}");
+            assert!(err.extra["blocks_expanded_total"].as_u64().unwrap() > 300);
+        }
+        let err = e.call("export", &json!({"path": "l.svg", "space": "Layout1"}), &c).map(|_| ()).unwrap_err();
+        assert_eq!(err.code, code::TOO_LARGE);
+        assert_eq!(std::fs::read_to_string(dir.join("l.svg")).unwrap(), "earlier");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anything given for `blocks_as_boxes` that is not a list of block names is refused naming what was
+    /// given, on every path (tools, the PDF JSON, the engine's plot hook): a number, a number in a list,
+    /// an object, a name that is no block.
+    #[test]
+    fn a_blocks_as_boxes_that_is_not_a_list_of_block_names_is_refused() {
+        let (mut e, c, dir) = forest();
+        for bad in [json!(5), json!([123]), json!({"a": 1}), json!(["Tree", null]), json!(true)] {
+            for (tool, args) in [
+                ("render_preview", json!({"blocks_as_boxes": bad})),
+                ("export", json!({"path": "b.svg", "blocks_as_boxes": bad})),
+                ("export", json!({"path": "b.pdf", "blocks_as_boxes": bad})),
+            ] {
+                let err = e.call(tool, &args, &c).map(|_| ()).unwrap_err();
+                assert_eq!(err.code, code::INVALID_ARGUMENT, "{tool} {args}");
+                let given = match &bad {
+                    Value::Array(a) => a.iter().find(|n| !n.is_string()).unwrap().to_string(),
+                    other => other.to_string(),
+                };
+                assert!(err.reason.contains("must be a list of block names, got") && err.reason.contains(&given), "{}", err.reason);
+                assert!(err.next_step.contains("[\"Tree\", \"Chair\"]") && err.next_step.contains("call again"), "{}", err.next_step);
+            }
+        }
+        // The same on the io paths that take the JSON.
+        let d = e.docs.list[0].drawing().unwrap();
+        for opts in [json!({"blocks_as_boxes": 5}), json!({"blocks_as_boxes": ["Nope"]}), json!({"blocks_as_boxes": [1]})] {
+            let msg = cadcraft_io::plot_complete(d, &Space::Model, &opts, 300, None).map(|_| ()).unwrap_err().to_string();
+            assert!(msg.contains("try again") && (msg.contains("[\"Tree\", \"Chair\"]") || msg.contains("read_drawing")), "{msg}");
+            assert!(cadcraft_io::plot(d, &Space::Model, &opts).is_err(), "{opts}");
+            assert!(cadcraft_io::plot(d, &Space::Model, &json!({"output": "png", "blocks_as_boxes": opts["blocks_as_boxes"]})).is_err(), "{opts}");
+        }
+        // The PDF JSON takes the string form as the tools do.
+        let pdf = cadcraft_io::plot_complete(d, &Space::Model, &json!({"blocks_as_boxes": "Tree"}), 300, None).unwrap();
+        assert!(matches!(pdf, cadcraft_io::Plot::Drawn(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The heaviest list is said once in words and once as the field; the example does not repeat the
+    /// names; a block that boxing does not shorten is named as that case; refused tile entries count
+    /// against the answer's size.
+    #[test]
+    fn the_refusal_says_the_heaviest_blocks_once_and_tells_which_case() {
+        use cadcraft_engine::render::{BlockCensus, BlockSaving};
+        let list: Vec<BlockSaving> = (0..50).map(|k| BlockSaving { block: format!("Block{k:02}"), total_if_boxed: 1_000 + k }).collect();
+        let census = BlockCensus { total: 90_000, heaviest: list, total_if_listed_boxed: 250, ..Default::default() };
+        let e = preview::refusal(300, 90_000, preview::Through::Model, &census, &[]);
+        for k in ["Block00", "Block49"] {
+            assert_eq!(e.next_step.matches(k).count(), 1, "{k} is said once in the words");
+        }
+        assert!(e.next_step.contains("Pass the block names from the top of heaviest_blocks") && !e.next_step.contains("Example"), "{}", e.next_step);
+        let one = BlockCensus {
+            total: 900,
+            heaviest: vec![BlockSaving { block: "Tree".into(), total_if_boxed: 100 }],
+            total_if_listed_boxed: 100,
+            ..Default::default()
+        };
+        let e = preview::refusal(300, 900, preview::Through::Model, &one, &[]);
+        assert!(e.next_step.contains("Example: blocks_as_boxes: [\"Tree\"]"), "{}", e.next_step);
+        // Blocks are referred to, but boxing saves nothing / no block is referred to: two different sentences.
+        let none = BlockCensus { total: 900, blocks_referenced: 3, ..Default::default() };
+        assert!(preview::refusal(300, 900, preview::Through::Model, &none, &[]).next_step.contains("the 3 block(s) the picture refers to"));
+        let none = BlockCensus { total: 900, ..Default::default() };
+        assert!(preview::refusal(300, 900, preview::Through::Model, &none, &[]).next_step.contains("refers to no block"));
+    }
+
+    /// Refused tile entries count against the answer's size like any other (the first is always
+    /// given; the next is left for `continue_from`).
+    #[test]
+    fn refused_tile_entries_count_against_the_answer_size() {
+        let (mut e, c, dir) = forest();
+        let _limit = preview::lower_limit(300);
+        let r = e.call("render_preview", &json!({"tiles": {"cols": 1, "rows": 3}, "max_bytes": 1}), &c).unwrap().value;
+        assert_eq!(r["returned"], json!(1), "{r}");
+        assert_eq!(r["tiles"][0]["picture_made"], json!(false));
+        assert_eq!(r["continue_from"], json!(1));
+        let r = e.call("render_preview", &json!({"tiles": {"cols": 1, "rows": 3}, "continue_from": 1}), &c).unwrap().value;
+        assert_eq!(r["returned"], json!(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The count said a picture fits and the build went over the limit anyway: no picture, and the answer
+    /// says so in words with both figures and what to do next (PDF sheets too).
+    #[test]
+    fn a_build_over_the_limit_that_the_count_missed_says_what_to_try() {
+        let c = ctx(None, true);
+        let d = tree_drawing(&["Refs"]);
+        let mut d = d;
+        d.add(&Space::Model, cadcraft_engine::doc::Common::default(), tree_array(10, 10)).unwrap();
+        let mut prep = preview::prepare(&d, &json!({"space": "Model"}), &c).unwrap();
+        let counted = prep.census(&prep.window, None, &c).unwrap().total;
+        assert_eq!(counted, 500);
+        // Force the mismatch: the limit drops after the count was made.
+        prep.block_cap = 50;
+        let err = prep.list_for(&prep.window, 800.0, &c).map(|_| ()).unwrap_err();
+        let text = err.text();
+        assert_eq!(err.code, code::TOO_LARGE);
+        assert!(
+            text.contains("still came out over the 50 block-piece limit")
+                && text.contains("count made before drawing said it fits (it counted 500)")
+                && text.contains("the count may be wrong"),
+            "{text}"
+        );
+        assert!(text.contains("switch off more layers") && text.contains("blocks_as_boxes") && text.contains("try again"), "{text}");
+        assert_eq!(err.extra["blocks_expanded_counted"], json!(500));
+        // The same from a PDF sheet whose count said it fits.
+        let sheet = cadcraft_io::SheetBlocks {
+            sheet: "Model".into(),
+            number: 2,
+            total: 60,
+            limit: 50,
+            census: cadcraft_engine::render::BlockCensus { total: 0, ..Default::default() },
+        };
+        let err = preview::pdf_refusal(&[sheet], &[]);
+        assert!(
+            err.reason.contains("PDF sheet 2 (Model) still came out over the 50 block-piece limit") && err.next_step.contains("try again"),
+            "{}",
+            err.text()
+        );
     }
 
     /// A name in `blocks_as_boxes` that is no block of the drawing is refused in words naming it
@@ -1972,6 +2209,12 @@ mod tests {
             );
             assert_eq!(err.extra["unknown_blocks"], json!(["Tre"]));
             assert_eq!(err.extra["closest"]["Tre"][0], json!("Tree"));
+            assert!(
+                err.next_step.contains("read_drawing section \"blocks\"")
+                    && err.next_step.contains("call again with blocks_as_boxes names taken from that list"),
+                "{}",
+                err.next_step
+            );
         }
         assert!(!dir.join("u.svg").exists() && !dir.join("u.pdf").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2059,7 +2302,7 @@ mod tests {
         // Boxes: the sheet is one piece, the file is written over the earlier one (kept as OLD_).
         let r = e.call("export", &json!({"path": "book.pdf", "space": "all", "blocks_as_boxes": ["Tree"]}), &c).unwrap().value;
         let saved = &r["saved"][0];
-        assert_eq!(saved["blocks_drawn_as_boxes"], json!([{"block": "Tree", "references": 3}]));
+        assert_eq!(saved["blocks_drawn_as_boxes"], json!([{"block": "Tree", "outlines_drawn": 3}]));
         assert_eq!(saved["sheets"].as_array().unwrap().len(), 3);
         assert!(std::fs::read(dir.join("book.pdf")).unwrap().starts_with(b"%PDF"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2515,8 +2758,8 @@ mod tests {
         let cadcraft_io::Plot::Drawn(p) = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &spaces, &o).unwrap() else { panic!("too big") };
         let note = preview::pdf_blocks_note(&p.blocks);
         assert_eq!(note["blocks_expanded_total"], json!(2));
-        assert_eq!(note["blocks_drawn_as_boxes"], json!([{"block": "A", "references": 2}]));
-        assert_eq!(note["sheets"][0]["blocks_drawn_as_boxes"], json!([{"block": "A", "references": 1}]));
+        assert_eq!(note["blocks_drawn_as_boxes"], json!([{"block": "A", "outlines_drawn": 2}]));
+        assert_eq!(note["sheets"][0]["blocks_drawn_as_boxes"], json!([{"block": "A", "outlines_drawn": 1}]));
     }
 
     /// What counting costs per tile of a tiled preview (L2): the objects a tile takes were picked

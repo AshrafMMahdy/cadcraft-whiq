@@ -111,6 +111,8 @@ pub struct PdfOptions {
     /// ([`Plot::TooBig`]), instead of a sheet with the block contents past the limit left out.
     /// Not read from JSON: [`plot_complete`] sets it, [`plot`] (the engine's hook) leaves it off.
     pub complete_only: bool,
+    /// Stops counting and drawing when set (not read from JSON): the plot then ends with an error.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for PdfOptions {
@@ -138,6 +140,7 @@ impl Default for PdfOptions {
             max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
             blocks_as_boxes: Vec::new(),
             complete_only: false,
+            cancel: None,
         }
     }
 }
@@ -175,14 +178,43 @@ impl PdfOptions {
             hyperlinks: v.get("hyperlinks").and_then(Value::as_bool).unwrap_or(true),
             plot_transparency: v.get("plotTransparency").and_then(Value::as_bool),
             max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
-            blocks_as_boxes: v
-                .get("blocks_as_boxes")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                .unwrap_or_default(),
+            // A value that is not a list of names is refused by `validate_blocks_as_boxes` before
+            // any plot reads it (`from_json` itself cannot fail).
+            blocks_as_boxes: boxed_names_json(v.get("blocks_as_boxes")).unwrap_or_default(),
             complete_only: false,
+            cancel: None,
         }
     }
+}
+
+/// The block names of a `blocks_as_boxes` argument: a list of strings, or one string (names separated by commas,
+/// which a block name cannot hold). Anything else is an error naming what was given.
+pub fn boxed_names_json(v: Option<&Value>) -> std::result::Result<Vec<String>, String> {
+    let wrong = |v: &Value| {
+        format!(
+            "`blocks_as_boxes` must be a list of block names, got {v}; give it as a list such as [\"Tree\", \"Chair\"] (the names of blocks of the drawing) and try again"
+        )
+    };
+    match v {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(s.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()),
+        Some(Value::Array(a)) => a.iter().map(|n| n.as_str().map(str::to_string).ok_or_else(|| wrong(n))).collect(),
+        Some(other) => Err(wrong(other)),
+    }
+}
+
+/// `blocks_as_boxes` checked against the drawing: a list of names of its blocks (as it spells them,
+/// any case), nothing else; the names as the drawing spells them.
+pub(crate) fn validate_blocks_as_boxes(d: &Drawing, opts: &Value) -> Result<Vec<String>> {
+    let names = boxed_names_json(opts.get("blocks_as_boxes")).map_err(IoError::Format)?;
+    let unknown: Vec<String> = names.iter().filter(|n| d.block(n).is_none()).map(|n| format!("`{n}`")).collect();
+    if !unknown.is_empty() {
+        return Err(IoError::Format(format!(
+            "`blocks_as_boxes` names {} that is not a block of this drawing; use block names of the drawing (the read_drawing tool, section \"blocks\", lists them) and try again",
+            unknown.join(", ")
+        )));
+    }
+    Ok(names)
 }
 
 fn offset(v: Option<&Value>) -> Option<[f64; 2]> {
@@ -298,19 +330,32 @@ impl Plot {
 /// counting one each; [`cadcraft_render::MAX_BLOCK_EXPANSION`] is the limit of the MCP tools) nothing
 /// is drawn and the answer is [`Plot::TooBig`] with the figures of every sheet. Otherwise the file
 /// and each sheet's count.
-pub fn plot_complete(d: &Drawing, space: &Space, opts: &Value, limit: usize) -> Result<Plot> {
-    plot_outcome(d, space, opts, Some(limit))
+pub fn plot_complete(
+    d: &Drawing,
+    space: &Space,
+    opts: &Value,
+    limit: usize,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Plot> {
+    plot_outcome(d, space, opts, Some((limit, cancel)))
 }
 
-/// `complete_only`: `Some(limit)` for [`plot_complete`].
-fn plot_outcome(d: &Drawing, space: &Space, opts: &Value, complete_only: Option<usize>) -> Result<Plot> {
+/// `complete_only`: `Some((limit, cancel))` for [`plot_complete`].
+fn plot_outcome(
+    d: &Drawing,
+    space: &Space,
+    opts: &Value,
+    complete_only: Option<(usize, Option<std::sync::Arc<std::sync::atomic::AtomicBool>>)>,
+) -> Result<Plot> {
     validate_plot_offset_json(opts)?;
+    validate_blocks_as_boxes(d, opts)?;
     // `layouts: [name | "Model"] | "all"` plots those sheets into one file, one page each,
     // instead of `space`; "all" = Model if it has objects, then the layouts in tab order.
     let mut o = PdfOptions::from_json(opts);
-    if let Some(limit) = complete_only {
+    if let Some((limit, cancel)) = complete_only {
         o.complete_only = true;
         o.max_block_expansion = limit;
+        o.cancel = cancel;
     }
     // `pages: [{window: [[x1,y1],[x2,y2]], paper?, landscape?, scale?}]` plots model space once
     // per window, one page each (a book of sheet frames), instead of `space`.
@@ -334,6 +379,7 @@ fn plot_outcome(d: &Drawing, space: &Space, opts: &Value, complete_only: Option<
                 po.max_block_expansion = o.max_block_expansion;
                 po.blocks_as_boxes = o.blocks_as_boxes.clone();
                 po.complete_only = o.complete_only;
+                po.cancel = o.cancel.clone();
                 Ok((Space::Model, po))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -567,22 +613,53 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
         let mut fonts = fonts::Fonts::new(!text_as_geometry);
         let mut groups = Groups::default();
         let mut blocks = Vec::new();
-        // The blocks drawn as boxes, per sheet. With `complete_only` every sheet is counted before
-        // any is drawn: one sheet over the limit and no file is made.
-        let boxes: Vec<Option<std::sync::Arc<cadcraft_render::BoxBlocks>>> = items
-            .iter()
-            .map(|(_, po)| (!po.blocks_as_boxes.is_empty()).then(|| std::sync::Arc::new(cadcraft_render::BoxBlocks::new(drawn, &po.blocks_as_boxes))))
-            .collect();
+        // The blocks drawn as boxes, per sheet (made once per distinct list of names). With
+        // `complete_only` every sheet is counted before any is drawn (once per distinct space, boxes
+        // and limit: `pages` can name up to 256 sheets of the same space): one sheet over the limit and
+        // no file is made.
+        let stopped = || o.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+        let stop = || Failure::Io(IoError::Format("stopped as asked".into()));
+        let mut made: std::collections::HashMap<Vec<String>, std::sync::Arc<cadcraft_render::BoxBlocks>> = std::collections::HashMap::new();
+        let mut boxes: Vec<Option<std::sync::Arc<cadcraft_render::BoxBlocks>>> = Vec::new();
+        for (_, po) in items {
+            if po.blocks_as_boxes.is_empty() {
+                boxes.push(None);
+                continue;
+            }
+            if !made.contains_key(&po.blocks_as_boxes) {
+                let b = cadcraft_render::BoxBlocks::new(drawn, &po.blocks_as_boxes).map_err(|e| Failure::Io(IoError::Format(e)))?;
+                made.insert(po.blocks_as_boxes.clone(), std::sync::Arc::new(b));
+            }
+            boxes.push(made.get(&po.blocks_as_boxes).cloned());
+        }
         let mut counted: Vec<Option<cadcraft_render::BlockCensus>> = items.iter().map(|_| None).collect();
         if o.complete_only {
             let mut sheets = Vec::new();
+            let mut seen: std::collections::HashMap<(String, Vec<String>, usize), usize> = std::collections::HashMap::new();
             for (k, (s, po)) in items.iter().enumerate() {
-                let opts = cadcraft_render::Options {
-                    max_block_expansion: po.max_block_expansion,
-                    blocks_as_boxes: boxes.get(k).cloned().flatten(),
-                    ..cadcraft_render::Options::default()
+                if stopped() {
+                    return Err(stop());
+                }
+                let key = (format!("{s:?}"), po.blocks_as_boxes.clone(), po.max_block_expansion);
+                let census = match seen.get(&key).and_then(|j| counted.get(*j)).cloned().flatten() {
+                    Some(c) => c,
+                    None => {
+                        let opts = cadcraft_render::Options {
+                            max_block_expansion: po.max_block_expansion,
+                            blocks_as_boxes: boxes.get(k).cloned().flatten(),
+                            cancel: po.cancel.clone(),
+                            ..cadcraft_render::Options::default()
+                        };
+                        let c = cadcraft_render::census_space(drawn, s, true, &opts);
+                        #[cfg(test)]
+                        let c = if UNDERCOUNT.with(std::cell::Cell::get) { cadcraft_render::BlockCensus { total: 0, ..c } } else { c };
+                        if stopped() {
+                            return Err(stop());
+                        }
+                        seen.insert(key, k);
+                        c
+                    }
                 };
-                let census = cadcraft_render::census_space(drawn, s, true, &opts);
                 sheets.push(SheetBlocks {
                     sheet: sheet_name(s),
                     number: k + 1,
@@ -685,7 +762,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         plot_style_table,
         view: None,
         skip_viewport: None,
-        cancel: None,
+        cancel: o.cancel.clone(),
         max_block_expansion: o.max_block_expansion,
         blocks_as_boxes: pre.boxes,
     };
@@ -1163,4 +1240,28 @@ fn uri(url: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the count made before drawing says 0, so the build's own check is what must catch a sheet over the limit.
+    static UNDERCOUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod mismatch_tests {
+    use super::*;
+
+    /// The count says a sheet fits but the build goes over the limit: no file, and the sheet's figures
+    /// say the count said it fits (so the answer can say the count may be wrong).
+    #[test]
+    fn a_build_over_the_limit_that_the_count_missed_makes_no_file() {
+        let d = crate::read(b"0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nA\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n1\n0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nA\n10\n0\n20\n0\n70\n10\n71\n10\n44\n2\n45\n2\n0\nENDSEC\n0\nEOF\n", "x.dxf").unwrap();
+        UNDERCOUNT.with(|c| c.set(true));
+        let r = plot_complete(&d, &Space::Model, &serde_json::json!({}), 50, None);
+        UNDERCOUNT.with(|c| c.set(false));
+        let Plot::TooBig(sheets) = r.unwrap() else { panic!("a file was made") };
+        let [sheet] = &sheets[..] else { panic!("{sheets:?}") };
+        assert!(sheet.over_limit() && sheet.census.total <= sheet.limit as u64, "{sheet:?}");
+    }
 }

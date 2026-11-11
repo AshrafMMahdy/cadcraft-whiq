@@ -28,7 +28,7 @@ pub use cadcraft_doc::Format;
 pub use cadcraft_dxf::Version;
 pub use dxf_read::entity_from_groups;
 pub use dxf_write::entity_groups;
-pub use pdf::{PdfOptions, Plot, Plotted, SheetBlocks, pdf, plot, plot_complete};
+pub use pdf::{PdfOptions, Plot, Plotted, SheetBlocks, boxed_names_json, pdf, plot, plot_complete};
 
 /// How a drawing is saved as DXF or DWG.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

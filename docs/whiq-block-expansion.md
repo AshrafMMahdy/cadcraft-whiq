@@ -386,9 +386,21 @@ and colour, instead of its contents, and costs **one** block piece. The extents 
 the reference's transform, so a rotated or scaled reference gives a rotated rectangle; a MINSERT array is one outline
 of the whole array (the box of its four corner copies in the turned frame, turned forward again), not one per cell.
 The up-front count and the build agree with the option on (the extended equality test). The answer names
-`blocks_drawn_as_boxes: [{block, references}]` (references drawn as boxes, nested ones once per copy of the block that
-holds them; a PDF gives it per sheet and summed). A name that is not a block of the drawing is refused in words naming
-it (`not_found`, with the nearest block names), nothing drawn or written. The drawing is never changed.
+`blocks_drawn_as_boxes: [{block, outlines_drawn}]` (outlines actually drawn: nested ones once per copy of the block that
+holds them; a block with nothing visible in it draws none; a PDF gives it per sheet and summed). A name that is not a block of the drawing is refused in words naming
+it (`not_found`, with the nearest block names, where the full list is and to call again with names from it), nothing
+drawn or written. Anything that is not a list of block names (a number, `[123]`, an object, a `null` in the list) is
+refused naming what was given, with the expected form and an example, on every path that can receive it (the tools, the
+PDF JSON, the engine's plot hook; the png / svg plotter says it does not draw boxes). The drawing is never changed.
+
+**What a box replaces.** A boxed reference draws one outline and nothing else: its contents AND its attribute texts are
+not drawn (decided: attribute texts on millions of references are themselves a load the option exists to remove). The
+answer's note says so. **What the outline covers.** The extents are taken once per block, from the drawing the picture
+is built from (layers off or frozen in the drawing are left out, as are the layer switches of the call and the frozen
+layers of a `viewport:` target). Layers frozen only in one layout viewport, and layers marked do-not-plot in a PDF, are
+not subtracted: the box would have to be different per viewport and per plot, and the extents code has one rule set
+that cannot take those without a second copy of it. So there the outline can be larger than what the block would draw,
+never smaller (the answer's note says so).
 
 ### How the heaviest-blocks list is found, and what it costs (measured)
 
@@ -398,16 +410,30 @@ expanded `parent expansions x copies` times, nodes in order of depth, which grow
 a walk per block. It is exact for a block that is not part of itself; blocks that are (a cycle, found by Tarjan's
 algorithm) and sums that overflow are counted by a walk of their own, so the figures are always what a count with that
 block boxed says (test `heaviest_equals_walks`, run on every drawing of the equality test). The list is cut where
-boxing the first k together fits, found by halving (boxing more never costs more); that is about log2(blocks) walks.
+boxing the first k together fits, found by halving (boxing more never costs more): about log2(blocks) walks of the
+objects, each of the cost of the count. Layer figures (what each reference layer switched off leaves) come from the same
+recording pass, so no walk is made per layer either. For a block that is part of itself, or a layer whose references
+hold others on the same layer (layer 0 contents follow the reference's layer), the expansions that pass through a
+cut reference are taken away first, over the part of the graph below the cut only. Only a figure that overflowed
+`u64` is counted by a walk of its own, and when the total itself overflowed a figure that did not stays "more than can
+be counted", so that block is not listed. The layer table of the walk is looked up once per name, not once per object.
 Measured (release build, one core, test `refusal_cost`, the limit set to a quarter of the total so every table is made):
 
 | drawing | objects | total | tables | blocks listed |
 |---|---|---|---|---|
-| 50 blocks x 2,000 references | 100,000 | 2.1 million | 0.19 s | 40 |
-| 500 blocks x 1,000 references | 500,000 | 4.5 million | 1.1 s | 422 |
-| 5,000 blocks x 100 references | 500,000 | 4.5 million | 1.6 s | 4,219 |
-| 20,000 blocks x 30 references | 600,000 | 3.6 million | 2.5 s | 18,000 |
-| 2,000 blocks x 300 references, nested | 600,000 | 1.1e14 | 2.2 s | 1,181 |
+| 50 blocks x 2,000 references | 100,000 | 2.1 million | 0.23 s | 40 |
+| 500 blocks x 1,000 references | 500,000 | 4.5 million | 1.4 s | 422 |
+| 5,000 blocks x 100 references | 500,000 | 4.5 million | 2.0 s | 4,219 |
+| 20,000 blocks x 30 references | 600,000 | 3.6 million | 3.1 s | 18,000 |
+| 2,000 blocks x 300 references, nested | 600,000 | 1.1e14 | 2.8 s | 1,181 |
+
+The shapes that made the first version quadratic (test `refusal_shapes`, release, one core; tables only):
+
+| drawing | tables |
+|---|---|
+| 250 / 1,000 / 2,000 / 4,000 / 20,000 blocks each holding two references to itself, each referred to once | 0.016 / 0.09 / 0.16 / 0.38 / 2.7 s (was 0.54 / 9 / 43 s for 250 / 1,000 / 2,000) |
+| 4,000 blocks x 30 references plus one block holding 20 references to itself (the total overflows) | 0.21 s (was 150 s) |
+| 300,000 references spread over 1,000 / 5,000 / 20,000 layers | 0.31 / 0.53 / 4.1 s (was 3.4 / 22 / 104 s) |
 
 The list can therefore be very long (thousands of entries, megabytes of answer) when the drawing is far over the limit
 with many block types. **No cap was put on it**; it is the natural end of the rule. A drawing with a handful of block
@@ -419,7 +445,7 @@ and the corpus is not on this machine, so these are generated drawings.)
 The value of the limit; the desktop canvas and the plotter and engine `plot` callers (they still keep what the build
 drew; the canvas options only gained the field `blocks_as_boxes: None`); PDF culling by window; streaming output; the
 10,000 columns / rows clamp of a MINSERT (`arrays_clamped` is still said in every answer that draws one short: that is
-a cut picture of another cause, not named in the decision). No timeout, cap, default or fallback was added.
+a cut picture of another cause, not named in the decision). No timeout, cap or default was added. One check was added behind the count: if a build still goes past the limit although the count said it fits (the equality test says it cannot), no picture is made and the answer says, in words, that the picture came out over the limit although the count said it fits, that the count may be wrong for this drawing, what both figures are, and to switch off more layers and / or draw more blocks as boxes and try again (a PDF sheet the same way, with its number). It changes no result when the count and the build agree; the owner decided it stays.
 
 Tests: render `a_boxed_reference_is_one_outline_of_its_extents_under_its_transform`,
 `a_boxed_block_nested_in_another_is_boxed_at_every_depth`, `the_heaviest_blocks_are_listed_down_to_where_boxing_them_fits`,
@@ -431,3 +457,18 @@ the extended equality test; io `a_complete_pdf_plot_past_the_limit_makes_no_file
 `under_the_limit_the_answer_is_the_count_and_nothing_else`, the descriptions test. The tests lower the limit through
 `Options::max_block_expansion`, `PdfOptions::max_block_expansion` / `plot_complete`'s `limit`, and (mcp, test builds
 only) `preview::lower_limit`.
+
+### Round 2 (blind review) in short
+
+* The refusal is linear: self-referencing blocks, a saturated total, and thousands of reference layers are measured in
+  the cost table above (before: 2,000 self-referencing blocks took 43 s; 1,000 reference layers 3.4 s, 20,000 104 s).
+* The PDF count stops on a cancel (the tools pass theirs) and counts identical (space, boxes, limit) sheets once.
+* A layout over the limit is refused once for the call (it is built whole for every tile); refused tile entries count
+  against `max_result_bytes`; the heaviest list is said once in the words (`next_step`) and once as `heaviest_blocks`,
+  the example does not repeat the names.
+* The engine commands `plot`, `export` (svg / png / pdf), `publish`, `pdfbook` and `preview`, reached through `edit`,
+  count first (`Session::complete_pictures`, set by the MCP only; the desktop app is unchanged) and over the limit write
+  nothing and say to use the `export` tool with `blocks_as_boxes` / `layers_off`. `publish` and `pdfbook` count every
+  sheet before the first file. `pngout`, `jpgout` and `bmpout` are not commands of this engine (edit says unknown
+  command), so nothing can be written through them.
+* Every refusal steers: it says what was wrong, what to give instead (with an example) and to call again.

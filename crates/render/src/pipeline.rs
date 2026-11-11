@@ -284,10 +284,10 @@ pub struct BlockSaving {
 pub struct BoxedRefs {
     /// The block's name as the drawing spells it.
     pub block: String,
-    /// The outlines drawn for it: every reference to it that is drawn, nested ones once per copy
-    /// of the block holding them, an array once ([`COUNT_SATURATED`](super::COUNT_SATURATED) when
+    /// The outlines drawn for it: every reference to it that is drawn and has something to outline,
+    /// nested ones once per copy of the block holding them, an array once ([`COUNT_SATURATED`](super::COUNT_SATURATED) when
     /// more than can be counted).
-    pub references: u64,
+    pub outlines: u64,
 }
 
 /// What counting the block expansions of a build finds, from the block table without building:
@@ -317,6 +317,9 @@ pub struct BlockCensus {
     /// biggest saving first, down to the one at which boxing all of them fits (the list ends
     /// there; when boxing every block still does not fit, it holds every block that saves any).
     pub heaviest: Vec<BlockSaving>,
+    /// Only when `total` is past the limit: how many blocks the drawn references refer to that are
+    /// still drawn with their contents (the candidates for `heaviest`).
+    pub blocks_referenced: usize,
     /// With `heaviest` not empty: the count with every block in it drawn as a box.
     pub total_if_listed_boxed: u64,
     /// The blocks the picture is asked to draw as boxes, with the references of each that are drawn.
@@ -336,35 +339,43 @@ fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus 
         layers_off: Vec::new(),
         clamped: stats.clamped.into_values().collect(),
         heaviest: Vec::new(),
+        blocks_referenced: 0,
         total_if_listed_boxed: 0,
         boxed: Vec::new(),
     };
     let cap = opts.max_block_expansion as u64;
     if total > cap {
+        // What a layer switched off and a block drawn as boxes each take off comes from how often the
+        // block copies are expanded (one pass that records them, for all layers and blocks together);
+        // only a figure that overflowed is counted by a walk of its own. When the total itself
+        // overflowed a figure that did not stays "more than can be counted", so it is not listed.
+        let noted = run(Pass { record: true, ..Pass::default() }).1;
+        let (blocks, savings, layer_savings) = (noted.blocks, noted.savings, noted.layer_savings);
+        let saturated = total == COUNT_SATURATED;
         for l in &c.reference_layers {
             if opts.cancelled() {
                 break;
             }
-            let after = run(Pass { off: std::slice::from_ref(l), ..Pass::default() }).0;
+            let after = match layer_savings.get(&l.to_ascii_lowercase()).copied() {
+                Some(Some(saved)) if !saturated => total.saturating_sub(saved),
+                Some(Some(_)) | None => total,
+                Some(None) => run(Pass { off: std::slice::from_ref(l), ..Pass::default() }).0,
+            };
             if after < total {
                 c.layers_off.push(LayerOff { layer: l.clone(), total_if_off: after });
             }
         }
         c.layers_off.sort_by(|a, b| a.total_if_off.cmp(&b.total_if_off).then_with(|| a.layer.cmp(&b.layer)));
-        // Each block alone drawn as a box, the biggest saving first. What a block saves comes from
-        // how often its copies are expanded (one pass that records them, for all blocks); a block that
-        // is part of itself, or sums that overflowed, are counted by a walk of their own.
-        let noted = run(Pass { record: true, ..Pass::default() }).1;
-        let (blocks, savings, cyclic, savings_unknown) = (noted.blocks, noted.savings, noted.cyclic, noted.savings_unknown);
+        c.blocks_referenced = blocks.len();
         let mut each: Vec<BlockSaving> = Vec::new();
         for name in blocks.into_values() {
             if opts.cancelled() {
                 break;
             }
-            let after = if !savings_unknown && total != COUNT_SATURATED && !cyclic.contains(&name) {
-                total.saturating_sub(savings.get(&name).copied().unwrap_or(0))
-            } else {
-                run(Pass { extra_boxes: std::slice::from_ref(&name), ..Pass::default() }).0
+            let after = match savings.get(&name).copied() {
+                Some(Some(saved)) if !saturated => total.saturating_sub(saved),
+                Some(Some(_)) | None => total,
+                Some(None) => run(Pass { extra_boxes: std::slice::from_ref(&name), ..Pass::default() }).0,
             };
             if after < total {
                 each.push(BlockSaving { block: name, total_if_boxed: after });
@@ -401,8 +412,8 @@ fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus 
             if opts.cancelled() {
                 break;
             }
-            let references = run(Pass { tally: Some(name), ..Pass::default() }).0;
-            c.boxed.push(BoxedRefs { block: name.to_string(), references });
+            let outlines = run(Pass { tally: Some(name), ..Pass::default() }).0;
+            c.boxed.push(BoxedRefs { block: name.to_string(), outlines });
         }
     }
     c
