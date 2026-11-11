@@ -1,8 +1,8 @@
+use super::count::{COUNT_SATURATED, ClampedArray, LargestRef, Pass, Stats};
 #[cfg(not(target_arch = "wasm32"))]
 use super::display::append;
 use super::display::{DisplayList, Kind, NO_LAYER, PlotText, VIEWPORT_CONTENT};
 use super::draw::entity;
-use super::count::{ClampedArray, LargestRef, Stats};
 use super::viewports::{MAX_VIEWPORTS, viewport};
 use super::{Bounds2, Builder, Color, Ctx, Drawing, Entity, EntityKind, Handle, Lineweight, Mat3, Space, Vec2, paper, pen, plotstyle, point};
 
@@ -40,8 +40,12 @@ pub struct Options {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Block contents expanded before the rest are not drawn: [`MAX_BLOCK_EXPANSION`] (only
     /// tests give another value). A build that went past it has [`DisplayList::expanded`] above
-    /// this; see [`Options::blocks_truncated`].
+    /// this ([`Options::blocks_truncated`]) and is incomplete: a caller that must not show an
+    /// incomplete picture counts first ([`census_space`], [`census_entities`]) and discards it.
     pub max_block_expansion: usize,
+    /// Blocks drawn as one outline box per reference instead of their contents (see
+    /// [`BoxBlocks`]). The block extents in it were taken from the drawing the build is given.
+    pub blocks_as_boxes: Option<std::sync::Arc<super::BoxBlocks>>,
 }
 
 impl Options {
@@ -72,6 +76,7 @@ impl Default for Options {
             transparency: false,
             cancel: None,
             max_block_expansion: super::MAX_BLOCK_EXPANSION,
+            blocks_as_boxes: None,
         }
     }
 }
@@ -263,6 +268,28 @@ pub struct LayerOff {
     pub total_if_off: u64,
 }
 
+/// A block that, drawn as outline boxes, makes the count smaller (see [`BlockCensus::heaviest`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockSaving {
+    /// The block's name.
+    pub block: String,
+    /// The expansions asked for with every reference to this block (and nothing else changed)
+    /// drawn as one box ([`COUNT_SATURATED`](super::COUNT_SATURATED) when still more than can be
+    /// counted).
+    pub total_if_boxed: u64,
+}
+
+/// The references to a block that a picture draws as boxes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxedRefs {
+    /// The block's name as the drawing spells it.
+    pub block: String,
+    /// The outlines drawn for it: every reference to it that is drawn, nested ones once per copy
+    /// of the block holding them, an array once ([`COUNT_SATURATED`](super::COUNT_SATURATED) when
+    /// more than can be counted).
+    pub references: u64,
+}
+
 /// What counting the block expansions of a build finds, from the block table without building:
 /// the number, and what an answer needs when the build is too big or draws an array short.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -285,12 +312,22 @@ pub struct BlockCensus {
     pub layers_off: Vec<LayerOff>,
     /// Arrays with more columns or rows than the 10,000 the build draws.
     pub clamped: Vec<ClampedArray>,
+    /// Only when `total` is past [`Options::max_block_expansion`]: the blocks that make the count
+    /// smallest when drawn as boxes, each with what is left if that block alone is a box, the
+    /// biggest saving first, down to the one at which boxing all of them fits (the list ends
+    /// there; when boxing every block still does not fit, it holds every block that saves any).
+    pub heaviest: Vec<BlockSaving>,
+    /// With `heaviest` not empty: the count with every block in it drawn as a box.
+    pub total_if_listed_boxed: u64,
+    /// The blocks the picture is asked to draw as boxes, with the references of each that are drawn.
+    pub boxed: Vec<BoxedRefs>,
 }
 
-/// Count with `run` (the walk of the build's top-level objects with some layers counted as off:
-/// the count and what it noted), then, when that is past the limit, once more per reference layer.
-fn census_of(opts: &Options, run: impl Fn(&[String]) -> (u64, Stats)) -> BlockCensus {
-    let (total, stats) = run(&[]);
+/// Count with `run` (the walk of the build's top-level objects under a [`Pass`]: the count and
+/// what it noted), then, when that is past the limit, once more per reference layer (switched off)
+/// and per block (drawn as a box), and the references drawn as boxes when blocks are asked for.
+fn census_of(opts: &Options, run: impl Fn(Pass) -> (u64, Stats)) -> BlockCensus {
+    let (total, stats) = run(Pass::default());
     let mut c = BlockCensus {
         total,
         largest: stats.largest,
@@ -298,18 +335,75 @@ fn census_of(opts: &Options, run: impl Fn(&[String]) -> (u64, Stats)) -> BlockCe
         references_off_table: stats.off_table,
         layers_off: Vec::new(),
         clamped: stats.clamped.into_values().collect(),
+        heaviest: Vec::new(),
+        total_if_listed_boxed: 0,
+        boxed: Vec::new(),
     };
-    if total > opts.max_block_expansion as u64 {
+    let cap = opts.max_block_expansion as u64;
+    if total > cap {
         for l in &c.reference_layers {
             if opts.cancelled() {
                 break;
             }
-            let after = run(std::slice::from_ref(l)).0;
+            let after = run(Pass { off: std::slice::from_ref(l), ..Pass::default() }).0;
             if after < total {
                 c.layers_off.push(LayerOff { layer: l.clone(), total_if_off: after });
             }
         }
         c.layers_off.sort_by(|a, b| a.total_if_off.cmp(&b.total_if_off).then_with(|| a.layer.cmp(&b.layer)));
+        // Each block alone drawn as a box, the biggest saving first. What a block saves comes from
+        // how often its copies are expanded (one pass that records them, for all blocks); a block that
+        // is part of itself, or sums that overflowed, are counted by a walk of their own.
+        let noted = run(Pass { record: true, ..Pass::default() }).1;
+        let (blocks, savings, cyclic, savings_unknown) = (noted.blocks, noted.savings, noted.cyclic, noted.savings_unknown);
+        let mut each: Vec<BlockSaving> = Vec::new();
+        for name in blocks.into_values() {
+            if opts.cancelled() {
+                break;
+            }
+            let after = if !savings_unknown && total != COUNT_SATURATED && !cyclic.contains(&name) {
+                total.saturating_sub(savings.get(&name).copied().unwrap_or(0))
+            } else {
+                run(Pass { extra_boxes: std::slice::from_ref(&name), ..Pass::default() }).0
+            };
+            if after < total {
+                each.push(BlockSaving { block: name, total_if_boxed: after });
+            }
+        }
+        each.sort_by(|a, b| a.total_if_boxed.cmp(&b.total_if_boxed).then_with(|| a.block.cmp(&b.block)));
+        // Boxing more blocks never costs more (a box is one unit, a copy at least one), so the
+        // list ends at the first prefix whose blocks together fit, found by halving; when even all
+        // of them do not fit, every one is listed.
+        let names: Vec<String> = each.iter().map(|b| b.block.clone()).collect();
+        let together = |k: usize| run(Pass { extra_boxes: names.get(..k).unwrap_or(&names), ..Pass::default() }).0;
+        let (mut lo, mut hi) = (0usize, names.len());
+        let mut listed = names.len();
+        let mut total_listed = if names.is_empty() { total } else { together(names.len()) };
+        if total_listed <= cap {
+            while lo < hi && !opts.cancelled() {
+                let mid = lo + (hi - lo) / 2;
+                let t = together(mid + 1);
+                if t <= cap {
+                    hi = mid;
+                    listed = mid + 1;
+                    total_listed = t;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+        }
+        each.truncate(listed);
+        c.heaviest = each;
+        c.total_if_listed_boxed = total_listed;
+    }
+    if let Some(boxes) = opts.blocks_as_boxes.as_deref() {
+        for name in boxes.names() {
+            if opts.cancelled() {
+                break;
+            }
+            let references = run(Pass { tally: Some(name), ..Pass::default() }).0;
+            c.boxed.push(BoxedRefs { block: name.to_string(), references });
+        }
     }
     c
 }
@@ -321,10 +415,10 @@ fn census_of(opts: &Options, run: impl Fn(&[String]) -> (u64, Stats)) -> BlockCe
 /// are on and the arrays drawn short. Stops early, with a count to discard, when `opts.cancel` is
 /// set.
 pub fn census_entities(d: &Drawing, ents: &[&Entity], plotting: bool, opts: &Options) -> BlockCensus {
-    census_of(opts, |off| {
-        let mut counter = super::count::Counter::new(d, plotting, &[], off, opts.cancel.as_deref());
+    census_of(opts, |pass| {
+        let mut counter = super::count::Counter::new(d, plotting, &[], pass, opts.blocks_as_boxes.as_deref(), opts.cancel.as_deref());
         let n = ents.iter().map(|e| counter.top(e, d.anno_draw(e))).fold(0, u64::saturating_add);
-        (n, counter.stats)
+        (n, counter.into_stats())
     })
 }
 
@@ -332,10 +426,11 @@ pub fn census_entities(d: &Drawing, ents: &[&Entity], plotting: bool, opts: &Opt
 /// (`plotting` true) of `space`, the entities' own and, for a layout, each viewport's model-space
 /// contents. Counted from the block table without building.
 pub fn census_space(d: &Drawing, space: &Space, plotting: bool, opts: &Options) -> BlockCensus {
-    census_of(opts, |off| {
+    census_of(opts, |pass| {
         let Some(store) = d.space(space) else { return (0, Stats::default()) };
         let cancel = opts.cancel.as_deref();
-        let mut counter = super::count::Counter::new(d, plotting, &[], off, cancel);
+        let boxes = opts.blocks_as_boxes.as_deref();
+        let mut counter = super::count::Counter::new(d, plotting, &[], pass, boxes, cancel);
         let mut stats = Stats::default();
         let mut n = 0u64;
         if !matches!(space, Space::Paper(_)) {
@@ -348,7 +443,7 @@ pub fn census_space(d: &Drawing, space: &Space, plotting: bool, opts: &Options) 
                         continue;
                     }
                     viewports += 1;
-                    let (more, s) = super::viewports::count_viewport(d, e, vp, plotting, off, cancel);
+                    let (more, s) = super::viewports::count_viewport(d, e, vp, plotting, pass, boxes, cancel);
                     stats.absorb(s);
                     more
                 } else {
@@ -357,7 +452,7 @@ pub fn census_space(d: &Drawing, space: &Space, plotting: bool, opts: &Options) 
                 n = n.saturating_add(more);
             }
         }
-        stats.absorb(counter.stats);
+        stats.absorb(counter.into_stats());
         (n, stats)
     })
 }

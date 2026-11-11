@@ -97,6 +97,36 @@ pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
     bounds_of(d, e, depth, false)
 }
 
+/// The boxes of the contents of blocks (in each block's own coordinates) as references to them at a
+/// nesting depth draw them, remembered by block and depth so that asking for many blocks walks each
+/// definition at each depth once, however they nest ([`block_contents_bounds`] for one).
+#[derive(Default)]
+pub struct BlockBoundsCache<'a>(HashMap<(&'a str, usize), Bounds2>);
+
+impl<'a> BlockBoundsCache<'a> {
+    /// The box of the contents of the block `name` for a reference at nesting `depth`: what a
+    /// reference's extents are made from (the `Insert` branch of [`entity_bounds`], of which this is the
+    /// inner part). Contents on layers turned off are left out. Empty for a missing or empty block, or
+    /// at [`MAX_BLOCK_DEPTH`].
+    pub fn contents(&mut self, d: &'a Drawing, name: &str, depth: usize) -> Bounds2 {
+        let Some(blk) = d.block(name).filter(|_| depth < MAX_BLOCK_DEPTH) else { return Bounds2::EMPTY };
+        if let Some(b) = self.0.get(&(blk.name.as_str(), depth)) {
+            return *b;
+        }
+        let mut inner = Bounds2::EMPTY;
+        for be in blk.entities.iter().filter(|be| in_block_visible(d, be, false)) {
+            inner = inner.union(&bounds_in(d, be, depth + 1, &mut self.0, false));
+        }
+        self.0.insert((blk.name.as_str(), depth), inner);
+        inner
+    }
+}
+
+/// [`BlockBoundsCache::contents`] for one block and depth.
+pub fn block_contents_bounds(d: &Drawing, name: &str, depth: usize) -> Bounds2 {
+    BlockBoundsCache::default().contents(d, name, depth)
+}
+
 /// The box `e` takes in the drawing's extents: as [`entity_bounds`], but block contents on a layer
 /// turned off count, as AutoCAD 2024's ZOOM Extents counts them (a frozen layer's do not).
 pub fn extent_bounds(d: &Drawing, e: &Entity) -> Bounds2 {

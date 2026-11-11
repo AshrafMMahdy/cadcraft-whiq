@@ -137,6 +137,7 @@ pub(super) fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Con
             transparency,
             cancel: None,
             max_block_expansion: cadcraft_render::MAX_BLOCK_EXPANSION,
+            blocks_as_boxes: None,
         };
         c.list = cadcraft_render::viewport_content(&st.doc, &st.space, h, area, &opts);
         c.key = Some(key);

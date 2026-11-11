@@ -44,6 +44,20 @@ pub(crate) fn insert(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc:
     if ctx.depth >= cadcraft_doc::MAX_BLOCK_DEPTH {
         return;
     }
+    // A block drawn as a box (`Options::blocks_as_boxes`): the whole reference, an array included, is one
+    // outline of its extents on the reference's own layer and colour, and takes one unit.
+    if let Some(boxes) = b.opts.blocks_as_boxes.as_deref()
+        && let Some(blk) = ctx.d.block(&ins.block)
+        && boxes.contains(&blk.name)
+    {
+        if b.expand()
+            && let Some(outline) = boxes.outline(&blk.name, ins, blk.base.xy(), ctx.depth)
+        {
+            let lw = if b.opts.lineweights { resolve(ctx, e, b.plotting).1 } else { 0.0 };
+            b.polyline(ctx, rgb, lw, &outline);
+        }
+        return;
+    }
     if let Some(blk) = ctx.d.block(&ins.block) {
         let cols = ins.cols.clamp(1, 10_000);
         let rows = ins.rows.clamp(1, 10_000);

@@ -216,19 +216,20 @@ pub(crate) fn count_viewport(
     e: &Entity,
     vp: &cadcraft_doc::Viewport,
     plotting: bool,
-    off: &[String],
+    pass: super::count::Pass,
+    boxes: Option<&super::BoxBlocks>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> (u64, super::count::Stats) {
-    let mut counter = super::count::Counter::new(d, plotting, &vp.frozen_layers, off, cancel);
+    let mut counter = super::count::Counter::new(d, plotting, &vp.frozen_layers, pass, boxes, cancel);
     if !viewport_shown(d, e, vp) || !vp.on {
-        return (0, counter.stats);
+        return (0, counter.into_stats());
     }
     let poly = viewport_clip(d, e.handle, vp);
     let area = match &poly {
         Some(p) => Some(p.bounds()),
         None => viewport_rect(vp),
     };
-    let Some(View { s, win, .. }) = area.and_then(|a| View::of(vp, a)) else { return (0, counter.stats) };
+    let Some(View { s, win, .. }) = area.and_then(|a| View::of(vp, a)) else { return (0, counter.into_stats()) };
     let all = d.anno_all_visible();
     let n = d
         .model
@@ -236,7 +237,7 @@ pub(crate) fn count_viewport(
         .filter(|me| model_seen(d, &win, me))
         .map(|me| counter.top(me, cadcraft_doc::anno_draw(me, 1.0 / s.max(1e-12), all)))
         .fold(0u64, u64::saturating_add);
-    (n, counter.stats)
+    (n, counter.into_stats())
 }
 
 /// The clip region of a clipped viewport: the outline of its clip boundary entity, when that

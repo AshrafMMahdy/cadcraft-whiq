@@ -130,7 +130,9 @@ struct Builder<'a> {
 /// Upper bound on the block contents drawn per display list (each block reference, MINSERT copy
 /// and entity drawn inside a block counts one). Nested, self-referencing or arrayed block
 /// references in a hostile file would otherwise expand exponentially (`MAX_BLOCK_DEPTH` only
-/// bounds the depth); past the limit the remaining block contents are not drawn.
+/// bounds the depth). A build stops expanding at the limit (the canvas and the plotter keep what
+/// was drawn); the MCP picture tools count first and draw no picture, and write no file, for a
+/// picture that would need more.
 pub const MAX_BLOCK_EXPANSION: usize = 2_000_000;
 
 impl Builder<'_> {
@@ -302,6 +304,7 @@ mod table;
 pub use table::{MAX_LAYOUT_CELLS, TableFill, TableGeom, TableLine, TableText, table_covered, table_geometry, table_style_of};
 
 mod blocks;
+mod boxes;
 mod count;
 mod dim_draw;
 mod display;
@@ -312,12 +315,16 @@ mod slices;
 mod text_entity;
 mod viewports;
 
+pub use boxes::BoxBlocks;
+pub use count::{COUNT_SATURATED, ClampedArray, LargestRef};
 pub use dim_draw::{dim_text, dimension_in};
 pub use display::{DPrim, DisplayList, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
-pub use slices::build_layout_slices;
-pub use count::{COUNT_SATURATED, ClampedArray, LargestRef};
-pub use pipeline::{BlockCensus, LayerOff, Options, build, build_entities, build_plot, build_slice, census_entities, census_space, count_expansions, count_space};
+pub use pipeline::{
+    BlockCensus, BlockSaving, BoxedRefs, LayerOff, Options, build, build_entities, build_plot, build_slice, census_entities, census_space,
+    count_expansions, count_space,
+};
 use props::{default_lineweight, resolve_common};
+pub use slices::build_layout_slices;
 use text_entity::text_style;
 pub use text_entity::{layout_mtext_entity, place_text_entity, text_align};
 pub use viewports::{viewport_clip, viewport_content};
