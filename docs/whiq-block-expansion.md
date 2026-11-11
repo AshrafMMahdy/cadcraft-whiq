@@ -378,8 +378,7 @@ ever returned or written.
 
 ### Blocks as boxes (`blocks_as_boxes`)
 
-`render_preview` and `export` (svg, png, pdf) take `blocks_as_boxes`: a list of block names (or one comma separated
-string), compared as block names are everywhere in the engine (ignoring case; `Drawing::block`). Every reference to a
+`render_preview` and `export` (svg, png, pdf) take `blocks_as_boxes`: a list of block names, compared as block names are everywhere in the engine (ignoring case; `Drawing::block`). Every reference to a
 named block, at any nesting depth, is drawn as **one outline** of the reference's extents on the reference's own layer
 and colour, instead of its contents, and costs **one** block piece. The extents are the block's contents' extents
 (`doc::block_contents_bounds`, the inner part of the reference extents of `doc/extents.rs`: layers off left out) under
@@ -402,43 +401,47 @@ not subtracted: the box would have to be different per viewport and per plot, an
 that cannot take those without a second copy of it. So there the outline can be larger than what the block would draw,
 never smaller (the answer's note says so).
 
-### How the heaviest-blocks list is found, and what it costs (measured)
+### How the heaviest-blocks list is found, and what it costs (measured, round 3)
 
-For every block a drawn reference refers to, the saving of drawing it as boxes is worked out in one pass from how often
-each block copy is expanded (the walk records each reference with its copies and the cost of one copy; copies are
-expanded `parent expansions x copies` times, nodes in order of depth, which grows by one along every reference), without
-a walk per block. It is exact for a block that is not part of itself; blocks that are (a cycle, found by Tarjan's
-algorithm) and sums that overflow are counted by a walk of their own, so the figures are always what a count with that
-block boxed says (test `heaviest_equals_walks`, run on every drawing of the equality test). The list is cut where
-boxing the first k together fits, found by halving (boxing more never costs more): about log2(blocks) walks of the
-objects, each of the cost of the count. Layer figures (what each reference layer switched off leaves) come from the same
-recording pass, so no walk is made per layer either. For a block that is part of itself, or a layer whose references
-hold others on the same layer (layer 0 contents follow the reference's layer), the expansions that pass through a
-cut reference are taken away first, over the part of the graph below the cut only. Only a figure that overflowed
-`u64` is counted by a walk of its own, and when the total itself overflowed a figure that did not stays "more than can
-be counted", so that block is not listed. The layer table of the walk is looked up once per name, not once per object.
-Measured (release build, one core, test `refusal_cost`, the limit set to a quarter of the total so every table is made):
+**Design.** The count walks the block table once (memoised). When the picture is over the limit, or blocks are
+drawn as boxes, one more walk records every reference with its copies and the cost of one copy. Everything per
+block and per layer then comes from that recording by arithmetic and never from a walk per name: the expansions
+form a graph whose edges raise the depth by one; taking away a set of references (a block's references drawn as
+boxes, a layer's references switched off) changes the cost of one copy of every expansion that holds one and of
+those above it, found from the cut upwards, and the top level sums the same. A block that holds itself, or a layer
+whose references hold others on the same layer, cost no more than any other, and the outlines drawn per boxed block
+come from the same recording (the box sites carry the block name). A figure that overflows is "more than can be
+counted": it is listed (first, as the heaviest), it is not walked, and it gets no after-figure; when the total is a
+number every figure is exact. The only counts besides the first two are the few that find how many of the heaviest
+blocks, boxed together, fit (found by halving: about log2(blocks) walks of the objects) and one to state the figure
+with all the listed blocks boxed. A saturated total still lists the blocks that save (with their saving only), so
+n independent overflowing blocks, which fit when boxed together (n pieces), are offered as that. The layer table of
+a census is built once (`Drawing::layer` is a linear scan).
 
-| drawing | objects | total | tables | blocks listed |
-|---|---|---|---|---|
-| 50 blocks x 2,000 references | 100,000 | 2.1 million | 0.23 s | 40 |
-| 500 blocks x 1,000 references | 500,000 | 4.5 million | 1.4 s | 422 |
-| 5,000 blocks x 100 references | 500,000 | 4.5 million | 2.0 s | 4,219 |
-| 20,000 blocks x 30 references | 600,000 | 3.6 million | 3.1 s | 18,000 |
-| 2,000 blocks x 300 references, nested | 600,000 | 1.1e14 | 2.8 s | 1,181 |
+Test `the_refusal_grows_with_the_drawing_not_with_its_square` runs every shape below with a bound, and
+`heaviest_equals_walks` asserts that every figure that is given (block and layer, order, after-figure) equals a real
+count of a drawing with that block boxed or that layer off, on every fixture including a block holding itself.
 
-The shapes that made the first version quadratic (test `refusal_shapes`, release, one core; tables only):
+Measured (release build, one core, test `refusal_shapes`; the limit set so every table is made; tables only):
 
-| drawing | tables |
+| drawing | tables (was) |
 |---|---|
-| 250 / 1,000 / 2,000 / 4,000 / 20,000 blocks each holding two references to itself, each referred to once | 0.016 / 0.09 / 0.16 / 0.38 / 2.7 s (was 0.54 / 9 / 43 s for 250 / 1,000 / 2,000) |
-| 4,000 blocks x 30 references plus one block holding 20 references to itself (the total overflows) | 0.21 s (was 150 s) |
-| 300,000 references spread over 1,000 / 5,000 / 20,000 layers | 0.31 / 0.53 / 4.1 s (was 3.4 / 22 / 104 s) |
+| 250 / 1,000 / 2,000 / 4,000 / 20,000 blocks each holding two references to itself | 0.013 / 0.06 / 0.22 / 0.35 / 2.1 s (0.54 / 9 / 43 s for 250 / 1,000 / 2,000) |
+| 125 / 250 / 500 / 1,000 / 4,000 blocks each holding 20 references to itself (every saving overflows) | 0.06 / 0.11 / 0.14 / 0.33 / 1.8 s (1.07 / 4.7 / 20 / 88 s) |
+| the same, each reference on a layer of its own | 0.08 / 0.09 / 0.21 / 0.50 / 2.5 s (1,000: 241 s) |
+| 4,000 blocks x 30 references plus one block holding 20 references to itself (the total overflows) | 0.12 s (150 s) |
+| 300,000 references over 1,000 / 5,000 / 20,000 layers | 0.32 / 0.36 / 0.46 s (3.4 / 22 / 104 s) |
+| 20,000 layers, each with a reference to one block holding 25 / 100 references to a leaf block | 0.8 / 2.1 s (18 s for the verifier's shape) |
+| 1,000 / 4,000 blocks drawn as boxes, success path (the outlines tally) | 0.02 / 0.10 s (5 s / 80 s) |
+| 50 blocks x 2,000 refs / 500 x 1,000 / 5,000 x 100 / 20,000 x 30 (500,000 to 600,000 objects) | 0.16 / 1.2 / 1.6 / 2.1 s |
+| 2,000 blocks x 300 refs, nested (600,000 objects, total 1.1e14) | 3.8 s |
 
-The list can therefore be very long (thousands of entries, megabytes of answer) when the drawing is far over the limit
-with many block types. **No cap was put on it**; it is the natural end of the rule. A drawing with a handful of block
-types (the owner's site layout) lists a handful. (No real drawing of the corpus is anywhere near the limit, section 3,
-and the corpus is not on this machine, so these are generated drawings.)
+The list can therefore be very long (thousands of entries) when a drawing is far over the limit with many block types.
+**No cap was put on it**; the answer is bounded by the existing `max_result_bytes` instead: the heaviest are shown first
+as far as it allows (`heaviest_blocks_more` says how many more; boxing the listed ones and calling again lists the next
+ones), the layer table likewise (`layers_that_reduce_more`), and each name is said once in the words and once in the
+field. (No real drawing of the corpus is anywhere near the limit, section 3, and the corpus is not on this machine, so
+these are generated drawings.)
 
 ### Not changed, and why
 
@@ -460,8 +463,9 @@ only) `preview::lower_limit`.
 
 ### Round 2 (blind review) in short
 
-* The refusal is linear: self-referencing blocks, a saturated total, and thousands of reference layers are measured in
-  the cost table above (before: 2,000 self-referencing blocks took 43 s; 1,000 reference layers 3.4 s, 20,000 104 s).
+* Round 2 removed the quadratic walk for blocks that hold themselves and for thousands of layers; it was not yet linear
+  for every shape (a walk per overflowing block or per layer with shared content remained). Round 3 (below) made it so:
+  every shape is measured in the table above.
 * The PDF count stops on a cancel (the tools pass theirs) and counts identical (space, boxes, limit) sheets once.
 * A layout over the limit is refused once for the call (it is built whole for every tile); refused tile entries count
   against `max_result_bytes`; the heaviest list is said once in the words (`next_step`) and once as `heaviest_blocks`,
@@ -472,3 +476,17 @@ only) `preview::lower_limit`.
   sheet before the first file. `pngout`, `jpgout` and `bmpout` are not commands of this engine (edit says unknown
   command), so nothing can be written through them.
 * Every refusal steers: it says what was wrong, what to give instead (with an example) and to call again.
+
+### Round 3 in short
+
+* The refusal and the success path never cost a walk per name (design above); the heaviest and layer lists are bounded by
+  `max_result_bytes`; a saturated total lists the blocks that save instead of claiming nothing helps.
+* A stop during drawing ends the call as cancelled with no file, for svg, png, the tile loop and PDF (the plotter checks
+  the stop after every sheet).
+* The engine commands that can write or return an image, an SVG or a PDF all follow the rule through `edit` (counted
+  first, nothing written over the limit): `export`, `plot`, `publish`, `pdfbook`, `preview`, `wblock`, `qsave` / `save`,
+  `saveas`, `document.bytes`, `layout.saveas` (the last five by the file's extension or format). `blocks_as_boxes` is drawn
+  only by `plot` to PDF (counted with the boxes and written with them); every other command refuses it naming the `export`
+  tool, so no picture is counted one way and drawn another. Names are checked as the tools check them.
+* `blocks_as_boxes` is a list of block names only; a string, a number or a list with a non-string is refused naming what
+  was given and the form expected. No default stands in for a wrong value.

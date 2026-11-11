@@ -148,6 +148,8 @@ fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<Vec<
     }
     // A drawing file is the drawing outside the Block Editor; an image is what is shown.
     let d: &cadcraft_doc::Drawing = if is_drawing_file(path) { s.state()?.drawing() } else { s.doc()? };
+    // An image or a PDF is a picture: complete or not written.
+    super::exchange::picture_fits_for_file(s, cmd, path, d, &json!({}))?;
     let r = if *opts == SaveAs::default() {
         (hooks.write)(d, path)
     } else {

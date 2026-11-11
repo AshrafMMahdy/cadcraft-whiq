@@ -68,29 +68,25 @@ pub(crate) struct Stats {
     /// A drawn reference sits on a layer that is not in the layer table (no switch can name it).
     pub off_table: bool,
     pub clamped: BTreeMap<u64, ClampedArray>,
-    /// The blocks the drawn references (not those drawn as boxes) refer to: the lower-case name
-    /// is the key, the block's own spelling the value.
-    pub blocks: BTreeMap<String, String>,
-    /// Only from a pass that records ([`Pass::record`]): for each block (its own spelling) what the
-    /// count falls by when every reference to it is drawn as a box, and for each layer (lower case)
-    /// what it falls by when that layer is switched off, worked out from how often each block copy is
-    /// expanded without a walk per block or layer. `None`: that figure overflowed (the walk of its own
-    /// is the way to it). When nothing was recorded `savings_unknown` is set.
-    pub savings: HashMap<String, Option<u64>>,
-    pub layer_savings: HashMap<String, Option<u64>>,
-    pub savings_unknown: bool,
+    /// Only from a pass that records ([`Pass::record`]): for every block the drawn references refer to
+    /// and that is not drawn as a box (its own spelling), what the count falls by when every reference
+    /// to it is drawn as a box; for every layer the drawn references sit on (lower case), what it falls
+    /// by when the layer is switched off; and for every block drawn as a box, the outlines drawn for it.
+    /// All from the one recording pass, by arithmetic over how the block copies nest, never by a walk
+    /// per name. A figure that overflowed is [`COUNT_SATURATED`]: "more than can be counted".
+    pub savings: HashMap<String, u64>,
+    pub layer_savings: HashMap<String, u64>,
+    pub outlines: HashMap<String, u64>,
 }
 
-/// What one counting walk assumes besides the build's own rules: layers counted as switched off,
-/// more blocks counted as drawn boxes, and, to tally rather than count, the one block whose
-/// boxes are counted.
+/// What one counting walk assumes besides the build's own rules: layers counted as switched off and
+/// more blocks counted as drawn boxes.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Pass<'a> {
     pub off: &'a [String],
     pub extra_boxes: &'a [String],
-    /// Count only the references to this block that are drawn as boxes (nothing else costs).
-    pub tally: Option<&'a str>,
-    /// Note, for every block, what drawing its references as boxes would save ([`Stats::savings`]).
+    /// Note, for every block and layer, what drawing the block as boxes or switching the layer off
+    /// would save, and the outlines drawn ([`Stats::savings`]).
     pub record: bool,
 }
 
@@ -108,16 +104,14 @@ impl Stats {
         for (k, v) in other.clamped {
             self.clamped.entry(k).or_insert(v);
         }
-        for (k, v) in other.blocks {
-            self.blocks.entry(k).or_insert(v);
-        }
-        for (mine, theirs) in [(&mut self.savings, other.savings), (&mut self.layer_savings, other.layer_savings)] {
+        for (mine, theirs) in
+            [(&mut self.savings, other.savings), (&mut self.layer_savings, other.layer_savings), (&mut self.outlines, other.outlines)]
+        {
             for (k, v) in theirs {
-                let sum = mine.entry(k).or_insert(Some(0));
-                *sum = add(*sum, v);
+                let sum = mine.entry(k).or_insert(0);
+                *sum = sadd(*sum, v);
             }
         }
-        self.savings_unknown |= other.savings_unknown;
     }
 }
 
@@ -170,6 +164,8 @@ struct Site {
     block: Option<String>,
     /// The layer the reference is drawn on (lower case).
     layer: String,
+    /// A reference drawn as a box: the block and whether an outline is drawn.
+    boxed: Option<(String, bool)>,
     /// The expansion the reference makes (`None`: a box, which expands nothing).
     child: Option<NodeKey>,
     /// Copies drawn (cells of an array).
@@ -179,10 +175,25 @@ struct Site {
 }
 
 /// A layer of the table as the walk uses it.
-struct LayerInfo {
+pub(crate) struct LayerInfo {
     visible: bool,
     plot: bool,
     name: String,
+}
+
+/// The drawing's layers by lower-case name, made once per census (`Drawing::layer` searches the table
+/// linearly; a drawing can have thousands of layers). The first layer of a name wins, as
+/// `Drawing::layer` finds it.
+pub(crate) struct LayerTable(HashMap<String, LayerInfo>);
+
+impl LayerTable {
+    pub(crate) fn new(d: &Drawing) -> LayerTable {
+        let mut m = HashMap::new();
+        for l in &d.layers {
+            m.entry(l.name.to_ascii_lowercase()).or_insert_with(|| LayerInfo { visible: l.visible(), plot: l.plot, name: l.name.clone() });
+        }
+        LayerTable(m)
+    }
 }
 
 /// What counting needs to know of the build it stands for.
@@ -198,9 +209,8 @@ pub(crate) struct Counter<'a> {
     /// "if this block were a box" asks).
     boxes: Option<&'a BoxBlocks>,
     extra_boxes: HashSet<&'a str>,
-    /// Tally the boxes drawn for this block instead of counting expansions.
-    tally: Option<&'a str>,
-    layers: HashMap<String, Option<LayerInfo>>,
+    table: &'a LayerTable,
+    layers: HashMap<String, Option<&'a LayerInfo>>,
     /// Record the references met, to work out [`Stats::savings`].
     record: bool,
     /// The references met in the contents being counted now (the top level when none is open).
@@ -224,6 +234,7 @@ impl<'a> Counter<'a> {
         frozen: &'a [String],
         pass: Pass<'a>,
         boxes: Option<&'a BoxBlocks>,
+        table: &'a LayerTable,
         cancel: Option<&'a AtomicBool>,
     ) -> Self {
         Counter {
@@ -233,7 +244,7 @@ impl<'a> Counter<'a> {
             off: pass.off,
             boxes,
             extra_boxes: pass.extra_boxes.iter().map(String::as_str).collect(),
-            tally: pass.tally,
+            table,
             record: pass.record,
             layers: HashMap::new(),
             sites: Vec::new(),
@@ -243,11 +254,6 @@ impl<'a> Counter<'a> {
             dim_memo: Costs::default(),
             stats: Stats::default(),
         }
-    }
-
-    /// The units one block copy or one entity of it costs: one, but none when tallying boxes.
-    fn unit(&self) -> u64 {
-        u64::from(self.tally.is_none())
     }
 
     /// Whether references to the block `name` (as the drawing spells it) are drawn as boxes in this walk.
@@ -281,13 +287,12 @@ impl<'a> Counter<'a> {
     /// of itself, what drawing all its references as boxes takes off the count: each reference of it
     /// costs `copies x one copy` and a box costs one.
     pub(crate) fn into_stats(mut self) -> Stats {
-        if !self.record {
-            self.stats.savings_unknown = true;
-            return self.stats;
+        if self.record {
+            let (blocks, layers, outlines) = savings(&self.sites, &self.nodes);
+            self.stats.savings = blocks;
+            self.stats.layer_savings = layers;
+            self.stats.outlines = outlines;
         }
-        let (blocks, layers) = savings(&self.sites, &self.nodes);
-        self.stats.savings = blocks;
-        self.stats.layer_savings = layers;
         self.stats
     }
 
@@ -309,12 +314,13 @@ impl<'a> Counter<'a> {
 
     /// What the walk needs of the layer `name` (the layer table is searched once per name, not once per
     /// object: a drawing can have thousands of layers).
-    fn layer_info(&mut self, name: &str) -> Option<&LayerInfo> {
-        if !self.layers.contains_key(name) {
-            let info = self.d.layer(name).map(|l| LayerInfo { visible: l.visible(), plot: l.plot, name: l.name.clone() });
-            self.layers.insert(name.to_string(), info);
+    fn layer_info(&mut self, name: &str) -> Option<&'a LayerInfo> {
+        if let Some(found) = self.layers.get(name) {
+            return *found;
         }
-        self.layers.get(name).and_then(Option::as_ref)
+        let found = self.table.0.get(&name.to_ascii_lowercase());
+        self.layers.insert(name.to_string(), found);
+        found
     }
 
     /// The layer layer-0 objects inside the reference `e` take (see `sub_ctx`).
@@ -356,7 +362,7 @@ impl<'a> Counter<'a> {
                 let outer = node.as_ref().map(|_| std::mem::take(&mut self.sites));
                 let mut n = 0u64;
                 for be in blk.entities.iter() {
-                    n = n.saturating_add(self.unit()).saturating_add(self.entity(be, depth + 1, inner));
+                    n = n.saturating_add(1).saturating_add(self.entity(be, depth + 1, inner));
                 }
                 if let (Some(k), Some(outer)) = (&node, outer) {
                     let mine = std::mem::replace(&mut self.sites, outer);
@@ -367,7 +373,14 @@ impl<'a> Counter<'a> {
             }
         };
         if let Some(child) = node {
-            self.sites.push(Site { block: None, layer: Self::layer_of(e, block_layer).to_ascii_lowercase(), child: Some(child), copies: 1, one: n });
+            self.sites.push(Site {
+                block: None,
+                layer: Self::layer_of(e, block_layer).to_ascii_lowercase(),
+                boxed: None,
+                child: Some(child),
+                copies: 1,
+                one: n,
+            });
         }
         n
     }
@@ -380,19 +393,25 @@ impl<'a> Counter<'a> {
         let Some(blk) = d.block(&ins.block) else { return 0 };
         self.note_layer(Self::layer_of(e, block_layer));
         if self.boxed(&blk.name) {
-            if self.record {
-                // A box costs one piece and expands nothing; it is still a reference on its layer.
-                self.sites.push(Site { block: None, layer: Self::layer_of(e, block_layer).to_ascii_lowercase(), child: None, copies: 1, one: 1 });
-            }
             // One outline for the whole reference (an array included): one unit, contents not walked.
-            return match self.tally {
-                None => 1,
-                // Only the outlines that are drawn (a block with nothing in it draws none).
-                Some(t) if t == blk.name => u64::from(self.boxes.is_some_and(|b| b.outline(&blk.name, ins, blk.base.xy(), depth).is_some())),
-                Some(_) => 0,
-            };
+            if self.record {
+                // It is still a reference on its layer; for a block the picture draws as boxes the
+                // site says whether an outline is drawn (a block with nothing in it draws none).
+                let drawn = self.boxes.is_some_and(|b| b.contains(&blk.name)).then(|| {
+                    let outline = self.boxes.is_some_and(|b| b.outline(&blk.name, ins, blk.base.xy(), depth).is_some());
+                    (blk.name.clone(), outline)
+                });
+                self.sites.push(Site {
+                    block: None,
+                    layer: Self::layer_of(e, block_layer).to_ascii_lowercase(),
+                    boxed: drawn,
+                    child: None,
+                    copies: 1,
+                    one: 1,
+                });
+            }
+            return 1;
         }
-        self.stats.blocks.entry(blk.name.to_ascii_lowercase()).or_insert_with(|| blk.name.clone());
         if ins.cols > MAX_ARRAY_SIDE || ins.rows > MAX_ARRAY_SIDE {
             self.stats.clamped.entry(e.handle.0).or_insert_with(|| ClampedArray {
                 handle: e.handle,
@@ -412,9 +431,9 @@ impl<'a> Counter<'a> {
             None => {
                 // The copy itself, then each entity (AttDefs are skipped) and what it expands.
                 let outer = node.as_ref().map(|_| std::mem::take(&mut self.sites));
-                let mut n = self.unit();
+                let mut n = 1u64;
                 for be in blk.entities.iter().filter(|be| !matches!(be.kind, EntityKind::AttDef(_))) {
-                    n = n.saturating_add(self.unit()).saturating_add(self.entity(be, depth + 1, inner));
+                    n = n.saturating_add(1).saturating_add(self.entity(be, depth + 1, inner));
                 }
                 if let (Some(k), Some(outer)) = (&node, outer) {
                     let mine = std::mem::replace(&mut self.sites, outer);
@@ -428,6 +447,7 @@ impl<'a> Counter<'a> {
             self.sites.push(Site {
                 block: Some(blk.name.clone()),
                 layer: Self::layer_of(e, block_layer).to_ascii_lowercase(),
+                boxed: None,
                 child: Some(child),
                 copies,
                 one,
@@ -450,12 +470,25 @@ fn reference_of(e: &Entity) -> Option<(&'static str, String)> {
     }
 }
 
-fn add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-    a?.checked_add(b?)
+/// `a + b`, [`COUNT_SATURATED`] ("more than can be counted") when either is or the sum overflows.
+fn sadd(a: u64, b: u64) -> u64 {
+    if a == COUNT_SATURATED || b == COUNT_SATURATED { COUNT_SATURATED } else { a.checked_add(b).unwrap_or(COUNT_SATURATED) }
 }
 
-fn mul(a: Option<u64>, b: u64) -> Option<u64> {
-    a?.checked_mul(b)
+/// `a x b`, saturated the same way (nothing times zero is zero).
+fn smul(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 {
+        0
+    } else if a == COUNT_SATURATED || b == COUNT_SATURATED {
+        COUNT_SATURATED
+    } else {
+        a.checked_mul(b).unwrap_or(COUNT_SATURATED)
+    }
+}
+
+/// `a - b` for `b <= a` (an uncountable `a` stays so).
+fn ssub(a: u64, b: u64) -> u64 {
+    if a == COUNT_SATURATED { COUNT_SATURATED } else { a.saturating_sub(b) }
 }
 
 /// A reference of the walk with its place in the graph of block expansions.
@@ -464,38 +497,39 @@ struct Flat<'a> {
     parent: Option<usize>,
     child: Option<usize>,
     block: Option<&'a str>,
+    boxed: Option<(&'a str, bool)>,
     layer: &'a str,
     copies: u64,
     one: u64,
 }
 
-/// What the count falls by when all the references to a block are drawn as boxes, for every block met,
-/// and when all the references on a layer are switched off, for every layer met, from how often each
-/// block copy is expanded, with no walk per block or layer. `top` are the references of the top-level
-/// objects, `nodes` those inside each block expansion.
+/// For every block the references refer to, every layer they sit on and every block drawn as boxes: what
+/// the count falls by when the block's references are drawn as boxes, when the layer's are switched off,
+/// and the outlines drawn, all from the references the walk recorded, with no walk per name.
 ///
 /// Expansions are nodes of a graph whose edges (the references) raise the depth by one, so by depth every
-/// node comes after all that hold a reference to it. `mult[n]` is how often the node is expanded. A
-/// cut (a block's references, a layer's references) takes off, for each of its references, the
-/// expansions of the holding node times `copies x one copy - 1` (a box costs one; a layer switched off
-/// costs nothing). That is exact when no cut reference sits inside an expansion that another of them
-/// replaces; when one does (a block holding itself, a layer's reference holding another on the layer,
-/// as layer 0 contents do) the expansions that pass through a cut reference are taken away first
-/// (`through`, found over the nodes below the cut only), so the cost of a cut is that of the part of the
-/// graph below it, not of the drawing.
-fn savings(top: &[Site], nodes: &HashMap<NodeKey, (String, Vec<Site>)>) -> (HashMap<String, Option<u64>>, HashMap<String, Option<u64>>) {
+/// node comes after those it refers to. Taking away a set of references (the cut) changes the cost of the
+/// one copy of every expansion that holds one, and of every expansion above those: `delta[n]`, found from
+/// the cut upwards (the parents, by depth, of the expansions that hold a cut reference), each parent
+/// taking `copies x delta` of its child for every reference that is not itself cut. The top level is
+/// the sum of the same over the top-level references. So a block that holds itself (a cycle only ever
+/// reaches the depth limit) or a layer whose references hold others on the same layer cost no more than
+/// any other, and the work for a name is the part of the graph above its references, not the drawing.
+/// The expansions of a block's copies are not counted per name.
+fn savings(top: &[Site], nodes: &HashMap<NodeKey, (String, Vec<Site>)>) -> (HashMap<String, u64>, HashMap<String, u64>, HashMap<String, u64>) {
     let mut keys: Vec<&NodeKey> = nodes.keys().collect();
     keys.sort_by_key(|k| k.depth);
     let idx: HashMap<&NodeKey, usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-    let mut flat: Vec<Flat> = Vec::new();
-    let mut out: Vec<Vec<usize>> = vec![Vec::new(); keys.len()];
-    let mut block_of: Vec<&str> = Vec::with_capacity(keys.len());
     let mut lists: Vec<(Option<usize>, &[Site])> = vec![(None, top)];
     for (i, k) in keys.iter().enumerate() {
-        let (block, sites) = nodes.get(*k).map(|(b, v)| (b.as_str(), v.as_slice())).unwrap_or(("", &[]));
-        block_of.push(block);
-        lists.push((Some(i), sites));
+        if let Some((_, sites)) = nodes.get(*k) {
+            lists.push((Some(i), sites.as_slice()));
+        }
     }
+    let mut flat: Vec<Flat> = Vec::new();
+    // The references to each expansion from other expansions, and the copies the top level makes of it.
+    let mut rev: Vec<Vec<usize>> = vec![Vec::new(); keys.len()];
+    let mut top_copies: Vec<u64> = vec![0; keys.len()];
     for (parent, sites) in lists {
         for s in sites {
             let child = match &s.child {
@@ -505,198 +539,107 @@ fn savings(top: &[Site], nodes: &HashMap<NodeKey, (String, Vec<Site>)>) -> (Hash
                 },
                 None => None,
             };
-            if child.is_some()
-                && let Some(o) = parent.and_then(|p| out.get_mut(p))
-            {
-                o.push(flat.len());
-            }
-            flat.push(Flat { parent, child, block: s.block.as_deref(), layer: &s.layer, copies: s.copies, one: s.one });
-        }
-    }
-    // How often each expansion happens.
-    let mut mult: Vec<Option<u64>> = vec![Some(0); keys.len()];
-    for f in flat.iter().filter(|f| f.parent.is_none()) {
-        if let Some(m) = f.child.and_then(|c| mult.get_mut(c)) {
-            *m = add(*m, Some(f.copies));
-        }
-    }
-    for i in 0..keys.len() {
-        let here = mult.get(i).copied().flatten();
-        for &fi in out.get(i).map(Vec::as_slice).unwrap_or_default() {
-            if let Some(f) = flat.get(fi)
-                && let Some(m) = f.child.and_then(|c| mult.get_mut(c))
-            {
-                *m = add(*m, mul(here, f.copies));
-            }
-        }
-    }
-    let times = |f: &Flat| -> Option<u64> {
-        match f.parent {
-            None => Some(1),
-            Some(p) => mult.get(p).copied().flatten(),
-        }
-    };
-    let cost = |f: &Flat, layer: bool| -> Option<u64> {
-        if f.one == COUNT_SATURATED {
-            return None;
-        }
-        f.copies.checked_mul(f.one).map(|c| if layer { c } else { c.saturating_sub(1) })
-    };
-    // The saving of the cut `which` (indices into `flat`): its references switched off (`layer`) or
-    // drawn as boxes. `nested`: a cut reference may sit below another of the cut.
-    let saving = |which: &[usize], layer: bool, nested: bool, is_cut: &dyn Fn(&Flat) -> bool| -> Option<u64> {
-        let mut through: HashMap<usize, Option<u64>> = HashMap::new();
-        if nested {
-            // The expansions below the cut and how often each is reached through a cut reference.
-            let mut cone: std::collections::BTreeSet<usize> = which.iter().filter_map(|&i| flat.get(i)).filter_map(|f| f.child).collect();
-            let mut stack: Vec<usize> = cone.iter().copied().collect();
-            while let Some(n) = stack.pop() {
-                for &fi in out.get(n).map(Vec::as_slice).unwrap_or_default() {
-                    if let Some(c) = flat.get(fi).and_then(|f| f.child)
-                        && cone.insert(c)
-                    {
-                        stack.push(c);
+            if let Some(c) = child {
+                match parent {
+                    Some(_) => {
+                        if let Some(r) = rev.get_mut(c) {
+                            r.push(flat.len());
+                        }
+                    }
+                    None => {
+                        if let Some(t) = top_copies.get_mut(c) {
+                            *t = sadd(*t, s.copies);
+                        }
                     }
                 }
             }
-            for f in which.iter().filter_map(|&i| flat.get(i)) {
-                if let Some(c) = f.child {
-                    let t = through.entry(c).or_insert(Some(0));
-                    *t = add(*t, mul(times(f), f.copies));
-                }
-            }
-            for &n in &cone {
-                let here = through.get(&n).copied().flatten();
-                for &fi in out.get(n).map(Vec::as_slice).unwrap_or_default() {
-                    if let Some(f) = flat.get(fi)
-                        && !is_cut(f)
-                        && let Some(c) = f.child
-                    {
-                        let t = through.entry(c).or_insert(Some(0));
-                        *t = add(*t, mul(here, f.copies));
+            flat.push(Flat {
+                parent,
+                child,
+                block: s.block.as_deref(),
+                boxed: s.boxed.as_ref().map(|(b, o)| (b.as_str(), *o)),
+                layer: &s.layer,
+                copies: s.copies,
+                one: s.one,
+            });
+        }
+    }
+    // The count falls by `reduce(cut)`: `rule` is what one cut reference takes off (the references of
+    // `cut` do not expand any more), `is_cut` says which references the cut is.
+    let reduce = |cut: &[usize], rule: &dyn Fn(&Flat) -> u64, is_cut: &dyn Fn(&Flat) -> bool| -> u64 {
+        let mut delta: HashMap<usize, u64> = HashMap::new();
+        let mut cut_top: HashMap<usize, u64> = HashMap::new();
+        let mut total = 0u64;
+        for f in cut.iter().filter_map(|&i| flat.get(i)) {
+            let r = rule(f);
+            match f.parent {
+                None => {
+                    total = sadd(total, r);
+                    if let Some(c) = f.child {
+                        let t = cut_top.entry(c).or_insert(0);
+                        *t = sadd(*t, f.copies);
                     }
                 }
+                Some(p) => {
+                    let d = delta.entry(p).or_insert(0);
+                    *d = sadd(*d, r);
+                }
             }
         }
-        let mut sum = Some(0u64);
-        for f in which.iter().filter_map(|&i| flat.get(i)) {
-            let held = match f.parent {
-                Some(p) => through.get(&p).copied().unwrap_or(Some(0)),
-                None => Some(0),
-            };
-            let once = times(f).zip(held).and_then(|(a, h)| a.checked_sub(h));
-            sum = add(sum, once.zip(cost(f, layer)).and_then(|(o, c)| o.checked_mul(c)));
+        // The expansions that change: those holding a cut reference and everything above them.
+        let mut changed: std::collections::BTreeSet<usize> = delta.keys().copied().collect();
+        let mut stack: Vec<usize> = changed.iter().copied().collect();
+        while let Some(n) = stack.pop() {
+            for f in rev.get(n).into_iter().flatten().filter_map(|&fi| flat.get(fi)) {
+                if let Some(p) = f.parent
+                    && changed.insert(p)
+                {
+                    stack.push(p);
+                }
+            }
         }
-        sum
+        for &n in changed.iter().rev() {
+            let d = delta.get(&n).copied().unwrap_or(0);
+            if d == 0 {
+                continue;
+            }
+            for f in rev.get(n).into_iter().flatten().filter_map(|&fi| flat.get(fi)) {
+                if let (Some(p), false) = (f.parent, is_cut(f)) {
+                    let e = delta.entry(p).or_insert(0);
+                    *e = sadd(*e, smul(f.copies, d));
+                }
+            }
+            let held = top_copies.get(n).copied().unwrap_or(0);
+            let cut_here = cut_top.get(&n).copied().unwrap_or(0);
+            total = sadd(total, smul(ssub(held, cut_here), d));
+        }
+        total
     };
     let mut by_block: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut by_layer: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_boxed: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, f) in flat.iter().enumerate() {
         if let Some(b) = f.block {
             by_block.entry(b).or_default().push(i);
         }
+        if let Some((b, _)) = f.boxed {
+            by_boxed.entry(b).or_default().push(i);
+        }
         by_layer.entry(f.layer).or_default().push(i);
     }
-    // The blocks that are part of themselves, however deep (the only ones whose references nest).
-    let mut ids: HashMap<&str, usize> = HashMap::new();
-    let mut edges: Vec<Vec<usize>> = Vec::new();
-    for f in &flat {
-        if let (Some(p), Some(to)) = (f.parent, f.block) {
-            let from = block_of.get(p).copied().unwrap_or("");
-            let mut intern = |n| match ids.get(n) {
-                Some(i) => *i,
-                None => {
-                    edges.push(Vec::new());
-                    ids.insert(n, edges.len() - 1);
-                    edges.len() - 1
-                }
-            };
-            let a = intern(from);
-            let b = intern(to);
-            if let Some(e) = edges.get_mut(a) {
-                e.push(b);
-            }
-        }
-    }
-    let on_cycle: std::collections::HashSet<usize> = on_a_cycle(&edges).into_iter().collect();
+    // A box takes off `copies x one - 1`; a switched off layer's reference everything it cost.
+    let cost = |f: &Flat| smul(f.copies, f.one);
     let mut blocks = HashMap::new();
-    for (b, which) in &by_block {
-        let nested = ids.get(b).is_some_and(|i| on_cycle.contains(i));
-        blocks.insert(b.to_string(), saving(which, false, nested, &|f: &Flat| f.block == Some(*b)));
+    for (b, cut) in &by_block {
+        blocks.insert(b.to_string(), reduce(cut, &|f| ssub(cost(f), 1), &|f| f.block == Some(*b)));
     }
     let mut layers = HashMap::new();
-    for (l, which) in &by_layer {
-        layers.insert(l.to_string(), saving(which, true, true, &|f: &Flat| f.layer == *l));
+    for (l, cut) in &by_layer {
+        layers.insert(l.to_string(), reduce(cut, &|f| cost(f), &|f| f.layer == *l));
     }
-    (blocks, layers)
-}
-
-/// The vertices of the graph `edges` (adjacency lists) that lie on a cycle (a self edge or a
-/// strongly connected component of two or more), by Tarjan's algorithm without recursion.
-fn on_a_cycle(edges: &[Vec<usize>]) -> Vec<usize> {
-    let n = edges.len();
-    let (mut index, mut low) = (vec![usize::MAX; n], vec![0usize; n]);
-    let (mut on_stack, mut stack) = (vec![false; n], Vec::new());
-    let (mut next, mut out) = (0usize, Vec::new());
-    for root in 0..n {
-        if index.get(root).copied() != Some(usize::MAX) {
-            continue;
-        }
-        // (vertex, next edge to look at)
-        let mut work = vec![(root, 0usize)];
-        while let Some(&(v, i)) = work.last() {
-            if i == 0 {
-                if let (Some(a), Some(b)) = (index.get_mut(v), low.get_mut(v)) {
-                    *a = next;
-                    *b = next;
-                }
-                next += 1;
-                stack.push(v);
-                if let Some(o) = on_stack.get_mut(v) {
-                    *o = true;
-                }
-            }
-            let target = edges.get(v).and_then(|e| e.get(i)).copied();
-            if let Some(last) = work.last_mut() {
-                last.1 += 1;
-            }
-            match target {
-                Some(w) if index.get(w).copied() == Some(usize::MAX) => work.push((w, 0)),
-                Some(w) => {
-                    if on_stack.get(w).copied() == Some(true) {
-                        let lw = index.get(w).copied().unwrap_or(usize::MAX);
-                        if let Some(l) = low.get_mut(v) {
-                            *l = (*l).min(lw);
-                        }
-                    }
-                }
-                None => {
-                    work.pop();
-                    let lv = low.get(v).copied().unwrap_or(0);
-                    if let Some(&(parent, _)) = work.last()
-                        && let Some(l) = low.get_mut(parent)
-                    {
-                        *l = (*l).min(lv);
-                    }
-                    if lv == index.get(v).copied().unwrap_or(usize::MAX) {
-                        let mut comp = Vec::new();
-                        while let Some(w) = stack.pop() {
-                            if let Some(o) = on_stack.get_mut(w) {
-                                *o = false;
-                            }
-                            comp.push(w);
-                            if w == v {
-                                break;
-                            }
-                        }
-                        let self_edge = comp.len() == 1 && edges.get(v).is_some_and(|e| e.contains(&v));
-                        if comp.len() > 1 || self_edge {
-                            out.extend(comp);
-                        }
-                    }
-                }
-            }
-        }
+    let mut outlines = HashMap::new();
+    for (b, cut) in &by_boxed {
+        outlines.insert(b.to_string(), reduce(cut, &|f| u64::from(f.boxed.is_some_and(|(_, o)| o)), &|_| false));
     }
-    out
+    (blocks, layers, outlines)
 }

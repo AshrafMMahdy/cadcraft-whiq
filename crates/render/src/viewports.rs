@@ -218,9 +218,10 @@ pub(crate) fn count_viewport(
     plotting: bool,
     pass: super::count::Pass,
     boxes: Option<&super::BoxBlocks>,
+    table: &super::count::LayerTable,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> (u64, super::count::Stats) {
-    let mut counter = super::count::Counter::new(d, plotting, &vp.frozen_layers, pass, boxes, cancel);
+    let mut counter = super::count::Counter::new(d, plotting, &vp.frozen_layers, pass, boxes, table, cancel);
     if !viewport_shown(d, e, vp) || !vp.on {
         return (0, counter.into_stats());
     }

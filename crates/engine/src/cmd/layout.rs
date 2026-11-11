@@ -833,7 +833,8 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         (None, Some(names)) => names.iter().map(|n| if n.eq_ignore_ascii_case("model") { Space::Model } else { Space::Paper(n.clone()) }).collect(),
         (None, None) => vec![space.clone()],
     };
-    super::exchange::picture_fits(s, cmd, &counted.into_iter().map(|c| (c, true)).collect::<Vec<_>>(), p)?;
+    let pdf = !opts.get("output").and_then(Value::as_str).is_some_and(|o| !o.eq_ignore_ascii_case("pdf"));
+    super::exchange::picture_fits(s, cmd, s.doc()?, &counted.into_iter().map(|c| (c, true)).collect::<Vec<_>>(), p, cmd == "plot" && pdf)?;
     let bytes = hook(s.doc()?, &space, &opts).map_err(|e| bad(cmd, e))?;
     let layout = match &sheets {
         Some(names) => names.first().cloned().unwrap_or_default(),

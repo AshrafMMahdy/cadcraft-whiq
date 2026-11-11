@@ -26,7 +26,7 @@ pub fn plot(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
     let boxed = pdf::validate_blocks_as_boxes(d, opts)?;
     if !boxed.is_empty() && opts.get("output").and_then(Value::as_str).is_some_and(|o| !o.eq_ignore_ascii_case("pdf")) {
         return Err(IoError::Format(
-            "`blocks_as_boxes` is drawn by the PDF plot, not by png or svg plots; the export and render_preview tools draw it for svg and png".into(),
+            "`blocks_as_boxes` is not drawn by a png or svg plot: call the `export` tool with a path ending .svg or .png and blocks_as_boxes: [block names] (or render_preview with the same arguments), or plot to pdf, and call again".into(),
         ));
     }
     if matches!(space, Space::Model)

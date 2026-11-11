@@ -321,7 +321,7 @@ pub use dim_draw::{dim_text, dimension_in};
 pub use display::{DPrim, DisplayList, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
 pub use pipeline::{
     BlockCensus, BlockSaving, BoxedRefs, LayerOff, Options, build, build_entities, build_plot, build_slice, census_entities, census_space,
-    count_expansions, count_space,
+    count_expansions, count_space, count_space_with,
 };
 use props::{default_lineweight, resolve_common};
 pub use slices::build_layout_slices;

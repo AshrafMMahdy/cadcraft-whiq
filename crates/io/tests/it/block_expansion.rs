@@ -133,7 +133,7 @@ fn a_complete_pdf_plot_past_the_limit_makes_no_file() {
     let largest = sheet.census.largest.as_ref().unwrap();
     assert_eq!((largest.kind, largest.block.as_str(), largest.count), ("array of block references (MINSERT)", "A", 200));
     // Drawing the block A as a box: one unit for the whole array.
-    assert_eq!(sheet.census.heaviest.iter().map(|h| (h.block.as_str(), h.total_if_boxed)).collect::<Vec<_>>(), vec![("A", 1)]);
+    assert_eq!(sheet.census.heaviest.iter().map(|h| (h.block.as_str(), h.total_if_boxed)).collect::<Vec<_>>(), vec![("A", Some(1))]);
     let boxed = cadcraft_io::PdfOptions { blocks_as_boxes: vec!["a".into()], ..o.clone() };
     let Plot::Drawn(p) = cadcraft_io::pdf::pdf_sheets_with_blocks(&d, &[Space::Model], &boxed).unwrap() else { panic!("still too big") };
     assert!(p.bytes.starts_with(b"%PDF"));

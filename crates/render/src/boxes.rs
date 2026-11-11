@@ -33,10 +33,13 @@ impl BoxBlocks {
     /// The boxes for `names` (compared with the drawing's block names ignoring case; a name given
     /// twice counts once). A name that is no block of `d` is an error naming it: nothing is ignored.
     pub fn new(d: &Drawing, names: &[String]) -> Result<BoxBlocks, String> {
+        if let Some(n) = names.iter().find(|n| d.block(n).is_none()) {
+            return Err(cadcraft_doc::unknown_blocks_message(d, std::slice::from_ref(n)));
+        }
         let mut entries: Vec<Entry> = Vec::new();
         let mut cache = BlockBoundsCache::default();
         for n in names {
-            let Some(blk) = d.block(n) else { return Err(format!("`{n}` is not a block of this drawing")) };
+            let Some(blk) = d.block(n) else { continue };
             if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&blk.name)) {
                 continue;
             }
