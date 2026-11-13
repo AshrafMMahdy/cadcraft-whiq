@@ -13,8 +13,8 @@ on:
       - .github/workflows/freebsd.yml
       - packaging/freebsd/**
       - packaging/env.sh
-  schedule:
-    - cron: "27 3 * * *"
+  # WHIQ fork: the upstream's scheduled run ("27 3 * * *") is switched off here (owner 2026-11-13):
+  # we do not ship on this platform; run it by hand with workflow_dispatch when wanted.
   workflow_dispatch:
 
 concurrency:
